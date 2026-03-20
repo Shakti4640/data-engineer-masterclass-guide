@@ -1,0 +1,334 @@
+# file: 05_index_analysis.py (COMPLETE)
+# Purpose: Demonstrate how indexes transform query performance
+# Solves: "8 seconds for date+status query, 1ms for order_id lookup"
+
+import pymysql
+import time
+import json
+
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "etl_user",
+    "password": "[REDACTED:PASSWORD]",
+    "database": "quickcart_db",
+    "charset": "utf8mb4"
+}
+
+
+def explain_query(cursor, label, sql, params=None):
+    """
+    Run EXPLAIN on a query and interpret results
+    
+    EXPLAIN output columns that matter:
+    → type: how MariaDB accesses the table
+       const    = single row via PRIMARY/UNIQUE (best)
+       eq_ref   = one row per join via UNIQUE index
+       ref      = multiple rows via non-unique index
+       range    = index range scan (BETWEEN, >, <)
+       index    = full index scan (reads every index entry)
+       ALL      = full TABLE scan (reads every row — WORST)
+    
+    → key: which index was chosen
+       NULL = no index used — full scan
+    
+    → rows: ESTIMATED rows to examine
+       Lower = better
+       Compare to actual result count
+    
+    → Extra:
+       "Using index"      = covering index — no table access (BEST)
+       "Using where"      = filtering after index lookup
+       "Using filesort"   = sorting in temp memory/disk (SLOW)
+       "Using temporary"  = temp table created (SLOW)
+    """
+    print(f"\n{'='*70}")
+    print(f"📊 {label}")
+    print(f"{'='*70}")
+    print(f"SQL: {sql.strip()[:300]}")
+    if params:
+        print(f"Params: {params}")
+    
+    # --- RUN EXPLAIN ---
+    explain_sql = f"EXPLAIN {sql}"
+    cursor.execute(explain_sql, params)
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    
+    print(f"\n{'EXPLAIN PLAN':}")
+    print(f"{'-'*70}")
+    
+    for row in rows:
+        row_dict = dict(zip(columns, row))
+        table = row_dict.get('table', '?')
+        access_type = row_dict.get('type', '?')
+        possible = row_dict.get('possible_keys', 'None')
+        key_used = row_dict.get('key', 'None')
+        key_len = row_dict.get('key_len', '?')
+        rows_est = row_dict.get('rows', '?')
+        extra = row_dict.get('Extra', '')
+        
+        # Color-code access type
+        if access_type in ('const', 'eq_ref'):
+            quality = "🟢 EXCELLENT"
+        elif access_type in ('ref', 'range'):
+            quality = "🟡 GOOD"
+        elif access_type == 'index':
+            quality = "🟠 ACCEPTABLE"
+        else:
+            quality = "🔴 BAD — FULL SCAN"
+        
+        print(f"  Table:          {table}")
+        print(f"  Access Type:    {access_type} → {quality}")
+        print(f"  Possible Keys:  {possible}")
+        print(f"  Key Used:       {key_used}")
+        print(f"  Key Length:      {key_len}")
+        print(f"  Rows Estimated: {rows_est}")
+        print(f"  Extra:          {extra}")
+        print(f"  ---")
+    
+    # --- RUN ACTUAL QUERY WITH TIMING ---
+    start = time.time()
+    cursor.execute(sql, params)
+    results = cursor.fetchall()
+    elapsed_ms = round((time.time() - start) * 1000, 2)
+    
+    print(f"\n  ⏱️  Actual: {len(results)} rows returned in {elapsed_ms} ms")
+    
+    # Show first 3 rows
+    if results:
+        result_columns = [desc[0] for desc in cursor.description]
+        print(f"  Sample results:")
+        for row in results[:3]:
+            row_dict = dict(zip(result_columns, row))
+            print(f"    {row_dict}")
+        if len(results) > 3:
+            print(f"    ... and {len(results) - 3} more rows")
+    
+    return elapsed_ms
+
+
+def demonstrate_index_impact(cursor):
+    """Show same query WITH and WITHOUT index"""
+    
+    print(f"\n{'#'*70}")
+    print(f"# DEMONSTRATION: INDEX vs NO INDEX ON SAME QUERY")
+    print(f"{'#'*70}")
+    
+    # --- QUERY 1: Primary key lookup (always fast) ---
+    explain_query(
+        cursor,
+        "PRIMARY KEY LOOKUP — Single order by ID",
+        "SELECT * FROM orders WHERE order_id = %s",
+        ("ORD-20250115-000001",)
+    )
+    # Expected: type=const, key=PRIMARY, rows=1
+    
+    # --- QUERY 2: Composite index — date + status ---
+    explain_query(
+        cursor,
+        "COMPOSITE INDEX — Orders by date range + status",
+        """
+        SELECT order_id, customer_id, total_amount, order_date, status
+        FROM orders 
+        WHERE order_date BETWEEN %s AND %s 
+          AND status = %s
+        """,
+        ("2025-01-01", "2025-01-31", "completed")
+    )
+    # Expected: type=range, key=idx_date_status_amount
+    
+    # --- QUERY 3: Covering index — aggregation from index only ---
+    explain_query(
+        cursor,
+        "COVERING INDEX — Daily revenue by status (no table access)",
+        """
+        SELECT order_date, status, COUNT(*) as cnt, SUM(total_amount) as revenue
+        FROM orders
+        WHERE order_date BETWEEN %s AND %s
+        GROUP BY order_date, status
+        ORDER BY order_date, status
+        """,
+        ("2025-01-01", "2025-03-31")
+    )
+    # Expected: Extra contains "Using index" — covering index!
+    
+    # --- QUERY 4: Customer order history (composite index with sort) ---
+    explain_query(
+        cursor,
+        "COMPOSITE INDEX WITH SORT — Customer order history",
+        """
+        SELECT order_id, order_date, total_amount, status
+        FROM orders
+        WHERE customer_id = %s
+        ORDER BY order_date DESC
+        LIMIT 10
+        """,
+        ("CUST-000001",)
+    )
+    # Expected: key=idx_customer_date, NO filesort
+    
+    # --- QUERY 5: JOIN with indexed foreign keys ---
+    explain_query(
+        cursor,
+        "JOIN — Order details with customer and items",
+        """
+        SELECT 
+            o.order_id,
+            c.name AS customer_name,
+            c.tier,
+            o.total_amount,
+            COUNT(oi.item_id) AS item_count
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
+        JOIN order_items oi ON o.order_id = oi.order_id
+        WHERE o.order_date = %s
+        GROUP BY o.order_id, c.name, c.tier, o.total_amount
+        ORDER BY o.total_amount DESC
+        LIMIT 10
+        """,
+        ("2025-03-15",)
+    )
+    # Expected: each table uses an index (ref or eq_ref)
+    
+    # --- QUERY 6: Suboptimal query — force full scan for comparison ---
+    explain_query(
+        cursor,
+        "🔴 FULL SCAN — Query that CANNOT use any index",
+        """
+        SELECT order_id, total_amount, status
+        FROM orders
+        WHERE total_amount * 1.08 > 500
+        """,
+        None
+    )
+    # Expected: type=ALL — function on column prevents index use
+    # FIX: WHERE total_amount > 500 / 1.08 → can use index on total_amount
+    
+    # --- QUERY 7: Same logic, rewritten to USE index ---
+    explain_query(
+        cursor,
+        "🟢 REWRITTEN — Same logic but index-friendly",
+        """
+        SELECT order_id, total_amount, status
+        FROM orders
+        WHERE total_amount > %s
+        """,
+        (500 / 1.08,)
+    )
+    # Expected: type=range or ALL (depends on selectivity)
+    # Key insight: NEVER put functions on indexed columns in WHERE
+
+
+def show_all_indexes(cursor):
+    """Display all indexes in the database"""
+    
+    print(f"\n{'='*70}")
+    print(f"📋 ALL INDEXES IN quickcart_db")
+    print(f"{'='*70}")
+    
+    cursor.execute("""
+        SELECT 
+            TABLE_NAME,
+            INDEX_NAME,
+            NON_UNIQUE,
+            GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ', ') AS columns,
+            INDEX_TYPE,
+            CARDINALITY
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = 'quickcart_db'
+        GROUP BY TABLE_NAME, INDEX_NAME, NON_UNIQUE, INDEX_TYPE, CARDINALITY
+        ORDER BY TABLE_NAME, INDEX_NAME
+    """)
+    
+    current_table = None
+    for row in cursor.fetchall():
+        table, idx_name, non_unique, cols, idx_type, cardinality = row
+        
+        if table != current_table:
+            print(f"\n  📦 {table}:")
+            current_table = table
+        
+        uniqueness = "UNIQUE" if non_unique == 0 else "NON-UNIQUE"
+        print(f"     {idx_name:<35} ({cols:<50}) [{uniqueness}, {idx_type}, card={cardinality}]")
+
+
+def identify_missing_indexes(cursor):
+    """Suggest indexes based on common query patterns"""
+    
+    print(f"\n{'='*70}")
+    print(f"🔍 INDEX RECOMMENDATIONS")
+    print(f"{'='*70}")
+    
+    recommendations = []
+    
+    # Check: orders table has index for status-only queries?
+    cursor.execute("""
+        SELECT COUNT(*) FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = 'quickcart_db'
+          AND TABLE_NAME = 'orders'
+          AND COLUMN_NAME = 'status'
+          AND SEQ_IN_INDEX = 1
+    """)
+    if cursor.fetchone()[0] == 0:
+        recommendations.append({
+            "table": "orders",
+            "issue": "No index with 'status' as leading column",
+            "query": "WHERE status = 'pending' (no date filter)",
+            "fix": "CREATE INDEX idx_status ON orders(status)",
+            "note": "Only if status-only queries are frequent. "
+                    "Low cardinality (5 values) — index may not help much."
+        })
+    
+    # Check: product_reviews has index for rating range queries?
+    cursor.execute("""
+        SELECT COUNT(*) FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = 'quickcart_db'
+          AND TABLE_NAME = 'product_reviews'
+          AND INDEX_NAME = 'idx_product_rating'
+    """)
+    if cursor.fetchone()[0] == 0:
+        recommendations.append({
+            "table": "product_reviews",
+            "issue": "No composite index for product + rating filter",
+            "query": "WHERE product_id = ? AND rating >= 4",
+            "fix": "CREATE INDEX idx_product_rating ON product_reviews(product_id, rating)",
+            "note": "Useful for 'show 4+ star reviews for product' page"
+        })
+    
+    if not recommendations:
+        print("\n  ✅ No obvious missing indexes detected")
+    else:
+        for i, rec in enumerate(recommendations, 1):
+            print(f"\n  ⚠️  Recommendation {i}:")
+            print(f"     Table: {rec['table']}")
+            print(f"     Issue: {rec['issue']}")
+            print(f"     Query: {rec['query']}")
+            print(f"     Fix:   {rec['fix']}")
+            print(f"     Note:  {rec['note']}")
+
+
+def run_index_analysis():
+    """Main execution"""
+    print("=" * 70)
+    print("🔍 INDEX ANALYSIS & EXPLAIN DEEP DIVE")
+    print("=" * 70)
+    
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    
+    # Show all existing indexes
+    show_all_indexes(cursor)
+    
+    # Demonstrate index impact on queries
+    demonstrate_index_impact(cursor)
+    
+    # Identify potential missing indexes
+    identify_missing_indexes(cursor)
+    
+    conn.close()
+    print("\n🔌 Connection closed")
+
+
+if __name__ == "__main__":
+    run_index_analysis()
