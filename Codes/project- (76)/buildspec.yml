@@ -1,0 +1,114 @@
+# file: buildspec.yml
+# CodeBuild instructions: lint → test → package → deploy
+
+version: 0.2
+
+env:
+  parameter-store:
+    REDSHIFT_WORKGROUP: /quickcart/${ENVIRONMENT}/redshift/workgroup
+    REDSHIFT_DATABASE: /quickcart/${ENVIRONMENT}/redshift/database
+  variables:
+    PYTHON_VERSION: "3.9"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - echo "=== INSTALL PHASE ==="
+      - pip install --upgrade pip
+      - pip install -r requirements.txt
+      - pip install pylint cfn-lint bandit pytest boto3 moto
+
+  pre_build:
+    commands:
+      - echo "=== LINT & SECURITY SCAN ==="
+      - echo "--- Python Syntax Check ---"
+      - python -m py_compile glue_jobs/*.py
+      - echo "--- Pylint (errors only) ---"
+      - pylint --errors-only glue_jobs/*.py || true
+      - echo "--- CloudFormation Lint ---"
+      - cfn-lint infrastructure/*.yaml
+      - echo "--- Security Scan ---"
+      - bandit -r glue_jobs/ -ll || true
+      - echo "--- SQL Syntax Check ---"
+      - python scripts/validate_sql.py redshift/migrations/*.sql
+
+  build:
+    commands:
+      - echo "=== UNIT TESTS ==="
+      - pytest tests/unit/ -v --tb=short --junitxml=test-results/unit.xml
+
+      - echo "=== PACKAGE ARTIFACTS ==="
+      # Package Glue scripts with commit SHA for versioning
+      - export COMMIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - echo "Commit SHA ${COMMIT_SHA}"
+      - mkdir -p dist/glue-scripts/${COMMIT_SHA}
+      - cp glue_jobs/*.py dist/glue-scripts/${COMMIT_SHA}/
+      
+      # Package CloudFormation templates
+      - mkdir -p dist/infrastructure
+      - cp infrastructure/*.yaml dist/infrastructure/
+      - cp infrastructure/parameters/${ENVIRONMENT}.json dist/infrastructure/params.json
+      
+      # Package Redshift migrations
+      - mkdir -p dist/redshift
+      - cp -r redshift/migrations dist/redshift/
+      
+      # Package Lambda functions
+      - mkdir -p dist/lambdas
+      - |
+        for dir in lambdas/*/; do
+          func_name=$(basename $dir)
+          cd $dir
+          pip install -r requirements.txt -t .
+          zip -r ../../dist/lambdas/${func_name}.zip .
+          cd ../..
+        done
+
+  post_build:
+    commands:
+      - echo "=== DEPLOY ==="
+      # Upload Glue scripts to S3
+      - |
+        aws s3 sync dist/glue-scripts/${COMMIT_SHA}/ \
+          s3://quickcart-artifacts-${ENVIRONMENT}/glue-scripts/${COMMIT_SHA}/ \
+          --sse AES256
+
+      # Deploy CloudFormation stack
+      - |
+        aws cloudformation deploy \
+          --template-file dist/infrastructure/glue-jobs.yaml \
+          --stack-name quickcart-glue-jobs-${ENVIRONMENT} \
+          --parameter-overrides file://dist/infrastructure/params.json \
+          CommitSha=${COMMIT_SHA} \
+          --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+          --no-fail-on-empty-changeset \
+          --tags Environment=${ENVIRONMENT} Pipeline=data-platform
+
+      # Run Redshift migrations
+      - python scripts/run_redshift_migrations.py --environment ${ENVIRONMENT}
+
+      # Run smoke tests (post-deploy)
+      - echo "=== SMOKE TESTS ==="
+      - pytest tests/smoke/ -v --tb=short --junitxml=test-results/smoke.xml
+
+reports:
+  unit-tests:
+    files:
+      - test-results/unit.xml
+    file-format: JUNITXML
+  smoke-tests:
+    files:
+      - test-results/smoke.xml
+    file-format: JUNITXML
+
+artifacts:
+  files:
+    - dist/**/*
+    - test-results/**/*
+  discard-paths: no
+
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'

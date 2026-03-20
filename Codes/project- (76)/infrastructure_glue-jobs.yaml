@@ -1,0 +1,195 @@
+# file: infrastructure/glue-jobs.yaml
+# CloudFormation template: defines ALL Glue jobs as infrastructure
+# Same template deployed to dev, staging, prod with different parameters
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: QuickCart Data Platform — Glue ETL Jobs
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  CommitSha:
+    Type: String
+    Description: Git commit SHA for script versioning
+
+  GlueRoleArn:
+    Type: String
+    Description: IAM role ARN for Glue jobs
+
+  SourceBucket:
+    Type: String
+    Description: S3 bucket for data lake
+
+  ArtifactsBucket:
+    Type: String
+    Description: S3 bucket for pipeline artifacts
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X, G.4X]
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 100
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+
+  # ═══════════════════════════════════════════
+  # GLUE JOB: Extract MariaDB → Bronze
+  # ═══════════════════════════════════════════
+  ExtractMariaDBOrders:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "extract-mariadb-orders-${Environment}"
+      Description: "Extract orders from MariaDB to S3 Bronze layer"
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue-scripts/${CommitSha}/extract_mariadb_orders.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--TempDir": !Sub "s3://${SourceBucket}/temp/glue/"
+        "--ENVIRONMENT": !Ref Environment
+        "--SOURCE_BUCKET": !Ref SourceBucket
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 30
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Environment: !Ref Environment
+        Pipeline: data-platform
+        CommitSha: !Ref CommitSha
+        ManagedBy: cloudformation
+
+  # ═══════════════════════════════════════════
+  # GLUE JOB: Bronze → Silver (Validate + Dedup)
+  # ═══════════════════════════════════════════
+  TransformBronzeToSilver:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "transform-bronze-to-silver-${Environment}"
+      Description: "Clean, validate, deduplicate Bronze → Silver"
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue-scripts/${CommitSha}/transform_bronze_to_silver.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--TempDir": !Sub "s3://${SourceBucket}/temp/glue/"
+        "--ENVIRONMENT": !Ref Environment
+        "--SOURCE_BUCKET": !Ref SourceBucket
+        "--enable-metrics": "true"
+        "--enable-auto-scaling": "true"
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 60
+      MaxRetries: 1
+      Tags:
+        Environment: !Ref Environment
+        Pipeline: data-platform
+        CommitSha: !Ref CommitSha
+
+  # ═══════════════════════════════════════════
+  # GLUE JOB: Silver → Gold (Aggregate + Compact)
+  # ═══════════════════════════════════════════
+  TransformSilverToGold:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "transform-silver-to-gold-${Environment}"
+      Description: "Aggregate, compact, write Gold data products"
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue-scripts/${CommitSha}/transform_silver_to_gold.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--TempDir": !Sub "s3://${SourceBucket}/temp/glue/"
+        "--ENVIRONMENT": !Ref Environment
+        "--SOURCE_BUCKET": !Ref SourceBucket
+        "--OUTPUT_FORMAT": "iceberg"
+        "--enable-metrics": "true"
+      GlueVersion: "4.0"
+      WorkerType: !If [IsProd, "G.2X", !Ref GlueWorkerType]
+      NumberOfWorkers: !If [IsProd, 4, !Ref GlueNumberOfWorkers]
+      Timeout: 120
+      MaxRetries: 1
+      Tags:
+        Environment: !Ref Environment
+        Pipeline: data-platform
+        CommitSha: !Ref CommitSha
+
+  # ═══════════════════════════════════════════
+  # GLUE JOB: Clickstream Micro-Batch (Project 72)
+  # ═══════════════════════════════════════════
+  ClickstreamMicroBatch:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "clickstream-microbatch-etl-${Environment}"
+      Description: "Real-time clickstream Bronze → Silver → Gold"
+      Role: !Ref GlueRoleArn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue-scripts/${CommitSha}/clickstream_microbatch_etl.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--BUCKET_NAME": !Ref SourceBucket
+        "--BRONZE_PREFIX": "bronze/clickstream/"
+        "--SILVER_PREFIX": "silver/clickstream/"
+        "--GOLD_PREFIX": "gold/clickstream_events/"
+        "--GLUE_DB_GOLD": !Sub "orders_gold_${Environment}"
+        "--GLUE_TABLE_GOLD": "clickstream_events"
+        "--PROCESSING_WINDOW_MINUTES": "15"
+        "--enable-metrics": "true"
+        "--enable-auto-scaling": "true"
+      GlueVersion: "4.0"
+      WorkerType: "G.1X"
+      NumberOfWorkers: 2
+      Timeout: 10
+      MaxRetries: 0
+      Tags:
+        Environment: !Ref Environment
+        Pipeline: clickstream-realtime
+        CommitSha: !Ref CommitSha
+
+Outputs:
+  ExtractJobName:
+    Value: !Ref ExtractMariaDBOrders
+    Export:
+      Name: !Sub "${Environment}-ExtractMariaDBOrdersJob"
+
+  BronzeToSilverJobName:
+    Value: !Ref TransformBronzeToSilver
+    Export:
+      Name: !Sub "${Environment}-BronzeToSilverJob"
+
+  SilverToGoldJobName:
+    Value: !Ref TransformSilverToGold
+    Export:
+      Name: !Sub "${Environment}-SilverToGoldJob"
+
+  ClickstreamJobName:
+    Value: !Ref ClickstreamMicroBatch
+    Export:
+      Name: !Sub "${Environment}-ClickstreamMicroBatchJob"
+
+  DeployedCommitSha:
+    Value: !Ref CommitSha
+    Description: "Git commit SHA of currently deployed scripts"
