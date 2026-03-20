@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 17: TRIGGER AN ALERT THE INSTANT A FILE LANDS IN S3 — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:21%"></div></div>
+<div id="progress-label">21%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 17 of 80</div>
+  <div class="project-title">TRIGGER AN ALERT THE INSTANT A FILE LANDS IN S3</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 8 months old
+</span>Situation:
+→ Daily CSV upload pipeline running (Project 1)
+→ 3 files land in S3 every midnight: orders, customers, products
+→ Athena queries work great (Project 16)
+→ BUT: nobody knows WHEN files actually arrive
+
+What's going wrong:
+→ Monday: upload script ran at 00:01 AM — files landed at 00:03 AM
+→ Tuesday: EC2 had a cron issue — files landed at 02:47 AM
+→ Wednesday: S3 throttled — files landed at 00:01, 00:01, 00:14 (staggered)
+→ Thursday: upload script crashed — files NEVER landed
+
+Data analyst arrives at 9 AM:
+→ "Are today's files ready? Should I run my Athena queries?"
+→ Checks S3 console manually → wastes 10 minutes every morning
+→ Sometimes runs queries on YESTERDAY's data thinking today's is there
+
+Operations Manager:
+→ "Thursday's files never arrived and nobody noticed until Friday"
+→ "We need to KNOW the instant files land — or DON'T land"
+
+CTO: "I want an email the moment each file hits S3.
+      And I want to know if a file DOESN'T arrive by 1 AM."
+
+YOU: "S3 can fire events when objects are created.
+      We route those events to SNS, which sends emails.
+      This is S3 Event Notifications."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what S3 Event Notifications are
+</span>→ S3 can emit events when specific things happen to objects
+→ Events: ObjectCreated, ObjectRemoved, ObjectRestore, Replication, etc.
+→ These events can be ROUTED to: SNS, SQS, Lambda, or EventBridge
+
+Step 2: Understand the event flow
+→ File uploaded to S3 (PutObject / CompleteMultipartUpload)
+→ S3 generates an event JSON message
+→ S3 sends that message to configured destination (SNS in our case)
+→ SNS receives the message
+→ SNS delivers to all subscribers (email, SQS, Lambda, HTTP, SMS)
+→ Analyst receives email: "orders_20250115.csv just landed in S3"
+
+Step 3: Understand filtering
+→ We DON'T want alerts for EVERY file in the bucket
+→ Athena result files also land in S3 — ignore those
+→ S3 Event Notifications support PREFIX and SUFFIX filters
+→ Prefix: "daily_exports/" → only our upload path
+→ Suffix: ".csv" → only CSV files (ignore .metadata, .crc, etc.)
+
+Step 4: Understand the permission chain
+→ S3 must have PERMISSION to publish to SNS
+→ SNS Topic Policy must ALLOW s3.amazonaws.com to sns:Publish
+→ Without this: S3 silently drops events — no error, no delivery
+
+Step 5: Plan our implementation
+→ Create SNS Topic (if not from Project 12, we create fresh one)
+→ Add email subscription to SNS Topic
+→ Configure SNS Topic Policy to allow S3
+→ Configure S3 Event Notification on the bucket
+→ Test by uploading a file
+→ Receive email alert</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  EC2 Upload Script (Project 1)
+        │
+        │ boto3 upload_file()
+        ▼
+  S3 Bucket: quickcart-raw-data-prod
+   └── daily_exports/
+        ├── orders/orders_20250115.csv      ← PutObject event fires
+        ├── customers/customers_20250115.csv ← PutObject event fires
+        └── products/products_20250115.csv   ← PutObject event fires
+        │
+        │ S3 Event Notification (filtered: prefix=daily_exports/, suffix=.csv)
+        │
+        ▼
+  SNS Topic: quickcart-s3-file-alerts
+        │
+        ├──→ Email Subscription: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="f296938693df8697939fb283879b919991938086dc919d9f">[email&#160;protected]</a>
+        │     → "File landed: orders_20250115.csv at 00:03:12 UTC"
+        │
+        ├──→ Email Subscription: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="ea859a99c79e8f8b87aa9b9f838981898b989ec4898587">[email&#160;protected]</a>
+        │     → Same notification
+        │
+        └──→ (Future: SQS subscription for automated processing — Project 18)
+
+
+  EVENT JSON THAT S3 SENDS TO SNS:
+  {
+    "Records": [{
+      "eventSource": "aws:s3",
+      "eventName": "ObjectCreated:Put",
+      "eventTime": "2025-01-15T00:03:12.000Z",
+      "s3": {
+        "bucket": {"name": "quickcart-raw-data-prod"},
+        "object": {
+          "key": "daily_exports/orders/orders_20250115.csv",
+          "size": 83942,
+          "eTag": "d41d8cd98f00b204e9800998ecf8427e"
+        }
+      }
+    }]
+  }</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: S3 Event → SNS (email alert)
+</span>→ Simplest notification mechanism
+→ Human-readable emails
+→ No code to process events
+→ ✅ WE USE THIS — teaches event flow fundamentals
+
+Option B: S3 Event → SQS (queue for processing)
+→ Machine-to-machine communication
+→ Consumer pulls messages and acts on them
+→ Covered in Project 18
+
+Option C: S3 Event → Lambda (instant code execution)
+→ Run code the moment file lands
+→ More complex — requires Lambda function
+→ Covered in later projects
+
+Option D: S3 Event → EventBridge (advanced routing)
+→ Most flexible — filter on any attribute
+→ Route to 20+ AWS services
+→ Covered in Project 41
+
+Option E: S3 Event → SNS → SQS Fan-out (multiple consumers)
+→ One event reaches email + queue + Lambda simultaneously
+→ Covered in Project 14 (concept), Project 28 (full pipeline)
+
+DECISION: Option A
+→ Teaches the core S3→SNS integration
+→ Foundation for ALL event-driven patterns that follow
+→ Every subsequent project (18, 28, 41) builds on this exact wiring</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create SNS Topic BEFORE configuring S3 notification
+</span>   → S3 notification config requires Topic ARN
+   → Cannot reference a non-existent topic
+
+2. Set SNS Topic Policy BEFORE configuring S3 notification
+   → S3 validates permissions during put_bucket_notification_configuration
+   → If SNS policy doesn't allow S3 → API call FAILS with:
+     "Unable to validate the following destination configurations"
+
+3. Use prefix AND suffix filters together
+   → Prefix: "daily_exports/" → targets only our upload path
+   → Suffix: ".csv" → ignores .metadata, .crc, _SUCCESS marker files
+   → More specific = fewer false alerts
+
+4. Use descriptive Event Name IDs
+   → "daily-csv-upload-notification" not "notification1"
+   → You'll have multiple notifications on one bucket eventually
+   → Clear names prevent confusion
+
+5. Confirm email subscription manually
+   → SNS sends confirmation email with a link
+   → Subscription stays "PendingConfirmation" until clicked
+   → No emails delivered until confirmed
+   → Check spam folder — AWS emails often land there
+
+6. Test with a real file upload BEFORE telling the team
+   → Upload a test file → verify email arrives
+   → Verify email contains useful information (filename, time, size)
+   → Then announce the feature
+
+7. Log the S3 event structure for debugging
+   → The JSON event S3 sends has specific structure
+   → Knowing this structure is essential for Projects 18, 28, 41
+   → Parse and print it during testing</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT configure S3 notification before SNS Topic Policy is set
+</span>   → put_bucket_notification_configuration validates destinations
+   → Error: "Unable to validate the following destination configurations"
+   → This error is CRYPTIC — doesn't tell you it's a permission issue
+   → Fix: always set Topic Policy first
+
+2. DO NOT create overlapping prefix filters on same bucket
+   → Two notifications: prefix="daily_exports/" AND prefix="daily_exports/orders/"
+   → Same file matches BOTH → TWO events fired → TWO emails
+   → Duplicate alerts confuse everyone
+   → Rule: no notification prefix should be a subset of another
+
+3. DO NOT assume events are delivered exactly once
+   → S3 Event Notifications guarantee AT-LEAST-ONCE delivery
+   → Rare but possible: same event delivered twice
+   → For SNS email: minor annoyance (2 emails)
+   → For SQS/Lambda processing: must handle idempotency (Project 18)
+
+4. DO NOT use S3 events for real-time streaming
+   → Event delivery latency: typically seconds, can be minutes
+   → Not guaranteed sub-second delivery
+   → For true real-time: use Kinesis (Project 72)
+
+5. DO NOT put notification config on Athena results bucket
+   → Every Athena query writes result files → fires events
+   → 50 queries/day = 100 events/day (result + metadata per query)
+   → Email inbox floods with irrelevant alerts
+
+6. DO NOT forget: S3 events are per-object, not per-upload-batch
+   → Upload 3 files = 3 separate events = 3 separate emails
+   → There is NO "batch complete" event from S3
+   → If you need "all 3 files arrived": build that logic (Project 28)
+
+7. DO NOT hardcode Topic ARN — construct from components
+   → ARN format: arn:aws:sns:{region}:{account_id}:{topic_name}
+   → Account ID can be fetched dynamically via STS
+   → Makes code portable across accounts (Project 56+)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────┬──────────────────────┬─────────────────────────────────────────┐
+</span>│ Scenario                          │ S3 Event Target      │ Why                                     │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Notify humans that file arrived   │ SNS (email/SMS)      │ Human-readable, no code needed          │
+│                                   │                      │ ✅ THIS PROJECT                         │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Queue file for async processing   │ SQS                  │ Decoupled, retry-safe, consumer pulls   │
+│                                   │                      │ Project 18                              │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Run code immediately on arrival   │ Lambda               │ Instant processing, no polling          │
+│ (validate, transform, trigger)    │                      │ Sub-15-min tasks                        │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Complex routing based on          │ EventBridge          │ Filter on any event attribute            │
+│ file attributes                   │                      │ Route to 20+ services, Project 41       │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Fan-out: email + queue + Lambda   │ SNS → multiple       │ One event → many consumers              │
+│ simultaneously                    │ subscribers          │ Project 14 concept, Project 28 full     │
+├───────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ No event needed — just query      │ None (use Athena)    │ Files already in S3, query on demand    │
+│ data when ready                   │                      │ Project 16                              │
+└───────────────────────────────────┴──────────────────────┴─────────────────────────────────────────┘
+
+
+WHEN TO USE SNS vs SQS as S3 event target:
+┌──────────────────────┬───────────────────────────────────────────────────┐
+│ SNS                  │ SQS                                              │
+├──────────────────────┼───────────────────────────────────────────────────┤
+│ Push-based           │ Pull-based                                       │
+│ Notify HUMANS        │ Feed MACHINES                                    │
+│ Fan-out to many      │ One consumer (or consumer group)                 │
+│ No message retention │ Retains messages up to 14 days                   │
+│ No replay            │ Can replay (with DLQ)                            │
+│ Fire-and-forget      │ Guaranteed processing (visibility timeout)       │
+└──────────────────────┴───────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE S3 EVENT NOTIFICATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need guaranteed ordering of events
+</span>   → S3 events are NOT ordered
+   → File A uploaded before File B ≠ Event A delivered before Event B
+   → Use: SQS FIFO + application-level sequencing
+
+2. When you need to filter on object content (not just key name)
+   → S3 events filter on PREFIX and SUFFIX of the key only
+   → Cannot filter: "only CSV files &gt; 10 MB" or "only if column X exists"
+   → Use: EventBridge (richer filtering) or Lambda (custom logic)
+
+3. When you need sub-100ms event processing
+   → S3 event delivery: typically 1-10 seconds, occasionally minutes
+   → Not suitable for real-time trading, gaming, IoT
+   → Use: Kinesis Data Streams (millisecond latency)
+
+4. When bucket receives 10,000+ objects/second
+   → S3 events work at this scale BUT SNS/SQS must handle the throughput
+   → SNS standard: soft limit 30,000 messages/second
+   → Consider: EventBridge (higher throughput, better filtering)
+
+5. When you need event replay / reprocessing
+   → S3 events are fire-and-forget — no event store
+   → If SNS delivery fails → message is lost
+   → Use: EventBridge Archive + Replay feature
+   → Or: S3 → SQS (retains messages up to 14 days)
+
+6. When you need cross-account event routing with complex rules
+   → S3 native events are account-local
+   → Use: EventBridge for cross-account event bus (Project 59)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│              S3 EVENT NOTIFICATION — INTERNAL MECHANICS                      │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  STEP 1: CONFIGURATION (one-time setup)                                      │
+│  ───────────────────────────────────────                                      │
+│  You call: put_bucket_notification_configuration()                           │
+│                                                                              │
+│  S3 stores this config internally per bucket:                                │
+│  ┌─────────────────────────────────────────────────────────────┐             │
+│  │ Bucket: quickcart-raw-data-prod                             │             │
+│  │ Notifications:                                               │             │
+│  │   [0]:                                                       │             │
+│  │     ID: "daily-csv-upload-alert"                             │             │
+│  │     Events: ["s3:ObjectCreated:*"]                           │             │
+│  │     Filter:                                                  │             │
+│  │       Prefix: "daily_exports/"                               │             │
+│  │       Suffix: ".csv"                                         │             │
+│  │     Target: arn:aws:sns:us-east-2:123456789:quickcart-alerts│             │
+│  └─────────────────────────────────────────────────────────────┘             │
+│                                                                              │
+│  VALIDATION AT CONFIG TIME:                                                  │
+│  → S3 calls SNS to verify it CAN publish (test permission)                   │
+│  → If SNS Topic Policy denies → config FAILS immediately                     │
+│  → If Topic doesn't exist → config FAILS immediately                         │
+│  → If prefix/suffix overlap with existing notification → config FAILS        │
+│                                                                              │
+│                                                                              │
+│  STEP 2: OBJECT UPLOAD (runtime)                                             │
+│  ────────────────────────────────                                             │
+│  Client calls PutObject → S3 stores the object                               │
+│                                                                              │
+│  After successful storage (all AZ replicas confirmed):                       │
+│  → S3 checks: does this object key match any notification filter?            │
+│                                                                              │
+│  KEY MATCHING LOGIC:                                                         │
+│  ┌────────────────────────────────────────────────────────────┐              │
+│  │ Object Key: "daily_exports/orders/orders_20250115.csv"     │              │
+│  │                                                            │              │
+│  │ Filter Prefix: "daily_exports/"                            │              │
+│  │   → key.startsWith("daily_exports/") → ✅ MATCH           │              │
+│  │                                                            │              │
+│  │ Filter Suffix: ".csv"                                      │              │
+│  │   → key.endsWith(".csv") → ✅ MATCH                       │              │
+│  │                                                            │              │
+│  │ Both match → FIRE EVENT                                    │              │
+│  └────────────────────────────────────────────────────────────┘              │
+│                                                                              │
+│  NON-MATCHING EXAMPLE:                                                       │
+│  Object Key: "athena-results/query123.csv"                                   │
+│  Filter Prefix: "daily_exports/"                                             │
+│  → key.startsWith("daily_exports/") → ❌ NO MATCH                           │
+│  → Event NOT fired                                                           │
+│                                                                              │
+│                                                                              │
+│  STEP 3: EVENT GENERATION                                                    │
+│  ─────────────────────────                                                   │
+│  S3 constructs an event message JSON:                                        │
+│                                                                              │
+│  {                                                                           │
+│    "Records": [                                                              │
+│      {                                                                       │
+│        "eventVersion": "2.1",                                                │
+│        "eventSource": "aws:s3",                                              │
+│        "awsRegion": "us-east-2",                                             │
+│        "eventTime": "2025-01-15T00:03:12.345Z",                              │
+│        "eventName": "ObjectCreated:Put",                                     │
+│        "userIdentity": {                                                     │
+│          "principalId": "AIDACKCEVSQ6C2EXAMPLE"                              │
+│        },                                                                    │
+│        "requestParameters": {                                                │
+│          "sourceIPAddress": "172.31.10.25"                                   │
+│        },                                                                    │
+│        "responseElements": {                                                 │
+│          "x-amz-request-id": "C3D13FE58DE4C810",                             │
+│          "x-amz-id-2": "FMyUVURIY8/IgAtTv8xRjskZQpcIZ9..."                  │
+│        },                                                                    │
+│        "s3": {                                                               │
+│          "s3SchemaVersion": "1.0",                                           │
+│          "configurationId": "daily-csv-upload-alert",                        │
+│          "bucket": {                                                         │
+│            "name": "quickcart-raw-data-prod",                                │
+│            "ownerIdentity": {"principalId": "A3NL1KOZZKExample"},            │
+│            "arn": "arn:aws:s3:::quickcart-raw-data-prod"                     │
+│          },                                                                  │
+│          "object": {                                                         │
+│            "key": "daily_exports/orders/orders_20250115.csv",                │
+│            "size": 83942,                                                    │
+│            "eTag": "d41d8cd98f00b204e9800998ecf8427e",                       │
+│            "sequencer": "0055AED6DCD90281E5"                                 │
+│          }                                                                   │
+│        }                                                                     │
+│      }                                                                       │
+│    ]                                                                         │
+│  }                                                                           │
+│                                                                              │
+│  KEY FIELDS EXPLAINED:                                                       │
+│  → eventName: "ObjectCreated:Put" (vs CompleteMultipartUpload, Copy)         │
+│  → eventTime: ISO 8601 timestamp of when S3 completed the write             │
+│  → s3.bucket.name: which bucket                                             │
+│  → s3.object.key: full object key (URL-encoded if special chars)            │
+│  → s3.object.size: object size in bytes                                     │
+│  → s3.object.eTag: MD5 hash for integrity                                   │
+│  → s3.object.sequencer: guarantees ordering per object key                  │
+│  → configurationId: which notification rule triggered this                  │
+│                                                                              │
+│                                                                              │
+│  STEP 4: EVENT DELIVERY TO SNS                                               │
+│  ──────────────────────────────                                              │
+│  S3 calls SNS Publish API with the event JSON as message body               │
+│                                                                              │
+│  SNS receives the message:                                                   │
+│  → Wraps it in an SNS envelope (adds MessageId, TopicArn, Timestamp)        │
+│  → Looks up all subscriptions for the topic                                  │
+│  → Delivers to each subscriber based on protocol:                           │
+│                                                                              │
+│    Email subscriber:                                                         │
+│    → SNS formats the JSON into email body                                   │
+│    → Sends via AWS SES (internal)                                           │
+│    → Subject: "Amazon S3 Notification"                                      │
+│    → Body: the raw JSON event (not pretty — but parseable)                  │
+│                                                                              │
+│    SQS subscriber (Project 18):                                              │
+│    → SNS calls SQS SendMessage                                              │
+│    → Message body = SNS envelope containing S3 event                        │
+│    → Double-wrapped: SQS message → SNS envelope → S3 event                 │
+│                                                                              │
+│    Lambda subscriber:                                                        │
+│    → SNS calls Lambda Invoke                                                │
+│    → Event passed directly to Lambda handler                                │
+│                                                                              │
+│                                                                              │
+│  STEP 5: DELIVERY GUARANTEES                                                 │
+│  ────────────────────────────                                                │
+│  S3 → SNS: AT-LEAST-ONCE delivery                                           │
+│  → Rare duplicates possible (S3 retries on transient SNS errors)            │
+│  → No message is lost (if SNS Topic Policy is correct)                      │
+│  → If SNS is down: S3 retries for a limited time, then drops               │
+│                                                                              │
+│  SNS → Email: BEST-EFFORT                                                    │
+│  → Email delivery is inherently unreliable (spam filters, bounces)          │
+│  → SNS → SQS is MORE reliable (Project 18)                                  │
+│                                                                              │
+│  LATENCY:                                                                    │
+│  → S3 event generation: typically &lt; 1 second after object stored            │
+│  → SNS delivery: milliseconds                                               │
+│  → Email arrival: 5-60 seconds (depends on email provider)                  │
+│  → Total end-to-end: 5-90 seconds typical                                   │
+│                                                                              │
+│                                                                              │
+│  SUPPORTED EVENT TYPES:                                                      │
+│  ┌────────────────────────────────────┬──────────────────────────────┐       │
+│  │ Event                              │ When Fired                   │       │
+│  ├────────────────────────────────────┼──────────────────────────────┤       │
+│  │ s3:ObjectCreated:*                 │ Any create (Put, Post,       │       │
+│  │                                    │ Copy, Multipart)             │       │
+│  │ s3:ObjectCreated:Put               │ PutObject only               │       │
+│  │ s3:ObjectCreated:CompleteMultipart │ Multipart upload completed   │       │
+│  │ s3:ObjectRemoved:*                 │ Any delete                   │       │
+│  │ s3:ObjectRemoved:Delete            │ DeleteObject                 │       │
+│  │ s3:ObjectRemoved:DeleteMarkerCreated│ Versioned delete            │       │
+│  │ s3:ObjectRestore:Completed         │ Glacier restore done         │       │
+│  │ s3:ReducedRedundancyLostObject     │ RRS data loss (deprecated)   │       │
+│  │ s3:Replication:*                   │ Replication events           │       │
+│  │ s3:ObjectTagging:*                 │ Tag added/removed            │       │
+│  └────────────────────────────────────┴──────────────────────────────┘       │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Unable to validate the following destination configurations"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ THE #1 most common error in S3→SNS setup
+→ Cause: SNS Topic Policy does not allow s3.amazonaws.com to publish
+→ Fix: set Topic Policy BEFORE calling put_bucket_notification_configuration
+→ Also check: Topic ARN is correct, Topic exists in same region as bucket
+→ Also check: no typo in region (us-east-2 vs us-east-1)
+
+PITFALL 2: "Notifications configured but no emails arrive"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: Email subscription not confirmed (still "PendingConfirmation")
+→ Cause B: Emails going to spam folder (AWS emails flagged by some providers)
+→ Cause C: Prefix/suffix filter doesn't match uploaded file's key
+→ Debug: check SNS subscription status → must be "Confirmed"
+→ Debug: upload test file matching exact prefix+suffix → check CloudTrail
+
+PITFALL 3: "I get notifications for files I didn't upload"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: prefix filter too broad
+→ "daily_exports/" matches: daily_exports/orders/*.csv AND daily_exports/temp/*.csv
+→ Fix: narrow the prefix or use multiple specific notifications
+→ Or: use EventBridge for richer filtering (Project 41)
+
+PITFALL 4: "put_bucket_notification_configuration REPLACES all existing notifications"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ THIS IS CRITICAL AND DANGEROUS
+→ The API is a PUT, not a PATCH
+→ If bucket already has Notification A and you add Notification B:
+  → You must include BOTH A and B in the API call
+  → If you only include B → Notification A is DELETED
+→ Fix: always GET existing config first, merge, then PUT
+→ Our code handles this correctly (see implementation below)
+
+PITFALL 5: "Duplicate events — same file triggers two notifications"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: overlapping prefix filters (two rules match same key)
+→ Cause B: S3 at-least-once delivery (rare duplicate)
+→ Fix A: ensure no notification prefix is subset of another
+→ Fix B: for processing (not alerts), implement idempotency (Project 18)
+
+PITFALL 6: "Object key in event is URL-encoded"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ S3 event encodes special characters in object key
+→ Space → "+", "+" → "%2B", etc.
+→ Key "my folder/file (1).csv" → "my+folder/file+%281%29.csv"
+→ Must URL-decode before using key in S3 GetObject calls
+→ Python: urllib.parse.unquote_plus(key)
+
+PITFALL 7: "Events work for PutObject but not multipart upload"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: filter set to "s3:ObjectCreated:Put" specifically
+→ boto3 upload_file() uses multipart for files &gt; threshold (default 8 MB)
+→ Multipart fires "s3:ObjectCreated:CompleteMultipartUpload", NOT "Put"
+→ Fix: use "s3:ObjectCreated:*" to catch ALL creation methods</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVENT THROUGHPUT:
+</span>━━━━━━━━━━━━━━━━
+→ S3: can emit events for thousands of objects/second
+→ SNS Standard Topic: 30,000 messages/second (soft limit)
+→ For QuickCart's 3 files/day: laughably within limits
+
+EMAIL SCALING:
+━━━━━━━━━━━━━━
+→ SNS email: not designed for high-volume email campaigns
+→ Works great for alerts to 1-50 recipients
+→ For 1000+ recipients: use SES (Simple Email Service)
+→ SNS email has no rich formatting (HTML limited)
+
+NOTIFICATION SCALING:
+━━━━━━━━━━━━━━━━━━━━━
+→ Max notifications per bucket: 100 event configurations
+→ Each config can target: 1 SNS topic OR 1 SQS queue OR 1 Lambda
+→ To send to MULTIPLE targets: use SNS fan-out (Project 14)
+→ Or use EventBridge (unlimited targets per rule)
+
+COST SCALING:
+━━━━━━━━━━━━━
+→ S3 Event Notifications: FREE (no charge for event generation)
+→ SNS: first 1,000,000 requests/month FREE
+→ SNS email: $0 (included in free tier)
+→ SNS SMS: $0.00645 per message (US)
+→ For QuickCart: 3 events/day × 30 days = 90 events/month → $0.00
+
+MULTI-BUCKET SCALING:
+━━━━━━━━━━━━━━━━━━━━━
+→ Each bucket has its own notification configuration
+→ 10 buckets × 10 notifications each = 100 separate event flows
+→ All can point to same SNS topic (centralized alerting)
+→ Or separate topics per team/domain (decentralized)
+
+WHEN TO GRADUATE FROM S3→SNS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 100+ events/minute → consider SQS for buffering
+→ Complex routing rules → use EventBridge
+→ Need event replay → use EventBridge Archive
+→ Need exactly-once processing → use SQS FIFO + Lambda</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY S3 EVENT NOTIFICATIONS ARE WORKING:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check notification configuration on bucket
+   → aws s3api get-bucket-notification-configuration --bucket BUCKET_NAME
+   → Should return JSON with your TopicConfiguration
+   → If empty → notification was never set or was overwritten
+
+2. Check SNS subscription status
+   → aws sns list-subscriptions-by-topic --topic-arn TOPIC_ARN
+   → Each subscription shows: SubscriptionArn, Protocol, Endpoint
+   → Status "PendingConfirmation" = email not confirmed yet
+
+3. Check CloudTrail for event delivery
+   → CloudTrail logs SNS:Publish calls made by s3.amazonaws.com
+   → Proves S3 attempted delivery
+   → If no CloudTrail entry → filter didn't match OR config is wrong
+
+4. Upload a test file and time it
+   → Upload file matching prefix+suffix filter
+   → Start a timer
+   → Check email inbox (including spam)
+   → Typical: email arrives in 5-30 seconds
+
+5. Check SNS delivery metrics in CloudWatch
+   → Metric: NumberOfMessagesPublished (per topic)
+   → Metric: NumberOfNotificationsDelivered
+   → Metric: NumberOfNotificationsFailed
+   → Gap between Published and Delivered = delivery failures
+
+6. Parse the email body
+   → Email contains raw JSON event
+   → Extract: bucket name, object key, size, event time
+   → Verify these match the file you uploaded</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(17)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create SNS Topic with S3 Publish Permission</h3>
+
+<h3>Step 2: Configure S3 Event Notification</h3>
+
+<h3>Step 3: Test the Notification</h3>
+
+<h3>Step 4: Parse S3 Event from SNS Email (Understanding the Structure)</h3>
+
+<h3>Step 5: Monitor and List Active Notifications</h3>
+
+<h3>Step 6: Cleanup</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Files exist in daily_exports/ (Project 1)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create SNS Topic with S3 publish permission</span><span>
+</span>python 17_01_create_sns_topic.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → IMPORTANT: Confirm email subscription before proceeding!</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Configure S3 event notification</span><span>
+</span>python 17_02_configure_s3_events.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Test with file uploads</span><span>
+</span>python 17_03_test_notification.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Check email for notification from Test 1</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Verify NO email for Tests 2 and 3</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Understand event JSON structure (reference)</span><span>
+</span>python 17_04_parse_s3_event.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Monitor active notifications</span><span>
+</span>python 17_05_monitor_notifications.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Cleanup when done</span><span>
+</span>python 17_06_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED EMAIL (received after Test 1 upload):
+</span>
+From: AWS Notifications &lt;<a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="a7c9c88ad5c2d7cbdee7d4c9d489c6cac6ddc8c9c6d0d489c4c8ca">[email&#160;protected]</a>&gt;
+Subject: Amazon S3 Notification
+Body:
+{
+  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "us-east-2",
+      "eventTime": "2025-01-15T00:03:12.345Z",
+      "eventName": "ObjectCreated:Put",
+      "s3": {
+        "bucket": {
+          "name": "quickcart-raw-data-prod"
+        },
+        "object": {
+          "key": "daily_exports/orders/test_notification_20250115_000312.csv",
+          "size": 187,
+          "eTag": "a1b2c3d4e5f6..."
+        }
+      }
+    }
+  ]
+}</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 can fire events when objects are created, deleted, restored, etc.
+→ Events route to SNS (notifications), SQS (queuing), Lambda (processing)
+→ PREFIX + SUFFIX filters control which files trigger events
+→ SNS Topic Policy MUST allow s3.amazonaws.com BEFORE configuring S3
+→ put_bucket_notification_configuration is FULL REPLACE — always GET→MERGE→PUT
+→ S3 event JSON has specific structure with URL-encoded object keys
+→ Events are AT-LEAST-ONCE — rare duplicates possible
+→ Email subscriptions require manual confirmation before delivery
+→ DDL/config validation happens at setup time — not at event time
+→ The S3 event JSON structure is THE FOUNDATION for all event-driven patterns
+
+WHAT THIS CONNECTS BACKWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 bucket + upload script = the SOURCE of events
+→ Project 12: SNS topic + subscription basics = the DELIVERY mechanism
+→ Project 3: IAM/bucket policies = understanding resource policies
+   (SNS Topic Policy follows same Principal/Action/Resource/Condition pattern)
+
+WHAT THIS CONNECTS FORWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 18: Same S3 event → SQS instead of SNS
+   → Machine-to-machine communication
+   → Consumer PULLS messages instead of PUSH
+   → Retry-safe, persistent, 14-day retention
+
+→ Project 14: SNS → SQS Fan-out
+   → One S3 event reaches BOTH email AND processing queue
+   → Same event, multiple consumers simultaneously
+
+→ Project 27: EC2 worker polling SQS for file processing jobs
+   → The SQS message contains the S3 event
+   → Worker parses event → downloads file → processes
+
+→ Project 28: Full pipeline: S3 → SNS → SQS → EC2 worker
+   → End-to-end event-driven file processing
+   → Combines Projects 17 + 18 + 27
+
+→ Project 41: EventBridge replaces SNS for richer routing
+   → Filter on ANY event attribute (not just prefix/suffix)
+   → Route to Step Functions for orchestration
+
+THE EVENT-DRIVEN ARCHITECTURE PROGRESSION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Project 17 (HERE):     S3 → SNS → Email (human notification)
+       ↓
+  Project 18 (NEXT):     S3 → SQS (machine queuing)
+       ↓
+  Project 14 (Fan-out):  S3 → SNS → [Email + SQS + Lambda]
+       ↓
+  Project 27 (Worker):   SQS → EC2 Consumer (polling + processing)
+       ↓
+  Project 28 (Pipeline): S3 → SNS → SQS → EC2 → Redshift
+       ↓
+  Project 41 (Advanced): S3 → EventBridge → Step Functions → Glue</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's data team now receives email alerts when files land in S3.
+</span>Problem solved for HUMANS — but what about MACHINES?
+
+NEW REQUIREMENT:
+→ When orders_YYYYMMDD.csv lands in S3
+→ An EC2 processing script should automatically:
+  1. Know a new file arrived
+  2. Download the file
+  3. Load it into MariaDB (Project 19) or Redshift (Project 21)
+
+Email won't work for this because:
+→ Machines don't read email
+→ Email is unreliable (spam filters, delays)
+→ No retry mechanism if processing fails
+→ No message persistence — once delivered, gone
+
+WHAT WE NEED:
+→ A message QUEUE where S3 events are stored
+→ EC2 script POLLS the queue periodically
+→ Picks up new file notifications
+→ Processes them one by one
+→ Deletes from queue only AFTER successful processing
+→ If processing fails → message reappears for retry
+
+CTO: "Can we make the EC2 script automatically know when files arrive?"
+YOU: "Yes — S3 sends events to SQS. EC2 polls SQS. Same event, 
+      but now a machine consumes it instead of a human."
+
+→ Project 18: "Queue a Processing Job the Instant a File Lands in S3"
+→ Introduces: S3 → SQS Event Notification → Queue Policy → JSON Parsing</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-16.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 17 of 80</span>
+    <span class="nav-project-title">TRIGGER AN ALERT THE INSTANT A FILE LANDS IN S3</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-18.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-18.html") window.location = "project-18.html";
+  if (e.key === 'ArrowLeft' && "project-16.html") window.location = "project-16.html";
+});
+</script>
+</body>
+</html>

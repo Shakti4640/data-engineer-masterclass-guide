@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 44: DESIGN A PROPER BRONZE → SILVER → GOLD DATA LAKE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:55%"></div></div>
+<div id="progress-label">55%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 44 of 80</div>
+  <div class="project-title">DESIGN A PROPER BRONZE → SILVER → GOLD DATA LAKE</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — 18 months old, data team growing to 5 people
+</span>Team: 2 data engineers (you + junior), 1 analytics engineer, 1 ML engineer, 1 BI analyst
+
+CURRENT STATE (built through Projects 1–43):
+→ Forward CDC: MariaDB → S3 → Glue → Redshift (Project 42)
+→ Reverse ETL: Redshift → S3 → Glue → MariaDB (Project 43)
+→ Athena queries on S3 data (Projects 24, 26)
+→ Glue Crawlers + ETL jobs (Projects 23, 25, 33, 34)
+→ Event-driven orchestration (Project 41)
+
+THE DATA SWAMP PROBLEM:
+
+  s3://quickcart-raw-data-prod/
+  ├── daily_exports/                     ← Full dumps (Project 20) — STILL LANDING HERE
+  │   ├── orders/orders_20250101.csv
+  │   ├── orders/orders_20250115.csv     ← 15 copies of full dumps!
+  │   ├── customers/...
+  │   └── products/...
+  ├── cdc_exports/                       ← CDC files (Project 42)
+  │   └── orders/dt=2025-01-15/
+  ├── reverse_etl/                       ← UNLOAD outputs (Project 43)
+  │   ├── customer_metrics/dt=2025-01-15/
+  │   └── customer_recommendations/dt=2025-01-15/
+  ├── curated/                           ← Glue Parquet outputs (Project 25)
+  │   ├── orders/part-00000.parquet
+  │   └── orders/part-00001.parquet      ← NO partitioning! All in one folder!
+  ├── glue-temp/                         ← Glue temp files (never cleaned up)
+  │   └── (500 MB of garbage)
+  ├── glue-scripts/                      ← Job scripts
+  ├── athena-results/                    ← Athena query outputs (never cleaned up)
+  │   └── (200 MB of old query results)
+  └── glue-libs/                         ← JDBC JARs
+
+PROBLEMS EVERYONE IS FACING:
+
+  Data Engineer (you):
+  → "Where do I write CDC output? curated/? cdc_exports/? daily_exports/?"
+  → "Old full dumps are eating 50 GB of storage — can I delete them?"
+  → "Glue temp files keep accumulating — who cleans them?"
+
+  Junior Data Engineer:
+  → "I wrote a new Glue job that outputs to my_test_output/ — is that OK?"
+  → "I accidentally overwrote the curated/orders/ folder — how do we recover?"
+
+  Analytics Engineer:
+  → "I'm building dbt models — should I write output to curated/ or somewhere new?"
+  → "The Parquet files in curated/ have mixed schemas — some have updated_at, some don't"
+
+  ML Engineer:
+  → "I need a place to store feature engineering outputs for the recommendation model"
+  → "Can I read from curated/? Or is that not cleaned yet?"
+
+  BI Analyst:
+  → "Which data is trustworthy? I queried curated/ and got weird null values"
+  → "Where do I find the FINAL, CLEAN, VALIDATED data for dashboards?"
+
+  CTO:
+  → "This is a data swamp, not a data lake."
+  → "I need ZONES. I need RULES. I need to know what's raw, what's clean,
+     and what's ready for business consumption."
+  → "Design this properly. Now."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the Medallion Architecture (Bronze/Silver/Gold)
+</span>→ Invented by Databricks, adopted industry-wide
+→ Organizes data lake into PROGRESSIVE QUALITY LAYERS
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                   MEDALLION ARCHITECTURE                            │
+  │                                                                     │
+  │  ┌───────────┐      ┌───────────┐      ┌───────────┐              │
+  │  │  BRONZE   │─────→│  SILVER   │─────→│   GOLD    │              │
+  │  │  (Raw)    │      │ (Cleansed)│      │ (Curated) │              │
+  │  └───────────┘      └───────────┘      └───────────┘              │
+  │                                                                     │
+  │  BRONZE: Exact copy of source data. No transformations.             │
+  │  → "What arrived from the source, byte-for-byte"                   │
+  │  → CSV, JSON, Parquet — whatever the source produces               │
+  │  → Append-only (never delete, never overwrite)                     │
+  │  → Used for: replay, audit, debugging, reprocessing                │
+  │                                                                     │
+  │  SILVER: Cleaned, deduplicated, typed, standardized                │
+  │  → Schema enforced (correct data types, nulls handled)             │
+  │  → Duplicates removed (CDC overlap rows, retry duplicates)         │
+  │  → Format: always Parquet (columnar, compressed)                   │
+  │  → Partitioned by date for efficient querying                      │
+  │  → Used for: data engineering, ad-hoc analysis, ML feature input   │
+  │                                                                     │
+  │  GOLD: Business-level aggregations, ready for consumption          │
+  │  → Pre-computed metrics (CLV, churn, revenue by segment)           │
+  │  → Joined/denormalized for specific use cases                      │
+  │  → Data quality validated (no nulls in required fields)            │
+  │  → Used for: dashboards, reports, ML models, reverse ETL           │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+Step 2: Map QuickCart's existing data to zones
+
+  ┌────────────────────────────────┬──────────┬─────────────────────────┐
+  │ Current Location               │ Zone     │ Why                     │
+  ├────────────────────────────────┼──────────┼─────────────────────────┤
+  │ daily_exports/ (full dumps)    │ BRONZE   │ Raw source data         │
+  │ cdc_exports/ (CDC CSVs)        │ BRONZE   │ Raw incremental data    │
+  │ reverse_etl/ (UNLOAD Parquet)  │ BRONZE   │ Raw from Redshift       │
+  │ curated/ (Glue Parquet)        │ SILVER   │ Transformed + cleaned   │
+  │ (doesn't exist yet)            │ GOLD     │ Business aggregations   │
+  │ glue-temp/                     │ SYSTEM   │ Not data — temp files   │
+  │ glue-scripts/                  │ SYSTEM   │ Not data — code         │
+  │ athena-results/                │ SYSTEM   │ Not data — query output │
+  │ glue-libs/                     │ SYSTEM   │ Not data — libraries    │
+  └────────────────────────────────┴──────────┴─────────────────────────┘
+
+Step 3: Decide bucket strategy
+
+  Option A: Single bucket, multiple prefixes (current)
+  → quickcart-raw-data-prod/bronze/
+  → quickcart-raw-data-prod/silver/
+  → quickcart-raw-data-prod/gold/
+  → Pros: simple, one bucket policy
+  → Cons: hard to apply different lifecycle rules per zone,
+    harder to grant zone-specific IAM permissions
+
+  Option B: One bucket per zone (recommended for production)
+  → quickcart-bronze-prod
+  → quickcart-silver-prod
+  → quickcart-gold-prod
+  → quickcart-system-prod
+  → Pros: independent lifecycle, IAM, versioning, encryption per zone
+  → Cons: more buckets to manage, cross-bucket references
+
+  Option C: Hybrid — one bucket with prefix-level IAM
+  → quickcart-datalake-prod/bronze/
+  → quickcart-datalake-prod/silver/
+  → quickcart-datalake-prod/gold/
+  → Pros: fewer buckets, prefix-level IAM policies work
+  → Cons: single lifecycle policy per bucket (can use prefix rules)
+
+  DECISION: Option C (Hybrid) for QuickCart's scale
+  → Simpler than multi-bucket
+  → Prefix-based lifecycle rules available since 2021
+  → Prefix-based IAM policies work well (Project 3)
+  → When QuickCart grows to 50+ TB → migrate to Option B
+
+Step 4: Define naming conventions for every path
+Step 5: Define lifecycle rules per zone
+Step 6: Define access controls per zone
+Step 7: Define data quality gates between zones
+Step 8: Implement with code</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE DATA LAKE ARCHITECTURE:
+</span>
+  s3://quickcart-datalake-prod/
+  │
+  ├── bronze/                                    ← RAW ZONE
+  │   ├── mariadb/                               ← Source system grouping
+  │   │   ├── full_dump/                         ← Full dumps (Project 20)
+  │   │   │   ├── orders/
+  │   │   │   │   └── year=2025/month=01/day=15/
+  │   │   │   │       └── orders_20250115.csv
+  │   │   │   ├── customers/
+  │   │   │   │   └── year=2025/month=01/day=15/
+  │   │   │   │       └── customers_20250115.csv
+  │   │   │   └── products/
+  │   │   │       └── year=2025/month=01/day=15/
+  │   │   │           └── products_20250115.csv
+  │   │   └── cdc/                               ← CDC extracts (Project 42)
+  │   │       ├── orders/
+  │   │       │   └── year=2025/month=01/day=15/
+  │   │       │       └── orders_cdc_20250115.csv
+  │   │       ├── customers/
+  │   │       │   └── year=2025/month=01/day=15/
+  │   │       └── products/
+  │   │           └── year=2025/month=01/day=15/
+  │   └── redshift/                              ← Reverse ETL UNLOAD (Project 43)
+  │       ├── customer_metrics/
+  │       │   └── year=2025/month=01/day=15/
+  │       └── customer_recommendations/
+  │           └── year=2025/month=01/day=15/
+  │
+  ├── silver/                                    ← CLEANSED ZONE
+  │   ├── orders/                                ← Entity-level organization
+  │   │   └── year=2025/month=01/day=15/
+  │   │       ├── part-00000.snappy.parquet
+  │   │       ├── part-00001.snappy.parquet
+  │   │       └── _metadata/
+  │   │           └── schema.json
+  │   ├── customers/
+  │   │   └── year=2025/month=01/day=15/
+  │   └── products/
+  │       └── year=2025/month=01/day=15/
+  │
+  ├── gold/                                      ← CURATED ZONE
+  │   ├── customer_360/                          ← Business domain tables
+  │   │   └── year=2025/month=01/day=15/
+  │   ├── revenue_daily/
+  │   │   └── year=2025/month=01/day=15/
+  │   ├── product_performance/
+  │   │   └── year=2025/month=01/day=15/
+  │   └── recommendation_scores/
+  │       └── year=2025/month=01/day=15/
+  │
+  └── _system/                                   ← OPERATIONAL (not data)
+      ├── glue-temp/
+      ├── glue-scripts/
+      ├── glue-libs/
+      ├── athena-results/
+      └── logs/
+
+  NAMING CONVENTIONS:
+  ━━━━━━━━━━━━━━━━━━
+  Zone:    {zone}/
+  Source:  {zone}/{source_system}/
+  Entity:  {zone}/{source_system}/{entity_name}/  (bronze)
+           {zone}/{entity_name}/                  (silver/gold)
+  Partition: year=YYYY/month=MM/day=DD/
+  File:    {entity}_{YYYYMMDD}[_{suffix}].{format}</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Just rename prefixes in existing bucket
+</span>→ Move files from daily_exports/ → bronze/mariadb/full_dump/
+→ Move files from curated/ → silver/
+→ Problem: breaks all existing Glue jobs, Athena tables, crawlers
+→ Problem: no lifecycle rules, no access controls
+→ VERDICT: Cosmetic fix, doesn't solve real problems
+
+Option B: Create new bucket with proper structure, migrate gradually
+→ New bucket: quickcart-datalake-prod
+→ Update pipelines one by one to write to new paths
+→ Keep old bucket running during migration
+→ Decommission old bucket when all pipelines migrated
+→ VERDICT: ✅ Safe, incremental, production-friendly
+
+Option C: Use AWS Lake Formation to manage everything
+→ Lake Formation provides: catalog, permissions, zones
+→ Problem: adds complexity, learning curve, costs
+→ Better for: 50+ tables, 10+ teams, cross-account sharing
+→ VERDICT: Future consideration (Project 73, 74), overkill now
+
+DECISION: Option B — new bucket with proper structure, gradual migration</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create ONE new bucket with clear zone prefixes
+</span>   → quickcart-datalake-prod (single bucket, prefix-based zones)
+   → bronze/, silver/, gold/, _system/
+   → Each zone has specific lifecycle, access, and quality rules
+
+2. Define ZONE CONTRACTS — who writes, who reads
+
+   ┌──────────┬──────────────────┬────────────────────────┬──────────────┐
+   │ Zone     │ Who Writes       │ Who Reads              │ Format       │
+   ├──────────┼──────────────────┼────────────────────────┼──────────────┤
+   │ Bronze   │ Ingestion jobs   │ Data engineers only    │ Any (CSV,    │
+   │          │ CDC scripts      │ (for debugging/replay) │ JSON, Parquet│
+   │          │ UNLOAD scripts   │                        │ as received) │
+   ├──────────┼──────────────────┼────────────────────────┼──────────────┤
+   │ Silver   │ Glue ETL jobs    │ Data engineers          │ Parquet only │
+   │          │ (Bronze→Silver)  │ Analytics engineers     │ Snappy       │
+   │          │                  │ ML engineers            │ compressed   │
+   │          │                  │ (via Athena)            │              │
+   ├──────────┼──────────────────┼────────────────────────┼──────────────┤
+   │ Gold     │ Glue ETL jobs    │ Everyone               │ Parquet only │
+   │          │ (Silver→Gold)    │ BI analysts             │ Snappy       │
+   │          │ dbt models       │ Dashboards              │ compressed   │
+   │          │                  │ Reverse ETL             │              │
+   │          │                  │ ML models               │              │
+   └──────────┴──────────────────┴────────────────────────┴──────────────┘
+
+3. Define LIFECYCLE RULES per zone prefix
+
+   ┌──────────┬─────────────────────────────────────────────────────┐
+   │ Zone     │ Lifecycle Rule                                      │
+   ├──────────┼─────────────────────────────────────────────────────┤
+   │ Bronze   │ Stay in Standard for 30 days                        │
+   │          │ → Move to Infrequent Access after 30 days           │
+   │          │ → Move to Glacier after 90 days                     │
+   │          │ → Delete after 365 days (unless compliance requires)│
+   ├──────────┼─────────────────────────────────────────────────────┤
+   │ Silver   │ Stay in Standard for 60 days                        │
+   │          │ → Move to Infrequent Access after 60 days           │
+   │          │ → Delete after 180 days (regenerable from Bronze)   │
+   ├──────────┼─────────────────────────────────────────────────────┤
+   │ Gold     │ Stay in Standard for 90 days                        │
+   │          │ → Move to Infrequent Access after 90 days           │
+   │          │ → Delete after 365 days (regenerable from Silver)   │
+   ├──────────┼─────────────────────────────────────────────────────┤
+   │ _system  │ Delete glue-temp/ after 7 days                      │
+   │          │ Delete athena-results/ after 30 days                │
+   │          │ Keep glue-scripts/ indefinitely                     │
+   └──────────┴─────────────────────────────────────────────────────┘
+
+4. Define DATA QUALITY GATES between zones
+
+   Bronze → Silver gate:
+   → Schema validation (all expected columns present)
+   → Data type casting (strings → proper types)
+   → Null handling (replace with defaults or flag)
+   → Deduplication (CDC overlap, retry duplicates)
+   → Format conversion (CSV → Parquet)
+
+   Silver → Gold gate:
+   → Business rule validation (order amount &gt; 0, dates in range)
+   → Referential integrity (customer_id exists in customers table)
+   → Completeness check (no entity has 0 rows)
+   → Freshness check (data is from expected date)
+
+5. Enable S3 Versioning on the bucket
+   → Protects against accidental overwrites (Project 2)
+   → Critical for bronze (raw data = irreplaceable)
+   → Less critical for silver/gold (regenerable from upstream)
+
+6. Tag all objects with zone metadata
+   → x-amz-meta-zone: bronze/silver/gold
+   → x-amz-meta-source: mariadb/redshift/external
+   → x-amz-meta-entity: orders/customers/products
+   → x-amz-meta-pipeline-run-id: step-functions-execution-id</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT allow anyone to write directly to Gold
+</span>   → Gold is the "single source of truth" for business
+   → If analyst writes ad-hoc output to gold/ → untrusted data mixes in
+   → Enforce: only approved Glue jobs can write to gold/
+
+2. DO NOT delete Bronze data to save cost (before lifecycle)
+   → Bronze is your INSURANCE POLICY
+   → If Silver transformation has a bug → replay from Bronze
+   → If Redshift data is corrupted → rebuild from Bronze
+   → Cost of Bronze storage &lt;&lt; cost of data loss
+
+3. DO NOT skip the Silver layer (Bronze → Gold directly)
+   → Tempting: "just transform raw to final in one step"
+   → Problem: no intermediate checkpoint
+   → If Gold transformation fails midway: must re-read raw data
+   → Silver provides: checkpointed, typed, deduplicated data
+   → Gold builds ON TOP of Silver (faster, cheaper)
+
+4. DO NOT mix formats within a zone
+   → Bronze: ANY format (whatever source produces) — OK
+   → Silver: MUST be Parquet (no CSV, no JSON)
+   → Gold: MUST be Parquet (no exceptions)
+   → Mixing formats in Silver/Gold breaks Athena partition scanning
+
+5. DO NOT put system files in data zones
+   → glue-temp/ in bronze/ → Crawler discovers temp files as data
+   → athena-results/ in silver/ → Query outputs mixed with ETL outputs
+   → _system/ prefix with underscore → Glue Crawlers skip it by default
+
+6. DO NOT create deep partition hierarchies
+   → year=2025/month=01/day=15/hour=02/minute=30/ → TOO DEEP
+   → Athena/Glue must list every level → slow
+   → Sweet spot: year=/month=/day=/ (3 levels max for daily data)
+   → For hourly: year=/month=/day=/hour=/ (4 levels max)
+
+7. DO NOT let multiple pipelines write to the same Silver/Gold prefix
+   → Pipeline A writes orders/ silver at 2:00 AM
+   → Pipeline B overwrites orders/ silver at 2:30 AM
+   → Race condition → partial data → broken queries
+   → Rule: one pipeline owns one prefix, always</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────┬──────────────────────────────┬─────────────────────────────┐
+</span>│ Architecture Pattern           │ Use When                     │ Don't Use When              │
+├────────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Medallion (Bronze/Silver/Gold) │ Batch ETL pipelines          │ Real-time streaming only    │
+│ (THIS PROJECT)                 │ Multiple consumers           │ Single-use data (temp)      │
+│                                │ Need audit trail             │ Prototyping / experiments   │
+│                                │ Data quality is important    │                             │
+├────────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Raw + Processed (2 zones)      │ Simple pipelines             │ Multiple consumer profiles  │
+│                                │ Small team (1-2 people)      │ Need quality gates          │
+│                                │ &lt; 10 tables                  │                             │
+├────────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Landing + Raw + Trusted + Ref  │ Enterprise (100+ tables)     │ Startup / small team        │
+│ (4+ zones)                     │ Regulatory compliance        │ &lt; 20 tables                 │
+│                                │ Multiple source systems      │ Speed over governance       │
+├────────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Data Mesh (domain-based)       │ Multiple autonomous teams    │ Single data team            │
+│ (Project 71)                   │ 10+ data domains             │ &lt; 5 source systems          │
+│                                │ Organizational decentralization│                           │
+└────────────────────────────────┴──────────────────────────────┴─────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE MEDALLION ARCHITECTURE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you have a single pipeline with a single consumer
+</span>   → Overhead of 3 zones for 1 table read by 1 dashboard = overkill
+   → Just use: raw/ and processed/ (2 zones)
+
+2. When all data is already clean from the source
+   → API returns perfectly typed JSON → no cleaning needed
+   → Bronze and Silver would be identical → skip Silver
+   → Go: Bronze (raw JSON) → Gold (aggregated)
+
+3. When data is purely transient (process and discard)
+   → Stream processing: Kinesis → Lambda → DynamoDB
+   → No need to persist intermediate states
+   → Medallion is for PERSISTENT data lake storage
+
+4. When budget is extremely tight and storage costs matter
+   → 3 copies of data (Bronze + Silver + Gold) = 3× storage
+   → 100 GB raw → ~100 GB Bronze + ~70 GB Silver + ~20 GB Gold = ~190 GB
+   → At $0.023/GB = $4.37/month (usually fine, but consider)
+   → Mitigation: lifecycle rules move old data to cheaper tiers
+
+5. When team lacks discipline to maintain zone boundaries
+   → Medallion requires GOVERNANCE: who writes where, quality gates
+   → Without discipline: people write anywhere → back to data swamp
+   → Better to start with 2 simple zones than 3 ungoverned zones</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: MEDALLION DATA LAKE                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ How S3 Prefix-Based Lifecycle Rules Work                                    │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                   │
+│                                                                                 │
+│  S3 Lifecycle Configuration (bucket-level):                                     │
+│  → Rules evaluated DAILY at midnight UTC                                        │
+│  → Each rule has: prefix filter + action + days threshold                       │
+│  → Multiple rules can coexist (evaluated independently)                         │
+│                                                                                 │
+│  Example: Bronze lifecycle rule                                                 │
+│  {                                                                              │
+│    "ID": "bronze-lifecycle",                                                    │
+│    "Filter": {"Prefix": "bronze/"},                                             │
+│    "Transitions": [                                                             │
+│      {"Days": 30, "StorageClass": "STANDARD_IA"},                              │
+│      {"Days": 90, "StorageClass": "GLACIER"}                                   │
+│    ],                                                                           │
+│    "Expiration": {"Days": 365}                                                  │
+│  }                                                                              │
+│                                                                                 │
+│  Internal execution:                                                            │
+│  1. S3 maintains a lifecycle evaluation queue (internal)                        │
+│  2. Daily: scans all objects matching each rule's prefix                        │
+│  3. For each object: compare (today - LastModified) vs Days threshold           │
+│  4. If threshold met: schedule transition/deletion                              │
+│  5. Transitions happen asynchronously (may take 24-48 hours)                    │
+│  6. Object metadata updated: x-amz-storage-class changes                       │
+│                                                                                 │
+│  COST IMPACT per zone:                                                          │
+│  ┌──────────┬──────────────┬─────────────┬─────────────┬──────────────┐        │
+│  │ Zone     │ 0-30 days    │ 30-90 days  │ 90-365 days │ After 365    │        │
+│  │          │ (Standard)   │ (Std or IA) │ (IA/Glacier)│              │        │
+│  ├──────────┼──────────────┼─────────────┼─────────────┼──────────────┤        │
+│  │ Bronze   │ $0.023/GB    │ $0.0125/GB  │ $0.004/GB   │ DELETED      │        │
+│  │ Silver   │ $0.023/GB    │ $0.023/GB   │ $0.0125/GB  │ DELETED(180d)│        │
+│  │ Gold     │ $0.023/GB    │ $0.023/GB   │ $0.023/GB   │ $0.0125/GB   │        │
+│  │ _system  │ $0.023/GB    │ DELETED(7d) │ —           │ —            │        │
+│  └──────────┴──────────────┴─────────────┴─────────────┴──────────────┘        │
+│                                                                                 │
+│                                                                                 │
+│  ❷ How Prefix-Based IAM Policies Work                                          │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                       │
+│                                                                                 │
+│  IAM policy for "BI Analyst" role:                                              │
+│  {                                                                              │
+│    "Effect": "Allow",                                                           │
+│    "Action": ["s3:GetObject", "s3:ListBucket"],                                │
+│    "Resource": [                                                                │
+│      "arn:aws:s3:::quickcart-datalake-prod",                                   │
+│      "arn:aws:s3:::quickcart-datalake-prod/gold/*"      ← Gold only            │
+│    ],                                                                           │
+│    "Condition": {                                                               │
+│      "StringLike": {                                                            │
+│        "s3:prefix": ["gold/*"]                          ← List filtering        │
+│      }                                                                          │
+│    }                                                                            │
+│  }                                                                              │
+│                                                                                 │
+│  How IAM evaluates:                                                             │
+│  1. BI Analyst calls s3:GetObject on gold/revenue_daily/... → ALLOW            │
+│  2. BI Analyst calls s3:GetObject on silver/orders/... → DENY                  │
+│  3. BI Analyst calls s3:GetObject on bronze/... → DENY                         │
+│  4. BI Analyst calls s3:ListBucket → sees only gold/* objects                  │
+│                                                                                 │
+│  Access matrix:                                                                 │
+│  ┌──────────────────┬────────┬────────┬────────┬─────────┐                     │
+│  │ Role             │ Bronze │ Silver │ Gold   │ _system │                     │
+│  ├──────────────────┼────────┼────────┼────────┼─────────┤                     │
+│  │ Data Engineer    │ R/W    │ R/W    │ R/W    │ R/W     │                     │
+│  │ Junior DE        │ R      │ R/W    │ R      │ R       │                     │
+│  │ Analytics Eng    │ R      │ R      │ R/W    │ —       │                     │
+│  │ ML Engineer      │ —      │ R      │ R      │ —       │                     │
+│  │ BI Analyst       │ —      │ —      │ R      │ —       │                     │
+│  │ Glue ETL Role    │ R      │ R/W    │ R/W    │ R/W     │                     │
+│  │ Athena Role      │ —      │ R      │ R      │ R(results)│                   │
+│  └──────────────────┴────────┴────────┴────────┴─────────┘                     │
+│                                                                                 │
+│                                                                                 │
+│  ❸ How Data Flows Through Zones                                                │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                              │
+│                                                                                 │
+│  INGESTION (Sources → Bronze):                                                  │
+│  → MariaDB full dump → bronze/mariadb/full_dump/{entity}/year=/month=/day=/    │
+│  → MariaDB CDC → bronze/mariadb/cdc/{entity}/year=/month=/day=/                │
+│  → Redshift UNLOAD → bronze/redshift/{table}/year=/month=/day=/                │
+│  → External API → bronze/api/{endpoint}/year=/month=/day=/                     │
+│  → Format: WHATEVER the source produces (CSV, JSON, Parquet)                   │
+│  → Rule: NEVER modify, NEVER delete, ALWAYS append                             │
+│                                                                                 │
+│  TRANSFORMATION (Bronze → Silver):                                              │
+│  → Glue ETL reads from bronze/{source}/{entity}/                               │
+│  → Applies: schema enforcement, type casting, dedup, null handling             │
+│  → Writes Parquet to silver/{entity}/year=/month=/day=/                         │
+│  → Rule: Silver REPLACES previous day's partition (idempotent)                 │
+│  → If run twice: same result (no duplicates, no data loss)                     │
+│                                                                                 │
+│  AGGREGATION (Silver → Gold):                                                   │
+│  → Glue ETL reads from silver/{entity}/                                         │
+│  → Applies: joins, aggregations, business logic                                │
+│  → Writes Parquet to gold/{domain_table}/year=/month=/day=/                    │
+│  → Rule: Gold is the SINGLE SOURCE OF TRUTH for business                       │
+│  → Quality gate: validate BEFORE writing (reject bad data)                     │
+│                                                                                 │
+│                                                                                 │
+│  ❹ How Glue Catalog Maps to Zones                                              │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                            │
+│                                                                                 │
+│  Glue Catalog Database per zone:                                                │
+│  → quickcart_bronze  (database) → tables point to bronze/ S3 paths             │
+│  → quickcart_silver  (database) → tables point to silver/ S3 paths             │
+│  → quickcart_gold    (database) → tables point to gold/ S3 paths               │
+│                                                                                 │
+│  Athena query:                                                                  │
+│  → SELECT * FROM quickcart_gold.revenue_daily WHERE year='2025'                │
+│  → Athena reads Glue Catalog → finds S3 path → scans only matching partitions  │
+│                                                                                 │
+│  WHY separate databases (not one database with prefixed table names):           │
+│  → Clean Athena namespace: "FROM quickcart_gold.x" vs "FROM quickcart.gold_x"  │
+│  → Database-level permissions in Lake Formation (Project 74)                    │
+│  → Crawlers can target one database per zone                                    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Silver and Bronze have the same data — why bother?"
+</span>→ They look similar for simple CSVs but differ in:
+   - Format: Bronze=CSV, Silver=Parquet (10× faster queries)
+   - Schema: Bronze=untyped strings, Silver=proper types
+   - Dedup: Bronze has CDC overlap duplicates, Silver doesn't
+   - Partitioning: Bronze=as-received, Silver=standardized year=/month=/day=
+→ Silver is OPTIMIZED for consumption, Bronze is RAW for preservation
+
+PITFALL 2: "Glue Crawler discovers _system/ files as data tables"
+→ Cause: Crawler scans entire bucket, finds Athena results as "tables"
+→ Fix: Use _system/ prefix (underscore prefix)
+→ Configure Crawler to exclude: _system/** pattern
+→ Or: set Crawler target to specific zone prefix only
+
+PITFALL 3: "Gold table has NULL values — quality gate didn't work"
+→ Cause: quality check runs AFTER write (too late)
+→ Fix: validate BEFORE writing to Gold
+→ Pattern: write to gold_staging/ → validate → rename to gold/
+→ Or: use Glue Data Quality (Project 68) with fail-on-violation
+
+PITFALL 4: "Lifecycle rule deleted Silver data that Gold still needs"
+→ Cause: Silver lifecycle=180 days, but Gold job references Silver from 200 days ago
+→ Fix: Gold jobs should ONLY reference recent Silver partitions
+→ Or: extend Silver lifecycle to match Gold's maximum lookback window
+
+PITFALL 5: "Bronze partition has 50,000 tiny files"
+→ Cause: CDC runs hourly, each run produces 1 small file
+→ 24 files/day × 30 days = 720 files per month per entity
+→ Not terrible, but Silver should compact these (Project 62)
+→ Fix: Bronze→Silver ETL reads all daily files → writes 4 Parquet files
+
+PITFALL 6: "Team member writes experiment output to gold/"
+→ Cause: no write protection on gold/ prefix
+→ Fix: IAM policy denies PutObject on gold/* for non-ETL roles
+→ Only the Glue ETL role can write to gold/
+→ Enforce via: bucket policy + IAM role restrictions
+
+PITFALL 7: "Migration from old bucket breaks Athena queries"
+→ Cause: Athena tables still point to old S3 paths
+→ Fix: update Glue Catalog table locations after migration
+→ Or: use ALTER TABLE SET LOCATION in Athena
+→ Plan: migrate one entity at a time, verify, then proceed</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT STATE (QuickCart):
+</span>→ 3 entities × 3 zones = 9 S3 prefixes
+→ ~500 MB/day ingestion → ~15 GB/month
+→ Bronze: ~15 GB/month (CSV)
+→ Silver: ~5 GB/month (Parquet, compressed)
+→ Gold: ~1 GB/month (aggregated, smaller)
+→ Total: ~21 GB/month → ~$0.50/month
+
+SCALING TO 50 ENTITIES:
+→ 50 entities × 3 zones = 150 S3 prefixes
+→ Glue Catalog: 150 tables (3 databases × 50 tables)
+→ Crawlers: 50 bronze crawlers + 50 silver crawlers = 100 crawlers
+→ Consider: programmatic table creation instead of crawlers at this scale
+→ Storage: ~300 GB/month → ~$7/month
+
+SCALING TO 1 TB/DAY:
+→ Bronze: 1 TB/day × 30 days (Standard) = 30 TB → $690/month
+→ After lifecycle: 30 TB Standard + 60 TB IA + 270 TB Glacier
+→ Silver: ~300 GB/day (Parquet compression) = 9 TB/month → $207/month
+→ Gold: ~50 GB/day = 1.5 TB/month → $35/month
+→ Total: ~$930/month for storage (before lifecycle savings)
+→ With lifecycle: ~$400/month (57% savings)
+
+SCALING TO MULTI-ACCOUNT:
+→ At 1 TB/day: consider separate AWS accounts per zone
+→ Bronze in Account A (ingestion account)
+→ Silver/Gold in Account B (analytics account)
+→ Cross-account access via bucket policies (Project 56)
+→ This becomes the Data Mesh pattern (Project 71)
+
+GLUE CATALOG LIMITS:
+→ Tables per database: 200,000 (soft limit)
+→ Partitions per table: 10,000,000 (soft limit)
+→ 3 years of daily partitions: 1,095 partitions per table (well within limit)
+→ At 10 years: 3,650 partitions → still fine
+→ Hourly partitions for 3 years: 26,280 → still fine</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO KNOW YOUR DATA LAKE IS HEALTHY:
+</span>
+1. Zone Inventory Dashboard
+   → For each zone: object count, total size, growth rate
+   → CloudWatch custom metrics via daily Lambda scan
+   → Alert: if bronze/ grows &gt; 2× expected rate (runaway ingestion)
+   → Alert: if gold/ has 0 new objects today (pipeline stalled)
+
+2. Data Freshness per Zone
+   → Bronze: latest object timestamp per entity
+   → Silver: latest partition per entity
+   → Gold: latest partition per domain table
+   → SLA: Bronze &lt; 1 hour old, Silver &lt; 4 hours, Gold &lt; 6 hours
+
+3. Schema Consistency
+   → Silver tables: schema should be stable (columns don't randomly appear/disappear)
+   → Glue Crawler schema change detection (Project 45)
+   → Alert: if Silver table schema changes unexpectedly
+
+4. Quality Metrics
+   → Bronze→Silver: rows_input vs rows_output (should be close)
+   → Silver→Gold: quality check pass rate (should be &gt;99%)
+   → Null rate per column (track over time, alert on spikes)
+
+5. Cost Attribution
+   → S3 tags per zone: Environment, Zone, Entity
+   → AWS Cost Explorer: filter by tag → see cost per zone
+   → Expected ratio: Bronze &gt; Silver &gt; Gold (by storage volume)
+   → If Gold &gt; Silver → something wrong (Gold should be aggregated/smaller)
+
+6. Access Audit
+   → CloudTrail: who accessed which zone, when
+   → Alert: if BI Analyst role accesses bronze/ (shouldn't need to)
+   → Alert: if unknown role writes to gold/ (unauthorized pipeline)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(44)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create the Data Lake Bucket with Zone Structure</h3>
+
+<h3>Step 2: Create Glue Catalog Databases per Zone</h3>
+
+<h3>Step 3: Create IAM Policies per Zone</h3>
+
+<h3>Step 4: Bronze → Silver ETL Job</h3>
+
+<h3>Step 5: Silver → Gold ETL Job</h3>
+
+<h3>Step 6: Data Lake Health Check</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create data lake bucket with zones + lifecycle</span><span>
+</span>python 44_01_create_datalake_bucket.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Create Glue Catalog databases per zone</span><span>
+</span>python 44_02_create_glue_catalog_databases.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Create IAM policies per role per zone</span><span>
+</span>python 44_03_create_zone_iam_policies.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY PIPELINE (automated via Step Functions — Project 41)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Ingestion lands in Bronze (Projects 20, 42, 43)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Bronze → Silver ETL (this project)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Runs as Glue job: 44_04_bronze_to_silver_etl.py</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Silver → Gold ETL (this project)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Runs as Glue job: 44_05_silver_to_gold_etl.py</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONITORING (daily or hourly)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 44_06_datalake_health_check.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Health Check):
+</span>
+======================================================================
+🏥 DATA LAKE HEALTH CHECK — 2025-01-15 08:00:00
+   Bucket: s3://quickcart-datalake-prod/
+======================================================================
+
+────────────────────────────────────────────────────────────
+📋 ZONE: bronze/
+────────────────────────────────────────────────────────────
+   Objects: 847
+   Size: 2,341.50 MB (2.286 GB)
+   File types: {'csv': 820, 'marker': 27}
+   Latest update: 2025-01-15 00:05 (8.0h ago) ✅ FRESH
+
+────────────────────────────────────────────────────────────
+📋 ZONE: silver/
+────────────────────────────────────────────────────────────
+   Objects: 156
+   Size: 892.30 MB (0.871 GB)
+   File types: {'parquet': 144, 'marker': 12}
+   Latest update: 2025-01-15 00:35 (7.4h ago) ✅ FRESH
+   ✅ Format compliance: all Parquet
+
+────────────────────────────────────────────────────────────
+📋 ZONE: gold/
+────────────────────────────────────────────────────────────
+   Objects: 48
+   Size: 145.80 MB (0.142 GB)
+   File types: {'parquet': 40, 'marker': 8}
+   Latest update: 2025-01-15 01:05 (6.9h ago) ✅ FRESH
+   ✅ Format compliance: all Parquet
+
+────────────────────────────────────────────────────────────
+📋 ENTITY FRESHNESS
+────────────────────────────────────────────────────────────
+   ✅ bronze/orders: data for today
+   ✅ bronze/customers: data for today
+   ✅ bronze/products: data for today
+   ✅ silver/orders: data for today
+   ✅ silver/customers: data for today
+   ✅ silver/products: data for today
+   ✅ gold/customer_360: data for today
+   ✅ gold/revenue_daily: data for today
+   ✅ gold/product_performance: data for today
+
+────────────────────────────────────────────────────────────
+💰 STORAGE COST ESTIMATE (current month)
+────────────────────────────────────────────────────────────
+   bronze: 2.286 GB → $0.0526/month
+   silver: 0.871 GB → $0.0200/month
+   gold: 0.142 GB → $0.0033/month
+   _system: 0.054 GB → $0.0012/month
+   ────────────────────────────────────
+   TOTAL: $0.0771/month
+
+======================================================================
+✅ DATA LAKE HEALTH: GOOD
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Medallion Architecture: Bronze (raw) → Silver (clean) → Gold (business-ready)
+→ Bronze is your INSURANCE POLICY — never delete, never modify, always append
+→ Silver enforces: schema, types, deduplication, Parquet format, partitioning
+→ Gold enforces: business rules, quality gates, pre-computed aggregations
+→ Zone contracts define: who writes, who reads, what format, what quality
+→ Lifecycle rules per zone: Bronze ages to Glacier, _system cleaned aggressively
+→ IAM policies per zone: BI Analyst sees only Gold, Engineers see everything
+→ Separate Glue Catalog databases per zone: clean Athena namespace
+→ Quality gates BETWEEN zones prevent bad data from propagating
+→ Format compliance: Silver/Gold = Parquet ONLY (no CSV, no JSON)
+→ Metadata columns (_etl_loaded_at, _etl_process_date) enable audit trails
+
+DATA FLOW THROUGH ZONES:
+━━━━━━━━━━━━━━━━━━━━━━━
+  Sources ──→ BRONZE ──→ SILVER ──→ GOLD ──→ Consumers
+  (raw)       (typed)    (clean)    (ready)   (dashboards,
+                                              apps, ML)
+
+  Project 42 CDC  →  bronze/mariadb/cdc/  
+                         ↓  (44_04 ETL)
+                     silver/orders/
+                         ↓  (44_05 ETL)
+                     gold/customer_360/
+                         ↓  (Project 43 reverse ETL)
+                     MariaDB app tables
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 1-4: S3 fundamentals (buckets, lifecycle, versioning)
+→ Project 3: IAM prefix-based policies (applied per zone)
+→ Project 25: CSV → Parquet conversion (now standardized in Bronze→Silver)
+→ Project 26: Partitioning (now enforced in Silver/Gold zones)
+→ Project 33: Job bookmarks (complementary to zone-based processing)
+→ Project 42: CDC outputs now land in bronze/mariadb/cdc/
+→ Project 43: UNLOAD outputs now land in bronze/redshift/
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 45: Source Schema Changed — Pipeline Must Not Break
+   (Now that we have strict Silver schemas, what happens when MariaDB
+    adds a column? Or changes a type? The Bronze→Silver ETL must
+    handle schema evolution gracefully.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The data lake is beautifully organized:
+</span>→ Bronze: raw CSV with whatever schema the source sends
+→ Silver: strict Parquet with enforced types
+→ Gold: business aggregations with quality gates
+
+Then the backend team deploys a new feature:
+→ They add "shipping_address" column to the orders table
+→ They rename "status" to "order_status" for clarity
+→ They change "unit_price" from INT to DECIMAL(10,4) for precision
+
+Next morning:
+→ CDC exports CSV with NEW schema (extra column, renamed column, changed type)
+→ Bronze ingestion succeeds (Bronze accepts anything — by design ✅)
+→ Bronze→Silver ETL FAILS ❌
+   "Required column 'status' missing in Bronze data"
+→ Silver→Gold ETL never runs (upstream failed)
+→ Gold data is stale → dashboards show yesterday's numbers
+→ CTO: "The source changed their schema and broke our entire pipeline!"
+
+→ Project 45: "Source Schema Changed — Pipeline Must Not Break"
+→ Introduces: Schema evolution, ResolveChoice, MergeSchema,
+  Glue Schema Registry, backward/forward compatibility</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-43.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 44 of 80</span>
+    <span class="nav-project-title">DESIGN A PROPER BRONZE → SILVER → GOLD DATA LAKE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-45.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-45.html") window.location = "project-45.html";
+  if (e.key === 'ArrowLeft' && "project-43.html") window.location = "project-43.html";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 75: DISASTER RECOVERY — ENTIRE PLATFORM MUST SURVIVE A REGION FA — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:94%"></div></div>
+<div id="progress-label">94%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 75 of 80</div>
+  <div class="project-title">DISASTER RECOVERY — ENTIRE PLATFORM MUST SURVIVE A REGION FAILURE</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: QuickCart — Full data lake platform running in us-east-2 (Project 73)
+</span>         Column-level security across 3 accounts (Project 74)
+         Real-time + batch pipelines (Projects 71-72)
+
+THE INCIDENT:
+→ Tuesday 2:14 AM UTC: AWS us-east-2 (Ohio) experiences major outage
+→ S3: intermittent 503 errors, reads failing
+→ Redshift Serverless: workgroup unreachable
+→ Kinesis: stream ingestion stopped
+→ Glue: all jobs failing
+→ Athena: queries timing out
+
+IMPACT:
+→ 2:14 AM - 8:30 AM: Complete platform outage (6 hours 16 minutes)
+→ Real-time clickstream: 6+ hours of events lost (not buffered)
+→ Nightly batch: failed at 2:14 AM, Gold layer stale
+→ BI dashboards: blank for entire business day
+→ Marketing recommendations: serving 18-hour-old data
+→ Revenue impact: $2.3M in lost personalization revenue
+→ Support tickets: 4,200 from internal teams
+
+POST-MORTEM FINDINGS:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  SINGLE POINT OF FAILURE: Everything in us-east-2                      │
+│                                                                         │
+│  Component              │ Region    │ Backup?  │ Recovery?              │
+│  ───────────────────────┼───────────┼──────────┼────────────────────── │
+│  S3 (15 TB)             │ us-east-2 │ None     │ Wait for region       │
+│  Redshift Serverless    │ us-east-2 │ None     │ Wait for region       │
+│  Kinesis Stream         │ us-east-2 │ None     │ Data LOST             │
+│  Firehose               │ us-east-2 │ None     │ Data LOST             │
+│  Glue Catalog (200 tbl) │ us-east-2 │ None     │ Wait for region       │
+│  Glue Jobs (50)         │ us-east-2 │ None     │ Wait for region       │
+│  MariaDB on EC2         │ us-east-2 │ None     │ Wait for region       │
+│  Step Functions         │ us-east-2 │ None     │ Wait for region       │
+│  Lake Formation grants  │ us-east-2 │ None     │ Manual recreate       │
+│  SNS/SQS               │ us-east-2 │ None     │ Wait for region       │
+│                                                                         │
+│  TOTAL: 100% single-region dependency                                  │
+│  RECOVERY: Wait for AWS to fix it (0 control)                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CTO MANDATE:
+"Build a disaster recovery plan. Requirements:
+ → RTO (Recovery Time Objective): 4 hours
+ → RPO (Recovery Point Objective): 1 hour
+ → Primary: us-east-2 (Ohio)
+ → DR: us-west-2 (Oregon)
+ → Budget: &lt; $3,000/month additional
+ → Must cover: S3, Redshift, Glue, MariaDB, Kinesis, Orchestration
+ → Automated failover where possible
+ → Quarterly DR drills mandatory"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand RTO and RPO
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RTO = Recovery Time Objective = 4 hours
+→ "How long can we be DOWN before it's unacceptable?"
+→ From moment of failure → platform operational in DR region
+→ Includes: detection (15 min) + decision (15 min) + failover (3.5 hours)
+
+RPO = Recovery Point Objective = 1 hour
+→ "How much DATA can we lose?"
+→ Maximum acceptable data loss = 1 hour of data
+→ If outage at 2:14 AM, we must have data up to at least 1:14 AM
+→ S3 replication lag must be &lt; 1 hour
+→ Redshift snapshots must be &lt; 1 hour old
+→ MariaDB replication lag must be &lt; 1 hour
+
+Step 2: Classify Components by DR Strategy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TIER 1: DATA (must replicate continuously)
+→ S3: Cross-Region Replication (CRR) — continuous
+→ Redshift: Cross-Region Snapshots — every 1 hour
+→ MariaDB: Read Replica in us-west-2 — continuous
+→ Glue Catalog: Export/Import — every 1 hour
+
+TIER 2: COMPUTE (recreate on demand)
+→ Redshift Serverless: create workgroup in DR region on failover
+→ Kinesis: create new stream in DR region on failover
+→ Firehose: create new delivery stream on failover
+→ Glue Jobs: deploy from code (IaC) on failover
+→ EC2: launch from AMI on failover
+
+TIER 3: CONFIGURATION (backup and restore)
+→ Lake Formation: export grants, import in DR
+→ IAM Roles: identical in both regions (global service)
+→ Step Functions: deploy from definition JSON
+→ EventBridge Rules: deploy from IaC
+→ SNS/SQS: create new in DR region
+
+Step 3: Design the DR Architecture
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ACTIVE-PASSIVE model:
+→ Primary (us-east-2): full production workload
+→ DR (us-west-2): data replicated, compute dormant
+→ On failover: spin up compute in DR, point to replicated data
+→ On recovery: fail back to primary
+
+WHY NOT ACTIVE-ACTIVE:
+→ Active-Active doubles cost (two running Redshift clusters, two Kinesis streams)
+→ Conflict resolution for writes is complex
+→ QuickCart's $3K/month budget doesn't support it
+→ Active-Passive meets 4-hour RTO at fraction of cost
+
+Step 4: Calculate DR Budget
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ S3 CRR: replicated data storage ($0.023/GB × 15 TB) = $345/month
+→ S3 CRR: replication requests ($0.005/1000 PUT) ≈ $50/month
+→ Redshift snapshots in DR: cross-region snapshot storage ≈ $200/month
+→ MariaDB Read Replica (t3.medium): $51/month
+→ Glue Catalog backup Lambda: $5/month
+→ DR automation (Lambda + Step Functions): $20/month
+→ Quarterly DR drill cost: ~$200/drill = $67/month amortized
+→ TOTAL: ~$738/month (well within $3,000 budget)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE DR ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  PRIMARY REGION: us-east-2 (Ohio)          DR REGION: us-west-2 (Oregon)       │
+│  ═══════════════════════════════           ═══════════════════════════           │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ S3: orders-data-prod │ ──── CRR ─────► │ S3: orders-data-dr  │              │
+│  │     15 TB            │   continuous     │     15 TB (replica) │              │
+│  │ Bronze/Silver/Gold   │   &lt; 15 min lag   │ Bronze/Silver/Gold  │              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ Redshift Serverless  │ ── snapshot ──► │ Redshift Serverless  │              │
+│  │ quickcart-analytics  │   every 1 hour   │ (dormant — created  │              │
+│  │ 500 GB hot data      │   cross-region   │  on failover only)  │              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ MariaDB (EC2)        │ ── binlog ────► │ MariaDB Read Replica │              │
+│  │ Primary              │   replication    │ (EC2 in us-west-2)  │              │
+│  │ orders, customers    │   &lt; 5 sec lag    │ read-only standby   │              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ Glue Catalog         │ ── export ────► │ Glue Catalog         │              │
+│  │ 7 databases          │   every 1 hour   │ (imported from       │              │
+│  │ 200+ tables          │   via Lambda     │  backup on failover) │              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ Kinesis + Firehose   │                  │ Kinesis + Firehose   │              │
+│  │ (ACTIVE)             │  NOT replicated  │ (created on failover │              │
+│  │ clickstream-events   │  ─────────────►  │  from CloudFormation)│              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────┐                  ┌─────────────────────┐              │
+│  │ Step Functions       │                  │ Step Functions       │              │
+│  │ EventBridge          │  Deploy from IaC │ (created on failover │              │
+│  │ Glue Jobs (50)       │  ─────────────►  │  from stored defs)   │              │
+│  │ Lake Formation       │                  │                      │              │
+│  └─────────────────────┘                  └─────────────────────┘              │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                     DR AUTOMATION LAYER                                  │   │
+│  │                                                                         │   │
+│  │  Route 53 Health Check → CloudWatch Alarm → Lambda DR Orchestrator     │   │
+│  │       ↓                       ↓                      ↓                  │   │
+│  │  Monitors primary        Triggers SNS alert    Executes failover:       │   │
+│  │  S3 + Redshift           → PagerDuty           1. Promote MariaDB       │   │
+│  │  endpoints               → On-call team        2. Restore Redshift      │   │
+│  │                                                 3. Import Glue Catalog   │   │
+│  │                                                 4. Create Kinesis        │   │
+│  │                                                 5. Deploy pipelines      │   │
+│  │                                                 6. Update DNS            │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>OPTION A: Active-Passive with Continuous Data Replication ✅
+</span>→ Primary active, DR passive (data replicated, compute dormant)
+→ On failover: spin up compute in DR region
+→ Cost: ~$738/month (within budget)
+→ RTO: 2-4 hours (spin up time)
+→ RPO: &lt; 1 hour (replication lag)
+→ ✅ SELECTED — meets all requirements
+
+OPTION B: Active-Active Multi-Region
+→ Both regions running full production workloads
+→ Pro: near-zero RTO (instant failover)
+→ Con: 2× cost ($15K+/month for dual Redshift, Kinesis, Glue)
+→ Con: write conflict resolution complexity
+→ ❌ REJECTED — exceeds budget, over-engineered
+
+OPTION C: Backup-Only (No Replication)
+→ Nightly S3 backup, weekly Redshift snapshot
+→ Pro: cheapest ($100/month)
+→ Con: RPO = 24 hours (unacceptable — lose full day of data)
+→ Con: RTO = 8-12 hours (restore from backup)
+→ ❌ REJECTED — doesn't meet RPO requirement
+
+OPTION D: Pilot Light (Minimal Always-On DR)
+→ Data replicated continuously (like Option A)
+→ Minimal compute always running (small Redshift, basic EC2)
+→ On failover: scale up existing resources
+→ Pro: faster RTO than pure passive (2-3 hours)
+→ Con: slightly higher cost ($1,200/month)
+→ ✅ CONSIDERED — could upgrade to this later
+
+DECISION: Option A now, upgrade to Option D if budget allows</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. S3 CROSS-REGION REPLICATION (CRR) — highest priority
+</span>   → 15 TB of data lake is the MOST critical asset
+   → CRR replicates every new object within 15 minutes (SLA: 99.99% in 15 min)
+   → Enable S3 Replication Time Control (RTC) for guaranteed 15-min SLA
+   → Replicate: orders-data-prod → orders-data-dr (us-west-2)
+
+2. REDSHIFT CROSS-REGION SNAPSHOTS — every 1 hour
+   → Automated snapshot schedule: every 1 hour
+   → Copy snapshots to us-west-2 automatically
+   → Retain 24 snapshots in DR region (24 hours of history)
+   → On failover: restore from latest snapshot
+
+3. MARIADB READ REPLICA — continuous replication
+   → Launch MariaDB read replica in us-west-2
+   → Binary log replication: &lt; 5 second lag
+   → On failover: promote read replica to primary
+   → Application reconnects to DR MariaDB
+
+4. GLUE CATALOG BACKUP — every 1 hour
+   → Lambda function exports all databases, tables, partitions
+   → Stores as JSON in DR S3 bucket
+   → On failover: Lambda imports catalog into DR region
+   → Include: column tags, table parameters, partition info
+
+5. INFRASTRUCTURE AS CODE — stored in S3 (replicated)
+   → All CloudFormation/CDK templates in S3 (auto-replicated via CRR)
+   → Kinesis stream definitions
+   → Firehose configurations
+   → Step Functions state machine definitions
+   → EventBridge rules
+   → Glue job scripts
+   → On failover: deploy stack in DR region
+
+6. FAILOVER RUNBOOK — automated + manual steps
+   → Step Functions state machine that orchestrates failover
+   → Human approval gate before executing
+   → Automated steps: restore Redshift, import catalog, deploy infra
+   → Manual steps: promote MariaDB, update DNS, verify
+
+7. QUARTERLY DR DRILLS
+   → Actually fail over to DR region
+   → Run full pipeline end-to-end
+   → Verify data integrity
+   → Measure actual RTO/RPO
+   → Document gaps and fix</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT replicate Kinesis streams cross-region
+</span>   → Kinesis is regional — no native cross-region replication
+   → During outage: events are LOST (buffered in producer's retry)
+   → Accept: real-time clickstream has RPO = outage duration
+   → Mitigate: producers retry with exponential backoff
+   → On recovery: producers resend buffered events
+
+2. DO NOT keep DR Redshift running 24/7
+   → Idle Redshift Serverless costs $0 (auto-pauses)
+   → But provisioned Redshift: $180+/month even idle
+   → Use Serverless in DR — create on failover, restore from snapshot
+
+3. DO NOT manually copy Glue Catalog
+   → 200+ tables with partitions = impossible to manually recreate
+   → Automate with Lambda export/import
+   → Test import monthly to verify it works
+
+4. DO NOT skip testing the failover
+   → "We have DR" means nothing without tested failover
+   → Quarterly drills are mandatory
+   → Measure actual RTO — it's always longer than planned
+
+5. DO NOT replicate Bronze layer to DR
+   → Bronze = raw data, can be re-extracted from source
+   → Only replicate Gold layer (curated, business-critical)
+   → Saves 60% of CRR storage cost
+   → Silver can be re-derived from Gold if needed
+
+6. DO NOT forget DNS / endpoint management
+   → Applications hardcode us-east-2 endpoints
+   → Use Route 53 DNS aliases that can be switched
+   → Or: use parameter store for endpoint configuration
+   → On failover: update parameter → apps reconnect
+
+7. DO NOT assume Lake Formation grants replicate
+   → Lake Formation is REGIONAL — grants don't cross regions
+   → Must backup and restore grants in DR region
+   → Include in catalog backup Lambda</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────┬────────────────────────────┬──────────────────────────────────┐
+</span>│ DR Strategy                  │ RTO / RPO                  │ When to Use                      │
+├──────────────────────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Backup &amp; Restore             │ RTO: 8-24h / RPO: 1-24h   │ Non-critical, budget &lt; $200/mo   │
+│ (S3 backup, weekly snapshot) │                            │ Acceptable to lose 1 day of data │
+├──────────────────────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Pilot Light                  │ RTO: 2-4h / RPO: 1h       │ Business-critical, moderate      │
+│ (Data replicated, minimal    │                            │ budget, can tolerate 2-4h outage │
+│  compute in DR) ✅ SELECTED  │                            │                                  │
+├──────────────────────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Warm Standby                 │ RTO: 30min-2h / RPO: min   │ High-criticality, $5K+/mo budget│
+│ (Scaled-down production in   │                            │ Need sub-hour recovery           │
+│  DR, scale up on failover)   │                            │                                  │
+├──────────────────────────────┼────────────────────────────┼──────────────────────────────────┤
+│ Active-Active Multi-Region   │ RTO: ~0 / RPO: ~0         │ Mission-critical, $15K+/mo       │
+│ (Full production in both     │                            │ Zero-tolerance for downtime      │
+│  regions simultaneously)     │                            │ Financial trading, healthcare    │
+└──────────────────────────────┴────────────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE MULTI-REGION DR</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DATA VOLUME &lt; 100 GB
+</span>   → Rebuild from source faster than failover
+   → Just keep good backups
+
+2. NO SLA REQUIREMENT
+   → Internal analytics platform with no revenue impact
+   → Users can wait for region to recover
+
+3. DATA CAN BE FULLY RE-DERIVED
+   → If all data comes from a single source DB in another region
+   → Re-extract is cheaper than continuous replication
+
+4. BUDGET &lt; $500/MONTH FOR DR
+   → CRR alone for 15 TB costs $345/month
+   → Minimum viable DR needs ~$700/month
+   → Below this: invest in good backups instead</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+</span>S3 CROSS-REGION REPLICATION — HOW IT WORKS INTERNALLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  REPLICATION FLOW:                                               │
+│                                                                  │
+│  1. Object PUT to source bucket (us-east-2)                     │
+│     → S3 writes to 3 AZs in us-east-2 (normal durability)      │
+│     → Returns 200 OK to client                                   │
+│                                                                  │
+│  2. S3 Replication engine detects new object                    │
+│     → Checks replication rules: does this prefix match?          │
+│     → Checks: is destination bucket valid?                       │
+│     → Queues object for cross-region copy                        │
+│                                                                  │
+│  3. S3 copies object to destination bucket (us-west-2)          │
+│     → Uses S3 Transfer Acceleration backbone (AWS network)       │
+│     → NOT over public internet — private AWS network             │
+│     → Object written to 3 AZs in us-west-2                     │
+│                                                                  │
+│  4. Replication status updated                                   │
+│     → Source object metadata: ReplicationStatus = COMPLETED      │
+│     → Destination object metadata: ReplicationStatus = REPLICA   │
+│                                                                  │
+│  TIMING:                                                         │
+│  → Standard CRR: most objects within 15 minutes                  │
+│  → S3 Replication Time Control (RTC): 99.99% within 15 minutes  │
+│  → RTC adds: $0.015/GB replicated (worth it for DR SLA)         │
+│                                                                  │
+│  WHAT REPLICATES:                                                │
+│  ✅ Object data (bytes)                                          │
+│  ✅ Object metadata (custom headers)                             │
+│  ✅ Object tags                                                  │
+│  ✅ Object ACL (if configured)                                   │
+│  ✅ SSE-S3 encrypted objects                                     │
+│  ✅ SSE-KMS encrypted objects (with KMS key in destination)      │
+│  ❌ Objects that existed BEFORE replication was enabled           │
+│  ❌ Objects in Glacier/Deep Archive (must restore first)         │
+│  ❌ Lifecycle transitions (must configure separately in dest)    │
+│  ❌ Delete markers (configurable — enable for DR)                │
+│                                                                  │
+│  COST:                                                           │
+│  → Replication requests: $0.005/1,000 PUT requests               │
+│  → Data transfer: $0.02/GB (us-east-2 → us-west-2)             │
+│  → Destination storage: same as source ($0.023/GB)               │
+│  → RTC premium: $0.015/GB                                        │
+│  → 15 TB total: ~$345/month storage + ~$307/month transfer       │
+│                                                                  │
+│  IMPORTANT: CRR requires VERSIONING on BOTH buckets              │
+│  → Source bucket: versioning enabled (Project 2)                 │
+│  → Destination bucket: versioning enabled                        │
+│  → Without versioning: CRR will NOT work                         │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FAILOVER SEQUENCE — MINUTE BY MINUTE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  T+0:00    Region failure detected by Route 53 health check
+  T+0:05    CloudWatch alarm triggers → SNS → PagerDuty
+  T+0:15    On-call engineer acknowledges alert
+  T+0:20    Engineer assesses: "Is this a full region outage?"
+  T+0:30    Decision: "YES — initiate DR failover"
+  
+  T+0:30    Engineer triggers DR Step Functions state machine
+            ┌────────────────────────────────────────────┐
+            │ AUTOMATED FAILOVER SEQUENCE                 │
+            │                                             │
+            │ T+0:31  Promote MariaDB read replica       │
+            │         → replica becomes read-write        │
+            │         → ~2 minutes                        │
+            │                                             │
+            │ T+0:33  Restore Redshift from snapshot     │
+            │         → latest cross-region snapshot      │
+            │         → ~45-90 minutes for 500 GB         │
+            │                                             │
+            │ T+0:34  Import Glue Catalog from backup    │
+            │         → Lambda reads JSON from DR S3      │
+            │         → Creates databases, tables, parts  │
+            │         → ~10 minutes for 200 tables        │
+            │                                             │
+            │ T+0:35  Deploy infrastructure stack        │
+            │         → CloudFormation in us-west-2       │
+            │         → Kinesis stream                    │
+            │         → Firehose delivery stream          │
+            │         → Step Functions state machines     │
+            │         → EventBridge rules                 │
+            │         → ~15 minutes                       │
+            │                                             │
+            │ T+0:50  Configure Lake Formation           │
+            │         → Import grants from backup         │
+            │         → Register S3 locations             │
+            │         → ~10 minutes                       │
+            │                                             │
+            │ T+1:00  Verify Glue Catalog + Athena       │
+            │         → Run test query against DR S3      │
+            │         → Confirm data accessible           │
+            │                                             │
+            │ T+1:30  Redshift restore complete          │
+            │         → Create Spectrum external schemas  │
+            │         → Verify dashboard queries          │
+            │                                             │
+            │ T+1:45  Update DNS / endpoints             │
+            │         → Route 53 failover records         │
+            │         → Parameter Store updates           │
+            │         → Application endpoints updated     │
+            │                                             │
+            │ T+2:00  Smoke test all pipelines           │
+            │         → Trigger micro-batch manually      │
+            │         → Verify Kinesis → Firehose → S3    │
+            │         → Verify Athena queries work        │
+            │         → Verify Redshift dashboards work   │
+            │                                             │
+            └────────────────────────────────────────────┘
+  
+  T+2:00    Platform operational in us-west-2
+  T+2:30    All pipelines running in DR region
+  T+3:00    BI dashboards serving from DR
+  T+3:30    Full verification complete
+  
+  ACTUAL RTO: ~2-3.5 hours (within 4-hour target ✅)
+  ACTUAL RPO: ~15-60 minutes (within 1-hour target ✅)</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: S3 CRR replication lag spikes during high-write periods
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Nightly batch writes 50 GB to Gold layer in 30 minutes
+→ CRR queue backs up → replication lag exceeds 1 hour
+→ Fix: enable S3 Replication Time Control (RTC) for 15-min SLA
+→ Fix: monitor ReplicationLatency metric → alarm if &gt; 30 min
+
+PITFALL 2: Redshift snapshot restore takes longer than expected
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 500 GB restore: documented as 30-60 min, actual: 45-120 min
+→ Cross-region restore slower than same-region
+→ Fix: test actual restore time quarterly
+→ Fix: keep Redshift data minimal (hot data only, Spectrum for rest)
+
+PITFALL 3: Glue Catalog import fails on partition count
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Table with 50,000 partitions: BatchCreatePartition takes 30+ minutes
+→ Glue API throttling at high partition counts
+→ Fix: use partition projection (Project 26) — no partitions to restore
+→ Fix: batch partition creation with exponential backoff
+
+PITFALL 4: DR MariaDB has stale data after promotion
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Replication lag was 30 seconds at failure time
+→ Some transactions may be lost
+→ Fix: check replication lag BEFORE promoting
+→ Fix: accept small data loss for MariaDB (nightly batch will catch up)
+
+PITFALL 5: Applications still pointing to us-east-2 endpoints
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Hardcoded region in application configs
+→ DR platform is up but nobody connects to it
+→ Fix: use Route 53 DNS aliases for all endpoints
+→ Fix: use AWS Systems Manager Parameter Store for config
+→ Fix: applications read region from config, not hardcode
+
+PITFALL 6: Lake Formation grants not restored in DR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Lake Formation is REGIONAL — no automatic cross-region
+→ All column-level security (Project 74) must be recreated
+→ Fix: include LF grants in catalog backup Lambda
+→ Fix: export grants as JSON, import during failover
+
+PITFALL 7: DR drill reveals IaC templates are outdated
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Kinesis stream was scaled from 2→10 shards last month
+→ CloudFormation template still says 2 shards
+→ DR deploys with wrong capacity
+→ Fix: IaC templates auto-generated from current state
+→ Fix: CI/CD updates IaC whenever production changes (Project 76)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCALING DATA REPLICATION:
+</span>→ 15 TB today: CRR handles easily (~$650/month)
+→ 50 TB (Year 2): CRR still works (~$2,100/month)
+→ 200 TB (Year 3): CRR cost significant (~$8,400/month)
+→ At 200 TB: consider replicating Gold only (not Bronze/Silver)
+→ Gold is typically 20-30% of total → $2,500/month
+
+SCALING REDSHIFT DR:
+→ 500 GB today: snapshot restore ~60 min
+→ 2 TB (Year 2): snapshot restore ~2-3 hours
+→ At 2 TB: Redshift restore may EXCEED 4-hour RTO
+→ Fix: use Redshift data sharing across regions (newer feature)
+→ Fix: reduce hot data to 90 days, Spectrum for historical
+
+SCALING GLUE CATALOG:
+→ 200 tables today: import ~10 minutes
+→ 1,000 tables: import ~45 minutes
+→ 5,000 tables: import may exceed 2 hours
+→ Fix: use partition projection everywhere (zero partition restore)
+→ Fix: parallel import with multiple Lambda invocations
+
+SCALING FAILOVER AUTOMATION:
+→ 5 services today: Step Functions handles easily
+→ 20 services: need parallel state branches
+→ 50 services: need hierarchical Step Functions (parent→child)
+→ Consider: AWS Elastic Disaster Recovery (DRS) for EC2 workloads</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(75)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: S3 Cross-Region Replication Setup</h3>
+
+<hr>
+<h3>Part 2: Glue Catalog Backup &amp; Restore</h3>
+
+<hr>
+<h3>Part 3: Redshift Cross-Region Snapshot Automation</h3>
+
+<hr>
+<h3>Part 4: DR Failover Orchestrator (Step Functions)</h3>
+
+<hr>
+<h3>Complete File Summary &amp; Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (Run once — sets up continuous DR replication)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: S3 Cross-Region Replication</span><span>
+</span>python 75_01_s3_cross_region_replication.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Glue Catalog hourly backup</span><span>
+</span>python 75_02_glue_catalog_backup.py backup
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Redshift hourly snapshots</span><span>
+</span>python 75_03_redshift_dr_snapshots.py snapshot
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: DR Failover orchestrator + health checks</span><span>
+</span>python 75_04_failover_orchestrator.py
+
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># FAILOVER (Run ONLY during actual DR event)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Option A: Automated via Step Functions (recommended)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Open AWS Console → Step Functions → us-west-2</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Start execution of: dr-failover-orchestrator</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Option B: Manual step-by-step</span><span>
+</span>python 75_02_glue_catalog_backup.py restore
+python 75_03_redshift_dr_snapshots.py restore</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ DR is about DATA first, COMPUTE second
+   (Data replication is continuous; compute is recreated on demand)
+→ S3 CRR with RTC provides 15-minute replication SLA
+→ Only replicate GOLD layer to DR (saves 60% cost)
+→ Redshift snapshots every 1 hour meet RPO &lt; 1 hour
+→ Glue Catalog is REGIONAL — must backup and restore explicitly
+→ Lake Formation grants are REGIONAL — include in catalog backup
+→ Active-Passive DR is cost-effective for most data platforms
+→ Automated failover via Step Functions reduces human error
+→ Quarterly DR drills are MANDATORY — untested DR is not DR
+→ Runbooks save lives at 3 AM when nobody can think clearly
+
+HOW THIS BUILDS ON PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 2:  S3 versioning (required for CRR)
+→ Project 4:  S3 storage classes and lifecycle
+→ Project 47: S3 replication rules (same-region → now cross-region)
+→ Project 55: Step Functions orchestration
+→ Project 67: Redshift Serverless (snapshot/restore)
+→ Project 70: Secrets Manager rotation (credentials in DR)
+→ Project 71: Data Mesh cross-account (DR affects all accounts)
+→ Project 73: Full platform architecture (what we're protecting)
+→ Project 74: Lake Formation tags (must backup for DR)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 76: CI/CD for Data Pipelines
+   "All this infrastructure was created manually with Python scripts.
+    What happens when someone changes a Glue job and breaks production?
+    We need version control, automated testing, and deployment pipelines."
+→ Introduces: CodeCommit, CodeBuild, CodePipeline, CloudFormation/CDK,
+              Glue job versioning, infrastructure as code</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Full platform (Project 73)
+→ Column-level security (Project 74)  
+→ Multi-region DR (this project)
+
+BUT: Everything was built by running Python scripts manually.
+→ 75_01 through 75_04 were executed by hand
+→ Glue job changes deployed by uploading scripts to S3 manually
+→ Redshift DDL run by copy-pasting into Query Editor
+→ CloudFormation templates maintained in someone's laptop
+
+THEN: A junior engineer pushes a Glue job change that breaks 
+      the nightly pipeline. Nobody knows what changed.
+      Rolling back takes 4 hours because there's no version history.
+
+CTO: "We need CI/CD for our data platform.
+      Git push → automated test → automated deploy.
+      Every change versioned, tested, and auditable."
+
+→ Project 76: "CI/CD for Data Pipelines: Git Push → Test → Deploy
+               Glue + Redshift DDL"</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-74.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 75 of 80</span>
+    <span class="nav-project-title">DISASTER RECOVERY — ENTIRE PLATFORM MUST SURVIVE A REGION FAILURE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-76.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-76.html") window.location = "project-76.html";
+  if (e.key === 'ArrowLeft' && "project-74.html") window.location = "project-74.html";
+});
+</script>
+</body>
+</html>

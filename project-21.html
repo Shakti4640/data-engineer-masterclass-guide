@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 21: BULK-LOAD 10 MILLION ROWS FROM S3 INTO REDSHIFT FAST — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:26%"></div></div>
+<div id="progress-label">26%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 21 of 80</div>
+  <div class="project-title">BULK-LOAD 10 MILLION ROWS FROM S3 INTO REDSHIFT FAST</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 18 months old, growing rapidly
+</span>Situation:
+→ Daily CSV exports land in S3 (established in Project 1)
+→ Redshift cluster provisioned with proper schema (established in Project 10, 11)
+→ orders table now has 10 MILLION rows accumulated in S3
+→ Analytics team says: "We need ALL historical orders in Redshift for dashboards"
+→ Junior engineer tried INSERT INTO ... VALUES one row at a time
+   → Running for 14 hours, only 200K rows loaded
+   → Redshift CPU at 98%, cluster unusable for other queries
+
+CTO: "This is taking forever. Can't we just bulk-load everything?"
+YOU: "INSERT row-by-row is the WORST way to load Redshift.
+      Redshift has a native COPY command designed for exactly this.
+      10 million rows should take 2-3 minutes, not 14 hours."
+
+Data Profile:
+→ 30 daily CSV files in S3 (one per day for last month)
+→ Each file: ~333K rows, ~50 MB
+→ Total: 10M rows, ~1.5 GB uncompressed CSV
+→ S3 path: s3://quickcart-raw-data-prod/daily_exports/orders/
+→ Redshift cluster: 2x dc2.large nodes (from Project 10)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY row-by-row INSERT is disastrous
+</span>→ Redshift is COLUMNAR — optimized for bulk operations
+→ Each INSERT is a single transaction with commit overhead
+→ Leader node parses SQL → sends to compute nodes → commit → repeat
+→ 10M individual transactions = 10M round trips
+→ Network + parse + commit overhead PER ROW
+
+Step 2: Understand the COPY command
+→ Native Redshift bulk loader
+→ Reads directly from S3 (parallel, distributed)
+→ Each compute node slice reads a portion of the data
+→ Bypasses leader node for data transfer
+→ 10M rows in minutes, not hours
+
+Step 3: Understand the PREREQUISITES
+→ Redshift cluster must have an IAM Role that can read S3
+→ S3 bucket policy must allow that role (or same-account = auto)
+→ Target table must exist in Redshift
+→ CSV format must match table columns (or use column mapping)
+
+Step 4: Understand OPTIMIZATION levers
+→ Split files = parallel loading across slices
+→ GZIP compression = less data over network
+→ Manifest file = explicit file list (no surprises)
+→ COMPUPDATE = auto-detect column encoding
+→ STATUPDATE = auto-refresh table statistics</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  S3: quickcart-raw-data-prod/
+   └── daily_exports/orders/
+        ├── orders_20250101.csv       (333K rows, 50MB)
+        ├── orders_20250102.csv       (333K rows, 50MB)
+        ├── ... (28 more files)
+        └── orders_20250130.csv       (333K rows, 50MB)
+                    │
+                    │  COPY command reads ALL files in parallel
+                    │  Each Redshift slice grabs different files
+                    ▼
+  ┌─────────────────────────────────────────────────────┐
+  │              REDSHIFT CLUSTER (2x dc2.large)        │
+  │                                                     │
+  │  Leader Node                                        │
+  │   ├── Parses COPY command                           │
+  │   ├── Distributes file assignments to slices        │
+  │   └── Does NOT transfer actual data                 │
+  │                                                     │
+  │  Compute Node 1          Compute Node 2             │
+  │   ├── Slice 0            ├── Slice 2                │
+  │   │   reads files 1-8    │   reads files 17-23      │
+  │   ├── Slice 1            ├── Slice 3                │
+  │   │   reads files 9-16   │   reads files 24-30      │
+  │   └── ✅ Parallel!       └── ✅ Parallel!           │
+  │                                                     │
+  │  Target: public.orders (10M rows loaded)            │
+  └─────────────────────────────────────────────────────┘
+
+THREE APPROACHES (increasing reliability):
+  A) COPY from prefix     — simplest, loads ALL matching files
+  B) COPY from manifest   — safest, loads EXACT specified files  
+  C) COPY from compressed — fastest, GZIP files before loading
+
+  DECISION: Approach B + C combined (manifest + compression)
+  → Production-grade: explicit file list + compressed transfer</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: COPY from S3 prefix (simplest)
+</span>──────────────────────────────────────────
+COPY orders FROM 's3://quickcart-raw-data-prod/daily_exports/orders/'
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftS3ReadRole'
+CSV IGNOREHEADER 1;
+
+→ Loads EVERY file under that prefix
+→ Risk: stray files (logs, temp files) cause failures
+→ Risk: reprocessing already-loaded files
+
+Option B: COPY from manifest file (recommended)
+────────────────────────────────────────────────
+→ JSON file listing EXACT files to load
+→ Redshift loads ONLY those files
+→ Fails if any listed file is missing (safety net)
+→ Full control over what gets loaded
+
+Option C: COPY with GZIP compression
+─────────────────────────────────────
+→ Compress CSVs to .gz before loading
+→ 50 MB CSV → ~12 MB GZIP (75% reduction)
+→ Less S3 read time, less network transfer
+→ Redshift decompresses in parallel on each slice
+
+Option D: Pre-split files to match slice count
+──────────────────────────────────────────────
+→ 2 dc2.large nodes × 2 slices each = 4 slices
+→ Optimal: number of files = multiple of 4
+→ 30 files ÷ 4 slices = 7-8 files per slice (close enough)
+→ WORST case: 1 giant file → only 1 slice works, others idle
+
+DECISION: B + C → Manifest file with GZIP-compressed CSVs</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ALWAYS use IAM Role — never access keys
+</span>   → Attach role to Redshift cluster with S3 read permission
+   → Reference role ARN in COPY command
+   → Keys in COPY command = security audit failure
+
+2. ALWAYS use MANIFEST for production loads
+   → Explicit file list prevents accidental data
+   → Fails loudly if a file is missing (better than silent partial load)
+
+3. ALWAYS use IGNOREHEADER 1 for CSVs with headers
+   → First row is column names, not data
+   → Without this: header row inserted as data → type errors or corrupt data
+
+4. ALWAYS set MAXERROR appropriately
+   → MAXERROR 0 (default): fail on first bad row
+   → MAXERROR 100: tolerate up to 100 bad rows
+   → Production: start with 0, increase only with monitoring
+
+5. SPLIT files for parallel loading
+   → Number of files should be MULTIPLE of number of slices
+   → 2 dc2.large = 4 slices → ideal: 4, 8, 12, 16... files
+   → Each slice processes its assigned files independently
+
+6. COMPRESS files with GZIP before loading
+   → Reduces S3 read I/O by 70-80%
+   → Redshift auto-detects GZIP when you specify GZIP keyword
+   → Upload .gz files to S3, then COPY with GZIP option
+
+7. TRUNCATE before full reload (if replacing data)
+   → TRUNCATE is instant (metadata operation)
+   → DELETE FROM is row-by-row (extremely slow on 10M rows)
+   → DELETE also leaves dead rows requiring VACUUM
+
+8. Run ANALYZE after large loads
+   → Updates table statistics for query planner
+   → Without this: queries may choose bad execution plans
+   → COPY can auto-run via STATUPDATE ON (default)
+
+9. Use a STAGING table for incremental loads
+   → Load into staging → validate → merge into production
+   → Covered deeply in Project 65 (CDC Merge Pattern)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use INSERT INTO ... VALUES for bulk loading
+</span>   → 10M single-row inserts = 14+ hours
+   → COPY for same data = 2-3 minutes
+   → INSERT is for single-row application writes, not ETL
+
+2. DO NOT use INSERT INTO ... SELECT from another table for S3 loads
+   → This doesn't read from S3 at all
+   → Only works for table-to-table within Redshift
+
+3. DO NOT COPY without IGNOREHEADER when CSVs have headers
+   → "order_id" gets inserted as a VARCHAR value into an INT column
+   → Causes silent data corruption or type mismatch errors
+
+4. DO NOT load one giant file
+   → Single file = single slice does all work
+   → Other slices sit idle
+   → Split into N files where N = multiple of slice count
+
+5. DO NOT forget the REGION parameter if bucket is in different region
+   → COPY defaults to cluster's region for S3 reads
+   → Cross-region: must specify REGION 'us-west-2'
+   → Best practice: keep S3 and Redshift in SAME region (Project 1 advice)
+
+6. DO NOT ignore STL_LOAD_ERRORS after a failed COPY
+   → This system table tells you EXACTLY which row failed and why
+   → Without checking: you retry blindly and waste hours
+
+7. DO NOT run COPY during peak query hours without WLM setup
+   → COPY consumes cluster resources (CPU, I/O, memory)
+   → Can starve dashboard queries
+   → Use WLM queues to isolate load vs query workloads (Project 40)
+
+8. DO NOT use COPY with access keys in the command
+   → COPY orders FROM 's3://...' 
+     ACCESS_KEY_ID 'AKIA...' SECRET_ACCESS_KEY '...'
+   → These appear in query logs (STL_QUERYTEXT)
+   → Anyone with system table access sees your credentials
+   → ALWAYS use IAM_ROLE instead</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────┬──────────────────┬──────────────────────────────────┐
+</span>│ Scenario                       │ Use              │ Why                              │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Bulk load from S3 to Redshift  │ COPY             │ Parallel, distributed, native    │
+│                                │                  │ fastest possible path            │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Load from DynamoDB             │ COPY from        │ Same COPY command, different     │
+│                                │ DynamoDB         │ source syntax                    │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Load from EMR/HDFS             │ COPY from EMR    │ Reads from HDFS via SSH          │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Insert single rows (app)       │ INSERT           │ Low volume, transactional        │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Transform + load via ETL tool  │ Glue → Redshift  │ When transformation needed       │
+│                                │ (Project 32)     │ before loading                   │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Load from another Redshift tbl │ INSERT INTO      │ Already in cluster, no S3 needed │
+│                                │ SELECT           │                                  │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ One-time migration from RDS    │ DMS → S3 → COPY  │ DMS extracts, COPY loads         │
+│                                │ (Project 79)     │                                  │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Export FROM Redshift to S3     │ UNLOAD           │ Reverse of COPY                  │
+│                                │ (Project 22)     │ Covered next project             │
+└────────────────────────────────┴──────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE COPY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data needs TRANSFORMATION before loading
+</span>   → COPY loads raw data as-is (no SQL transforms during load)
+   → Use: Glue ETL → transform → write to S3 → COPY (Project 32)
+   → Or: COPY into staging table → INSERT INTO SELECT with transforms
+
+2. When loading &lt; 100 rows
+   → COPY has overhead (manifest parsing, S3 listing, slice coordination)
+   → For tiny inserts: regular INSERT is fine
+   → Threshold: below ~1000 rows, INSERT is acceptable
+
+3. When source is NOT S3, DynamoDB, or EMR
+   → COPY only supports these three sources
+   → For RDS/MariaDB: extract to S3 first, then COPY (Project 20 → 21 flow)
+   → For API data: write to S3 first, then COPY
+
+4. When you need real-time streaming ingestion
+   → COPY is batch-oriented (run it, wait, done)
+   → For streaming: Kinesis Data Firehose → S3 → COPY micro-batches
+   → Covered in Project 72
+
+5. When data has complex nested JSON requiring flattening
+   → COPY handles flat JSON and simple nesting
+   → Deep nesting with arrays: pre-process in Glue first
+   → Then COPY the flattened output</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                    REDSHIFT COPY — INTERNAL EXECUTION FLOW                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHASE 1: COMMAND PARSING (Leader Node)                                     │
+│  ──────────────────────────────────────                                     │
+│  1. Leader receives COPY SQL statement                                      │
+│  2. Validates: table exists, columns match, IAM role valid                  │
+│  3. Contacts S3 to LIST files matching the prefix or manifest               │
+│  4. Determines number of input files                                        │
+│  5. Plans distribution: assigns files to compute node slices                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  FILE ASSIGNMENT ALGORITHM:                                     │        │
+│  │                                                                 │        │
+│  │  Files:  [f1, f2, f3, f4, f5, f6, f7, f8]                      │        │
+│  │  Slices: [S0, S1, S2, S3]                                      │        │
+│  │                                                                 │        │
+│  │  Assignment (round-robin):                                      │        │
+│  │    S0 → f1, f5                                                  │        │
+│  │    S1 → f2, f6                                                  │        │
+│  │    S2 → f3, f7                                                  │        │
+│  │    S3 → f4, f8                                                  │        │
+│  │                                                                 │        │
+│  │  PERFECT: 8 files / 4 slices = 2 files each (balanced)         │        │
+│  │                                                                 │        │
+│  │  WORST CASE: 1 file / 4 slices = 1 slice busy, 3 idle          │        │
+│  │  → This is why we split files!                                  │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 2: PARALLEL DATA INGESTION (Compute Nodes)                           │
+│  ─────────────────────────────────────────────────                           │
+│  1. Each slice opens DIRECT connection to S3                                │
+│     → Data does NOT flow through leader node                                │
+│     → Leader only orchestrates; compute nodes do the actual I/O             │
+│                                                                             │
+│  2. Each slice:                                                             │
+│     a. Downloads its assigned files from S3                                 │
+│     b. Decompresses (if GZIP/LZO/BZIP2 specified)                          │
+│     c. Parses rows according to format (CSV/JSON/AVRO/Parquet)              │
+│     d. Applies column mapping / data type conversion                        │
+│     e. Writes to local columnar storage                                     │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  NETWORK DATA FLOW:                                             │        │
+│  │                                                                 │        │
+│  │  S3 ──────┬──────→ Compute Node 1, Slice 0  (files 1,5)        │        │
+│  │           ├──────→ Compute Node 1, Slice 1  (files 2,6)        │        │
+│  │           ├──────→ Compute Node 2, Slice 2  (files 3,7)        │        │
+│  │           └──────→ Compute Node 2, Slice 3  (files 4,8)        │        │
+│  │                                                                 │        │
+│  │  Leader Node: sits idle during data transfer ✅                 │        │
+│  │  → This is why COPY is so fast                                  │        │
+│  │  → Contrast with INSERT: every row routes through leader        │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 3: DATA DISTRIBUTION (Across Slices)                                 │
+│  ──────────────────────────────────────────                                  │
+│  After ingestion, rows may need REDISTRIBUTION based on DISTKEY:            │
+│                                                                             │
+│  → DISTSTYLE EVEN: rows stay where they landed (no redistribution)          │
+│  → DISTSTYLE KEY:  rows re-shuffled so same key values → same slice         │
+│  → DISTSTYLE ALL:  full copy sent to every slice (small dimension tables)   │
+│                                                                             │
+│  This redistribution happens AFTER ingestion, adding time for KEY/ALL       │
+│                                                                             │
+│  PHASE 4: COMMIT &amp; STATISTICS                                               │
+│  ────────────────────────────                                                │
+│  1. All slices confirm successful load                                      │
+│  2. Transaction committed atomically                                        │
+│     → Either ALL rows load or NONE (ACID)                                   │
+│  3. If STATUPDATE ON: table statistics auto-refreshed                       │
+│  4. If COMPUPDATE ON: column encodings analyzed and applied                 │
+│  5. Leader returns success + rows loaded count                              │
+│                                                                             │
+│  PHASE 5: ERROR HANDLING                                                    │
+│  ───────────────────────                                                     │
+│  If any row fails parsing:                                                  │
+│  → Error details written to STL_LOAD_ERRORS system table                    │
+│  → If errors ≤ MAXERROR: COPY continues, bad rows skipped                   │
+│  → If errors &gt; MAXERROR: entire COPY rolled back (zero rows loaded)         │
+│  → Error info: file name, line number, column, raw value, error message     │
+│                                                                             │
+│  KEY SYSTEM TABLES FOR DEBUGGING:                                           │
+│  ┌────────────────────────┬────────────────────────────────────────┐        │
+│  │ STL_LOAD_ERRORS        │ Row-level error details                │        │
+│  │ STL_LOAD_COMMITS       │ Which files were loaded successfully   │        │
+│  │ STL_FILE_SCAN          │ Bytes read per file per slice          │        │
+│  │ STL_S3CLIENT_ERROR     │ S3 connectivity issues                 │        │
+│  │ SVL_S3LOG              │ S3 request details per file            │        │
+│  │ STV_LOAD_STATE         │ Currently running COPY progress        │        │
+│  └────────────────────────┴────────────────────────────────────────┘        │
+│                                                                             │
+│  COPY vs INSERT — WHY 1000x FASTER:                                         │
+│  ┌─────────────────────┬────────────────────┬─────────────────────┐         │
+│  │                     │ INSERT (per row)   │ COPY (bulk)         │         │
+│  │ Parse SQL           │ 10M times          │ 1 time              │         │
+│  │ Leader routing      │ 10M times          │ 1 time              │         │
+│  │ Transaction commit  │ 10M times          │ 1 time              │         │
+│  │ Network round trips │ 10M (app→leader)   │ 4 (S3→slices)      │         │
+│  │ S3 connections      │ N/A (no S3)        │ 4 parallel          │         │
+│  │ Parallelism         │ None (sequential)  │ Full (all slices)   │         │
+│  │ Time for 10M rows   │ ~14 hours          │ ~2-3 minutes        │         │
+│  └─────────────────────┴────────────────────┴─────────────────────┘         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "COPY loads 0 rows but doesn't error"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: S3 prefix has no matching files
+→ Debug: 
+   SELECT * FROM stl_load_commits WHERE query = pg_last_copy_id();
+→ Fix: verify exact S3 path — trailing "/" matters
+   's3://bucket/orders'  → matches orders.csv AND orders_backup/
+   's3://bucket/orders/' → matches ONLY files inside orders/ prefix
+
+PITFALL 2: "Load Error: Delimiter not found"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: specified DELIMITER '|' but file uses ','
+→ Debug:
+   SELECT * FROM stl_load_errors ORDER BY starttime DESC LIMIT 10;
+→ Fix: match DELIMITER to actual file delimiter
+
+PITFALL 3: "Load Error: Extra column(s) found"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV has 8 columns, table has 7 columns
+→ Fix: either add missing column to table or use column mapping
+   COPY orders (col1, col2, col3) FROM ...
+
+PITFALL 4: "Load extremely slow despite multiple files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: all files are tiny (&lt; 1MB each) → S3 request overhead dominates
+→ Cause B: number of files not aligned with slice count
+→ Cause C: COMPUPDATE ON analyzing encodings (slow on first load)
+→ Fix A: merge small files into larger ones (64-128 MB each)
+→ Fix B: split/merge to get file count = multiple of slice count
+→ Fix C: use COMPUPDATE OFF after first load
+
+PITFALL 5: "COPY fails with Access Denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Redshift IAM role lacks s3:GetObject on the bucket
+→ Debug: check IAM role → trust policy → S3 policy
+→ Three things must align:
+   1. Role has s3:GetObject + s3:ListBucket policy
+   2. Role trust policy allows redshift.amazonaws.com to assume it
+   3. Role is ATTACHED to the Redshift cluster (not just exists)
+
+PITFALL 6: "Loaded data has wrong values in wrong columns"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV column order doesn't match table column order
+→ COPY maps by POSITION, not by column name
+→ Fix: explicit column list in COPY command
+   COPY orders (order_id, customer_id, amount) FROM ...
+
+PITFALL 7: "Manifest file COPY fails: S3ServiceException: Forbidden"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: IAM role can read data files but NOT the manifest file
+→ Manifest file is also in S3 → role needs access to BOTH:
+   - s3://bucket/manifests/load_manifest.json  (manifest itself)
+   - s3://bucket/daily_exports/orders/*        (data files)
+
+PITFALL 8: "Table has duplicate data after running COPY twice"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: COPY is append-only — it does NOT check for duplicates
+→ Running COPY twice on same files = double the data
+→ Fix: 
+   Option A: TRUNCATE before COPY (full reload)
+   Option B: Load into staging → MERGE into target (Project 65)
+   Option C: Track loaded files in a control table</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME SCALING:
+</span>━━━━━━━━━━━━━━━━━━━
+→ 10 MB:   trivial, single file, 5 seconds
+→ 1 GB:    split into 4-8 files, 30-60 seconds
+→ 10 GB:   split into 16-32 files + GZIP, 3-5 minutes
+→ 100 GB:  split into 64+ files + GZIP, 15-30 minutes
+→ 1 TB:    split into 128+ files + GZIP, 1-3 hours
+→ 10 TB+:  consider multiple COPY jobs in parallel (different tables)
+
+OPTIMAL FILE SIZE:
+━━━━━━━━━━━━━━━━━━
+→ Sweet spot: 1 MB – 1 GB per file (after compression)
+→ Below 1 MB: S3 GET request overhead dominates
+→ Above 1 GB: single slice takes too long, others finish and wait
+→ Ideal: 64-128 MB compressed per file
+
+FILE COUNT FORMULA:
+━━━━━━━━━━━━━━━━━━
+→ Optimal file count = (number of slices) × (integer multiplier)
+→ 2x dc2.large = 4 slices → files: 4, 8, 12, 16, 20...
+→ 4x dc2.large = 8 slices → files: 8, 16, 24, 32...
+→ 2x ra3.xlplus = 4 slices → files: 4, 8, 12, 16...
+
+HOW TO FIND YOUR SLICE COUNT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ SELECT COUNT(DISTINCT slice) FROM stv_slices;
+→ dc2.large: 2 slices per node
+→ dc2.8xlarge: 16 slices per node
+→ ra3.xlplus: 2 slices per node
+→ ra3.4xlarge: 4 slices per node
+→ ra3.16xlarge: 16 slices per node
+
+CLUSTER SCALING:
+━━━━━━━━━━━━━━━━
+→ More nodes = more slices = more parallel S3 readers
+→ Double nodes → roughly halve COPY time
+→ But: node cost doubles too
+→ Balance: optimize file count/size FIRST, add nodes LAST
+
+CONCURRENCY:
+━━━━━━━━━━━━
+→ Multiple COPY jobs can run simultaneously
+→ Each COPY competes for I/O and memory
+→ WLM (Project 40) controls how many concurrent COPYs run
+→ Recommended: max 2-3 concurrent COPY jobs</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY COPY WORKED CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check rows loaded:
+   → COPY command prints: "INFO: Load into table 'orders' completed,
+      10000000 record(s) loaded successfully."
+   → Verify: SELECT COUNT(*) FROM orders;
+
+2. Check for errors:
+   → SELECT * FROM stl_load_errors 
+     WHERE query = pg_last_copy_id() 
+     ORDER BY starttime DESC;
+   → Shows: filename, line_number, colname, raw_field_value, err_reason
+
+3. Check which files were loaded:
+   → SELECT * FROM stl_load_commits 
+     WHERE query = pg_last_copy_id();
+   → Shows: filename, lines_scanned, bytes_scanned
+
+4. Check per-file performance:
+   → SELECT * FROM stl_file_scan 
+     WHERE query = pg_last_copy_id();
+   → Shows: which slice read which file, time taken, bytes read
+
+5. Sample data validation:
+   → SELECT * FROM orders ORDER BY order_id LIMIT 10;
+   → Verify column values look correct (not shifted)
+
+6. Aggregate validation:
+   → Compare S3 row counts vs Redshift row counts
+   → Compare SUM(amount) in source vs target
+   → Any mismatch = data integrity issue
+
+7. Execution time tracking:
+   → SELECT query, starttime, endtime, 
+     DATEDIFF(seconds, starttime, endtime) as duration_sec
+     FROM stl_query WHERE querytxt LIKE 'COPY%' 
+     ORDER BY starttime DESC LIMIT 5;</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(21)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create the Redshift Target Table</h3>
+
+<h3>Step 2: Create IAM Role for Redshift → S3 Access</h3>
+
+<h3>Step 3: Compress CSV Files and Upload to S3</h3>
+
+<h3>Step 4: Generate Manifest File</h3>
+
+<h3>Step 5: Execute COPY Command (Full Pipeline)</h3>
+
+<h3>Step 6: Alternative — COPY from Prefix (Without Manifest)</h3>
+
+<h3>Step 7: Alternative — COPY Uncompressed CSV (Simplest Possible)</h3>
+
+<h3>Step 8: Diagnostic Queries (Keep These Bookmarked)</h3>
+
+<h3>Step 9: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES (from earlier projects):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists with CSV files (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift cluster is running (Project 10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift schema exists (Project 11)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create target table in Redshift</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Run 01_create_redshift_table.sql in Redshift query editor</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create IAM role for Redshift S3 access</span><span>
+</span>python 02_create_redshift_s3_role.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Then attach role to cluster (console or CLI)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Compress CSVs and upload to S3</span><span>
+</span>python 03_compress_and_upload.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Generate manifest file</span><span>
+</span>python 04_generate_manifest.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Execute COPY command</span><span>
+</span>python 05_execute_copy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Run diagnostic queries</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Run 08_copy_diagnostics.sql for deep inspection</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+📊 Rows before COPY: 0
+🗑️  Truncating existing data (full reload mode)...
+   ✅ Table truncated
+
+🚀 Executing COPY command...
+   Source: s3://quickcart-raw-data-prod/manifests/orders_full_load_manifest.json
+   Target: public.orders
+
+✅ COPY completed successfully!
+   Rows loaded: 10,000,000
+   Duration: 147.32 seconds
+   Throughput: 67,879 rows/sec
+
+🔍 Checking STL_LOAD_ERRORS...
+   ✅ No load errors found
+
+📁 Files loaded (STL_LOAD_COMMITS):
+   orders_20250101.csv.gz → 333,334 rows, 11.2 MB
+   orders_20250102.csv.gz → 333,333 rows, 11.1 MB
+   orders_20250103.csv.gz → 333,334 rows, 11.3 MB
+   orders_20250104.csv.gz → 333,333 rows, 11.2 MB
+   orders_20250105.csv.gz → 333,334 rows, 11.1 MB
+   orders_20250106.csv.gz → 333,333 rows, 11.2 MB
+   orders_20250107.csv.gz → 333,334 rows, 11.3 MB
+   orders_20250108.csv.gz → 333,333 rows, 11.1 MB
+   orders_20250109.csv.gz → 333,334 rows, 11.2 MB
+   orders_20250110.csv.gz → 333,333 rows, 11.3 MB
+   orders_20250111.csv.gz → 333,334 rows, 11.1 MB
+   orders_20250112.csv.gz → 333,333 rows, 11.2 MB
+   orders_20250113.csv.gz → 333,334 rows, 11.3 MB
+   orders_20250114.csv.gz → 333,333 rows, 11.1 MB
+   orders_20250115.csv.gz → 333,334 rows, 11.2 MB
+   orders_20250116.csv.gz → 333,333 rows, 11.3 MB
+   orders_20250117.csv.gz → 333,334 rows, 11.1 MB
+   orders_20250118.csv.gz → 333,333 rows, 11.2 MB
+   orders_20250119.csv.gz → 333,334 rows, 11.3 MB
+   orders_20250120.csv.gz → 333,333 rows, 11.1 MB
+   orders_20250121.csv.gz → 333,334 rows, 11.2 MB
+   orders_20250122.csv.gz → 333,333 rows, 11.3 MB
+   orders_20250123.csv.gz → 333,334 rows, 11.1 MB
+   orders_20250124.csv.gz → 333,333 rows, 11.2 MB
+   orders_20250125.csv.gz → 333,334 rows, 11.3 MB
+   orders_20250126.csv.gz → 333,333 rows, 11.1 MB
+   orders_20250127.csv.gz → 333,334 rows, 11.2 MB
+   orders_20250128.csv.gz → 333,333 rows, 11.3 MB
+   orders_20250129.csv.gz → 333,334 rows, 11.1 MB
+   orders_20250130.csv.gz → 333,333 rows, 11.2 MB
+   ────────────────────────────────────
+   Total: 10,000,000 rows, 336.2 MB across 30 files
+
+📋 Sample data (first 5 rows):
+   ORDER_ID                  CUSTOMER_ID         AMOUNT STATUS       DATE
+   ───────────────────────── ─────────────────── ────── ──────────── ──────────
+   ORD-20250101-000001       CUST-023841          89.95 completed    2025-01-01
+   ORD-20250101-000002       CUST-004219         234.50 shipped      2025-01-01
+   ORD-20250101-000003       CUST-041872          12.99 pending      2025-01-01
+   ORD-20250101-000004       CUST-009153         567.00 completed    2025-01-01
+   ORD-20250101-000005       CUST-033607          45.75 cancelled    2025-01-01
+
+📊 Aggregate validation:
+   Total rows:        10,000,000
+   Unique customers:  49,847
+   Unique products:   4,998
+   Date range:        2025-01-01 → 2025-01-30
+   Total revenue:     $2,548,319,472.50
+   Avg order value:   $254.83</code></pre></div>
+<hr>
+<h2>💻 Step 10: Automated Daily Incremental COPY (Append New Day Only)</h2>
+
+<hr>
+<h2>💻 Step 11: COPY Performance Benchmarking Script</h2>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED BENCHMARK OUTPUT:
+</span>
+══════════════════════════════════════════════════════════════════════
+📋 BENCHMARK SUMMARY
+══════════════════════════════════════════════════════════════════════
+Config                                          Time     Rows/sec
+───────────────────────────────────────────── ──────── ────────────
+Uncompressed CSV — Prefix scan                 187.3s      53,396
+GZIP CSV — Prefix scan                         142.8s      70,028
+GZIP CSV — Manifest                            141.5s      70,671
+GZIP CSV — Manifest — COMPUPDATE ON           198.2s      50,454
+══════════════════════════════════════════════════════════════════════
+
+KEY OBSERVATIONS:
+→ GZIP is ~24% faster than uncompressed (less S3 I/O)
+→ Manifest vs Prefix: negligible speed difference
+→ Manifest wins on SAFETY (not speed)
+→ COMPUPDATE ON adds ~40% overhead (analyzing encodings)
+→ Use COMPUPDATE ON only on FIRST ever load
+→ All subsequent loads: COMPUPDATE OFF</code></pre></div>
+<hr>
+<h2>💻 Step 12: COPY Error Recovery Script</h2>
+
+<hr>
+<h2>💻 Step 13: COPY Options Quick Reference</h2>
+
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ COPY is the ONLY way to bulk-load S3 → Redshift efficiently
+→ INSERT row-by-row: 14 hours for 10M rows
+→ COPY: 2-3 minutes for same 10M rows (1000x faster)
+→ COPY reads directly from S3 → compute node slices (bypasses leader)
+→ Split files to match slice count for maximum parallelism
+→ GZIP compression reduces load time by 20-30%
+→ MANIFEST gives explicit control over which files load
+→ MANIFEST mandatory=true prevents silent partial loads
+→ MAXERROR 0 in production (fail loudly, not silently)
+→ COMPUPDATE ON only on first load, OFF for all subsequent loads
+→ STL_LOAD_ERRORS is your best friend for debugging failures
+→ COPY is APPEND-ONLY — running twice = duplicate data
+→ Idempotency must be implemented in YOUR code (not COPY's job)
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket where source files live
+→ Project 3:  IAM policies controlling who can read from S3
+→ Project 6:  IAM Role concept — Redshift uses same mechanism as EC2
+→ Project 10: Redshift cluster provisioning
+→ Project 11: Target table schema (fact table design)
+→ Project 20: MariaDB → CSV → S3 (these are the files we just loaded)
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 22: UNLOAD — reverse of COPY (Redshift → S3)
+→ Project 30: Automated S3 → SQS → EC2 → Redshift COPY pipeline
+→ Project 32: Glue writes to Redshift (alternative to COPY)
+→ Project 39: Optimize table design (DISTKEY, SORTKEY) for queries AFTER load
+→ Project 65: CDC Merge — incremental loads with updates and deletes</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has 10M orders in Redshift — dashboards are blazing fast
+</span>
+BUT: Finance team asks for a monthly revenue summary as a CSV file
+     They want it in S3 so their Excel-based tools can download it
+     
+They also need to share Redshift query results with a partner
+     who has NO Redshift access — only S3 access
+
+CTO: "We loaded S3 → Redshift with COPY. Can we go the other way?"
+YOU: "Yes — UNLOAD is the exact reverse of COPY.
+      It runs a query in Redshift and writes results to S3.
+      Parallel output, compressed, partitioned — same principles."
+
+→ Project 22: "Export Redshift Query Results Back to S3 for Sharing"
+→ Introduces: UNLOAD → Parallel Files → Delimiter → Header → Partition Prefix
+→ COPY loads IN, UNLOAD exports OUT — they are mirror commands</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-20.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 21 of 80</span>
+    <span class="nav-project-title">BULK-LOAD 10 MILLION ROWS FROM S3 INTO REDSHIFT FAST</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-22.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-22.html") window.location = "project-22.html";
+  if (e.key === 'ArrowLeft' && "project-20.html") window.location = "project-20.html";
+});
+</script>
+</body>
+</html>

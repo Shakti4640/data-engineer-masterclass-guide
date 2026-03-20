@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 56: ACCOUNT B NEEDS TO READ ACCOUNT A&#x27;S S3 BUCKET — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:70%"></div></div>
+<div id="progress-label">70%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 56 of 80</div>
+  <div class="project-title">ACCOUNT B NEEDS TO READ ACCOUNT A&#x27;S S3 BUCKET</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now a 200-person company
+</span>Team: 15 engineers, 5 data engineers, 4 analysts, 1 security lead
+
+ORGANIZATIONAL CHANGE:
+→ Security audit mandated AWS account separation
+→ Previously: everything in ONE AWS account (Projects 1-55)
+→ Now: must split into multiple accounts for security isolation
+
+NEW ACCOUNT STRUCTURE:
+┌─────────────────────────────────────────────────────────────────┐
+│  AWS Organization                                                │
+│                                                                   │
+│  Account A: "Production Data" (111111111111)                      │
+│  → S3 buckets with all raw + processed data                      │
+│  → MariaDB on EC2 (source system)                                │
+│  → Redshift cluster (production warehouse)                       │
+│  → Owned by: Platform Engineering team                           │
+│                                                                   │
+│  Account B: "Analytics" (222222222222)                            │
+│  → Glue ETL jobs (transform data)                                │
+│  → Athena queries (ad-hoc analysis)                              │
+│  → DataBrew projects (Sarah's cleaning)                          │
+│  → Owned by: Data Engineering + Analytics team                   │
+│                                                                   │
+│  Account C: "Development" (333333333333)                          │
+│  → Dev/test environments                                         │
+│  → Not covered in this project (same patterns apply)             │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+THE IMMEDIATE PROBLEM:
+→ Account B's Glue ETL job needs to READ data from Account A's S3 bucket
+→ Account B's Athena needs to QUERY data in Account A's S3
+→ Account B's DataBrew needs to READ raw CSVs from Account A's S3
+→ Account B should NOT have full admin access to Account A
+→ Account B should ONLY access specific S3 prefixes (not everything)
+→ All access must be AUDITABLE (CloudTrail)
+
+WHAT DOESN'T WORK:
+→ Can't use Account A's IAM credentials in Account B (security violation)
+→ Can't copy all data from A to B (duplication cost, staleness)
+→ Can't make Account A's bucket public (massive security risk)
+→ Can't share IAM users across accounts (impossible by design)
+
+SECURITY LEAD: "Account B must access Account A's S3 data with:
+  1. Least privilege — only specific prefixes
+  2. No credential sharing — use IAM roles
+  3. Full audit trail — every access logged
+  4. Revocable — we can cut access instantly
+  5. No data duplication — read in place"
+
+YOU: "Two approaches:
+  Approach 1: Bucket Policy (Account A grants access to Account B's role)
+  Approach 2: AssumeRole (Account B assumes a role IN Account A)
+  We'll implement BOTH and understand when to use which."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY cross-account access is needed
+</span>→ Security: blast radius isolation (compromised Account B can't destroy Account A)
+→ Billing: separate cost tracking per team
+→ Compliance: data residency and access controls per account
+→ Governance: different IAM policies per account
+→ This is AWS BEST PRACTICE — not optional for enterprises
+
+Step 2: Understand the TWO cross-account S3 patterns
+→ Pattern 1: RESOURCE-BASED policy (Bucket Policy)
+  - Account A's bucket policy says: "Account B's role can read"
+  - Account B's role accesses bucket directly
+  - Objects accessed REMAIN owned by Account A
+  - Simpler but less flexible
+
+→ Pattern 2: IDENTITY-BASED + TRUST (AssumeRole via STS)
+  - Account A creates a role: "CrossAccountS3ReadRole"
+  - Account A's role trust policy says: "Account B can assume me"
+  - Account B's entity calls sts:AssumeRole → gets temporary credentials
+  - Uses temporary credentials to access Account A's S3
+  - More flexible, more secure, more common in production
+
+Step 3: Understand the PERMISSION CHAIN
+→ Cross-account access requires BOTH sides to agree:
+  - Account A must ALLOW (resource policy OR trust policy)
+  - Account B must be ALLOWED to perform the action (identity policy)
+  - If EITHER side denies → access denied
+  - This is the "two-door" model — both doors must be open
+
+Step 4: Understand STS (Security Token Service)
+→ AssumeRole returns TEMPORARY credentials (not permanent)
+→ Credentials expire after 1-12 hours (configurable)
+→ Each AssumeRole call is logged in CloudTrail (both accounts)
+→ Can be revoked by: removing trust policy, deleting role, or waiting for expiry
+
+Step 5: Design the access matrix
+→ Account B's Glue role → can READ s3://acct-a-bucket/daily_exports/*
+→ Account B's Glue role → can READ s3://acct-a-bucket/cleaned/*
+→ Account B's Glue role → CANNOT read s3://acct-a-bucket/internal/*
+→ Account B's Glue role → CANNOT write to Account A's bucket
+→ Account B's Athena role → same read access as Glue</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE — BOTH PATTERNS:
+</span>
+═══════════════════════════════════════════════════════════════
+PATTERN 1: BUCKET POLICY (Resource-Based)
+═══════════════════════════════════════════════════════════════
+
+Account A [REDACTED:BANK_ACCOUNT_NUMBER]1)          Account B [REDACTED:BANK_ACCOUNT_NUMBER]2)
+┌─────────────────────────┐      ┌─────────────────────────┐
+│                         │      │                         │
+│  S3 Bucket              │      │  Glue ETL Job           │
+│  quickcart-data-prod    │◄─────│  (runs as GlueRole-B)   │
+│                         │      │                         │
+│  Bucket Policy:         │      │  GlueRole-B Policy:     │
+│  "Allow Account B's     │      │  "Allow s3:GetObject    │
+│   GlueRole-B to         │      │   on Account A's bucket"│
+│   s3:GetObject on       │      │                         │
+│   daily_exports/*"      │      │                         │
+│                         │      │                         │
+└─────────────────────────┘      └─────────────────────────┘
+
+Flow:
+1. Account B's Glue job runs as GlueRole-B
+2. Glue calls s3:GetObject on Account A's bucket
+3. S3 checks: bucket policy allows GlueRole-B? YES
+4. S3 checks: GlueRole-B's IAM policy allows s3:GetObject? YES
+5. Both doors open → access GRANTED
+
+
+═══════════════════════════════════════════════════════════════
+PATTERN 2: ASSUME ROLE (Identity-Based + STS)
+═══════════════════════════════════════════════════════════════
+
+Account A [REDACTED:BANK_ACCOUNT_NUMBER]1)          Account B [REDACTED:BANK_ACCOUNT_NUMBER]2)
+┌─────────────────────────┐      ┌─────────────────────────┐
+│                         │      │                         │
+│  S3 Bucket              │      │  Python Script / Glue   │
+│  quickcart-data-prod    │      │  (runs as GlueRole-B)   │
+│                         │      │                         │
+│  IAM Role:              │      │  Step 1: GlueRole-B     │
+│  "CrossAccount-S3Read"  │      │  calls sts:AssumeRole   │
+│                         │      │  on Account A's role     │
+│  Trust Policy:          │      │                         │
+│  "Allow Account B's     │  ←───│  Step 2: STS returns    │
+│   GlueRole-B to         │      │  temporary credentials  │
+│   assume this role"     │      │                         │
+│                         │      │  Step 3: Use temp creds  │
+│  Permission Policy:     │      │  to access S3 bucket    │
+│  "Allow s3:GetObject    │      │                         │
+│   on daily_exports/*"   │      │                         │
+│                         │      │                         │
+└─────────────────────────┘      └─────────────────────────┘
+
+Flow:
+1. Account B's script calls sts:AssumeRole(Account A's role ARN)
+2. STS checks: does Account A's role trust Account B's caller? YES
+3. STS checks: does Account B's caller have sts:AssumeRole permission? YES
+4. STS returns temporary AccessKeyId + SecretAccessKey + SessionToken
+5. Script uses temporary credentials to call s3:GetObject
+6. S3 checks: role has s3:GetObject permission? YES
+7. Access GRANTED — credentials expire after session duration</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Copy data from Account A to Account B
+</span>→ S3 Replication or manual copy script
+→ PROBLEMS: data duplication ($$$), staleness, sync complexity
+→ At 100 GB: doubling storage cost + replication time
+→ Not scalable — every new dataset needs replication setup
+
+Option B: Make Account A's bucket public
+→ ABSOLUTELY NOT — this is the #1 cause of S3 data breaches
+→ Anyone on the internet can read your data
+→ 2017 Verizon, 2019 Capital One — public S3 = headlines
+
+Option C: Share IAM credentials from Account A to Account B
+→ Impossible by design — IAM credentials belong to one account
+→ Even if possible: violates security principles (shared credentials)
+→ No audit trail of who used the credentials
+
+Option D: Bucket Policy (Pattern 1) ✅ for simple cases
+→ Account A grants specific access via bucket policy
+→ Simple, no STS calls needed
+→ But: Account B accesses as ITSELF (not as Account A's role)
+→ Object ownership can be confusing (especially for writes)
+
+Option E: AssumeRole (Pattern 2) ✅ for production use
+→ Account A creates a role with specific permissions
+→ Account B assumes that role via STS
+→ Most flexible, most secure, most common
+→ Clear audit trail in BOTH accounts' CloudTrail
+→ Temporary credentials — automatically expire
+
+DECISION: Implement BOTH patterns
+→ Pattern 1 (Bucket Policy): simpler, good for read-only S3 access
+→ Pattern 2 (AssumeRole): production standard, used in Projects 57-61
+→ Understanding both is CRITICAL for interviews</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use External ID for AssumeRole (confused deputy prevention)
+</span>   → External ID: a secret string shared between Account A and B
+   → Account A's trust policy: "Allow Account B IF ExternalId matches"
+   → Prevents: malicious third party tricking Account B into accessing Account A
+   → This is the "confused deputy problem" — External ID solves it
+   → AWS recommends External ID for ALL cross-account AssumeRole
+
+2. Use LEAST PRIVILEGE on both sides
+   → Account A's bucket policy: only specific prefixes, only specific actions
+   → Account A's role: only s3:GetObject + s3:ListBucket (not s3:PutObject)
+   → Account B's policy: only sts:AssumeRole on Account A's specific role ARN
+   → Never use Resource: "*" in cross-account policies
+
+3. Set session duration appropriately
+   → Default: 1 hour
+   → For Glue ETL (may run 2+ hours): set DurationSeconds to 3600-7200
+   → For interactive Athena: 1 hour is fine
+   → Shorter = more secure (credentials expire faster)
+   → Longer = more convenient (fewer re-authentication calls)
+
+4. Enable CloudTrail in BOTH accounts
+   → Account A CloudTrail: sees who accessed S3 (the assumed role)
+   → Account B CloudTrail: sees who called AssumeRole (the original caller)
+   → Together: complete audit trail from original user to data access
+
+5. Tag cross-account roles clearly
+   → Tag: CrossAccount=true, SourceAccount=222222222222
+   → Tag: Purpose=S3ReadOnly, ManagedBy=SecurityTeam
+   → Makes it easy to audit all cross-account roles
+
+6. Use Condition keys in trust policies
+   → aws:SourceAccount: restrict to specific account
+   → sts:ExternalId: prevent confused deputy
+   → aws:PrincipalOrgID: restrict to accounts in same Organization
+   → aws:PrincipalArn: restrict to specific roles (not any role in Account B)
+
+7. Document the access path
+   → Maintain a spreadsheet/wiki of all cross-account access grants
+   → Who has access, to what, via which role, when granted, why
+   → Review quarterly — revoke unused access</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use root account credentials for cross-account access
+</span>   → Root should NEVER be used for operational tasks
+   → Root can't be restricted with IAM policies
+   → Use IAM roles exclusively
+
+2. DO NOT grant s3:* (all S3 actions) in cross-account policies
+   → Account B only needs READ → grant only s3:GetObject + s3:ListBucket
+   → s3:DeleteObject in cross-account = Account B can delete Account A's data
+   → s3:PutObject with wrong ownership = Account A can't read objects Account B wrote
+
+3. DO NOT hardcode Account IDs in application code
+   → Use environment variables or SSM Parameter Store
+   → Account IDs change when migrating between environments
+   → Hardcoded IDs make testing impossible
+
+4. DO NOT forget the BUCKET SIDE permission when using AssumeRole
+   → Common mistake: set up AssumeRole correctly but forget bucket policy
+   → With AssumeRole: bucket policy is NOT needed (role's IAM policy is enough)
+   → But: if bucket has an explicit DENY → even AssumeRole can't override it
+   → Check for explicit denies in bucket policy
+
+5. DO NOT use long-lived access keys for cross-account
+   → Access keys don't expire → compromised key = permanent access
+   → AssumeRole credentials expire automatically
+   → If you MUST use keys: rotate every 90 days (but prefer AssumeRole)
+
+6. DO NOT create overly broad trust policies
+   → Bad: "Allow entire Account B to assume this role"
+     → Any user/role in Account B can assume it
+   → Good: "Allow ONLY arn:aws:iam::222222222222:role/GlueRole-B"
+     → Only the specific Glue role can assume it
+
+7. DO NOT skip testing with wrong credentials
+   → Test: Account B tries to access DENIED prefix → should fail
+   → Test: Account B tries to WRITE → should fail
+   → Test: Account C tries to assume Account A's role → should fail
+   → Negative testing is MORE important than positive testing for security</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬─────────────────────────┬───────────────────────────────────────────┐
+</span>│ Scenario                         │ Use                     │ Why                                       │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Simple S3 read-only from         │ Bucket Policy           │ No STS call needed, simpler setup,        │
+│ one specific role                │ (Pattern 1)             │ good for Athena/Glue native integration   │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Multiple services in Account B   │ AssumeRole              │ One role in A, multiple consumers in B,   │
+│ need access to Account A         │ (Pattern 2)             │ temporary creds, full audit trail         │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Cross-account WRITE to S3        │ AssumeRole +            │ Object ownership issues with bucket       │
+│                                  │ bucket-owner-full-ctrl  │ policy approach; AssumeRole avoids this   │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Cross-account within same        │ AWS Organizations SCP + │ Centralized governance, easier trust      │
+│ AWS Organization                 │ AssumeRole              │ via aws:PrincipalOrgID condition           │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Third-party vendor needs         │ AssumeRole + External   │ External ID prevents confused deputy;     │
+│ access to your S3                │ ID (mandatory)          │ temporary creds; revocable instantly       │
+├──────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Replicate data for DR or         │ S3 Replication Rules    │ Actual copy needed; not just access       │
+│ compliance (data must exist      │ (Project 47)            │ (cross-region or cross-account)           │
+│ in both accounts)                │                         │                                           │
+└──────────────────────────────────┴─────────────────────────┴───────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE CROSS-ACCOUNT S3 ACCESS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data MUST physically exist in both accounts
+</span>   → Cross-account access = read in place, no copy
+   → Compliance may require: "data must reside in Account B's region"
+   → Use: S3 Cross-Account Replication (Project 47)
+
+2. When latency is critical and accounts are in different regions
+   → Cross-account in same region: no latency impact
+   → Cross-account cross-region: latency + data transfer cost
+   → Use: replicate to local region, then access locally
+
+3. When you need to grant access to thousands of objects selectively
+   → Bucket policies have 20 KB size limit
+   → Can't list 10,000 individual object ARNs
+   → Use: prefix-based access (daily_exports/*) or tag-based (S3 access points)
+
+4. When the accessing account is untrusted (public API consumers)
+   → Cross-account = trust between known AWS accounts
+   → Public consumers: use pre-signed URLs or CloudFront
+   → Never create cross-account roles for unknown entities
+
+5. When both accounts are in the SAME account
+   → No cross-account setup needed
+   → Just use IAM roles with proper policies
+   → Cross-account adds complexity for zero benefit in single-account</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│           CROSS-ACCOUNT S3 ACCESS — INTERNAL MECHANICS                       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PATTERN 1: BUCKET POLICY (Resource-Based Access)                            │
+│  ═══════════════════════════════════════════════                              │
+│                                                                              │
+│  HOW S3 EVALUATES ACCESS:                                                    │
+│  ┌────────────────────────────────────────────────────────────────┐          │
+│  │ Request arrives: s3:GetObject from Account B's GlueRole-B     │          │
+│  │                                                                 │          │
+│  │ Step 1: Is there an EXPLICIT DENY?                              │          │
+│  │   → Check bucket policy for Deny statements                    │          │
+│  │   → Check Account A's SCPs (Organization)                      │          │
+│  │   → If explicit deny found → DENIED (game over)                │          │
+│  │                                                                 │          │
+│  │ Step 2: Is there an EXPLICIT ALLOW in resource policy?          │          │
+│  │   → Check bucket policy for Allow with matching principal       │          │
+│  │   → If bucket policy allows GlueRole-B → ALLOWED               │          │
+│  │   → For CROSS-ACCOUNT: resource policy Allow is SUFFICIENT      │          │
+│  │     (identity policy in Account B is ALSO checked)              │          │
+│  │                                                                 │          │
+│  │ Step 3: Is there an EXPLICIT ALLOW in identity policy?          │          │
+│  │   → Check GlueRole-B's IAM policies in Account B               │          │
+│  │   → Must have s3:GetObject on the bucket ARN                   │          │
+│  │                                                                 │          │
+│  │ CROSS-ACCOUNT RULE:                                             │          │
+│  │   → BOTH resource policy (Account A) AND identity policy        │          │
+│  │     (Account B) must ALLOW the action                           │          │
+│  │   → This is DIFFERENT from same-account where EITHER suffices   │          │
+│  │                                                                 │          │
+│  │ Result: bucket policy ALLOWS + identity policy ALLOWS → GRANTED │          │
+│  └────────────────────────────────────────────────────────────────┘          │
+│                                                                              │
+│                                                                              │
+│  PATTERN 2: ASSUME ROLE (STS-Based Access)                                   │
+│  ═════════════════════════════════════════                                    │
+│                                                                              │
+│  DETAILED FLOW:                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐          │
+│  │                                                                 │          │
+│  │  Account B                          Account A                   │          │
+│  │  ────────                          ────────                     │          │
+│  │                                                                 │          │
+│  │  GlueRole-B                        CrossAccount-S3Read Role     │          │
+│  │  (identity policy:                 (trust policy:                │          │
+│  │   sts:AssumeRole on               "Allow GlueRole-B             │          │
+│  │   Account A's role ARN)            from Account B")             │          │
+│  │       │                                  │                      │          │
+│  │       │  1. AssumeRole API call          │                      │          │
+│  │       │─────────────────────────────────→│                      │          │
+│  │       │                                  │                      │          │
+│  │       │                          2. STS evaluates:              │          │
+│  │       │                          a) Trust policy: does it       │          │
+│  │       │                             allow GlueRole-B? YES      │          │
+│  │       │                          b) External ID match? YES     │          │
+│  │       │                          c) Session duration OK? YES   │          │
+│  │       │                                  │                      │          │
+│  │       │  3. Return temporary credentials │                      │          │
+│  │       │←─────────────────────────────────│                      │          │
+│  │       │  {                               │                      │          │
+│  │       │    AccessKeyId: "[REDACTED:AWS_ACCESS_KEY]...",       │                      │          │
+│  │       │    SecretAccessKey: "...",       │                      │          │
+│  │       │    SessionToken: "...",          │                      │          │
+│  │       │    Expiration: "2025-01-15T02:00:00Z"                   │          │
+│  │       │  }                               │                      │          │
+│  │       │                                  │                      │          │
+│  │       │  4. Use temp creds for S3 call   │                      │          │
+│  │       │─────────────────────────────────→│                      │          │
+│  │       │  s3:GetObject(bucket, key)       │                      │          │
+│  │       │                                  │                      │          │
+│  │       │                          5. S3 evaluates:               │          │
+│  │       │                          Caller is Account A's role     │          │
+│  │       │                          Role has s3:GetObject? YES    │          │
+│  │       │                          No explicit deny? YES         │          │
+│  │       │                                  │                      │          │
+│  │       │  6. Return S3 object             │                      │          │
+│  │       │←─────────────────────────────────│                      │          │
+│  │       │                                  │                      │          │
+│  └────────────────────────────────────────────────────────────────┘          │
+│                                                                              │
+│  KEY DIFFERENCE FROM PATTERN 1:                                              │
+│  → In Pattern 1: caller is Account B's role accessing Account A's S3        │
+│  → In Pattern 2: caller BECOMES Account A's role (via AssumeRole)           │
+│  → In Pattern 2: S3 sees the request as coming from Account A               │
+│  → In Pattern 2: no bucket policy needed (role is in same account as bucket)│
+│                                                                              │
+│  CLOUDTRAIL AUDIT:                                                           │
+│  ┌──────────────────────────────────────────────────────────────┐            │
+│  │ Account B's CloudTrail:                                       │            │
+│  │   Event: sts:AssumeRole                                       │            │
+│  │   Caller: arn:aws:iam::222222222222:role/GlueRole-B           │            │
+│  │   Target: arn:aws:iam::111111111111:role/CrossAccount-S3Read  │            │
+│  │   Time: 2025-01-15T01:00:00Z                                 │            │
+│  │                                                                │            │
+│  │ Account A's CloudTrail:                                       │            │
+│  │   Event: s3:GetObject                                         │            │
+│  │   Caller: arn:aws:sts::111111111111:assumed-role/              │            │
+│  │           CrossAccount-S3Read/session-name                    │            │
+│  │   Resource: arn:aws:s3:::quickcart-data-prod/daily_exports/..│            │
+│  │   Time: 2025-01-15T01:00:05Z                                 │            │
+│  │                                                                │            │
+│  │ COMBINED: GlueRole-B (Acct B) → assumed CrossAccount-S3Read  │            │
+│  │           (Acct A) → read daily_exports/orders_20250115.csv   │            │
+│  └──────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│  CONFUSED DEPUTY PROBLEM:                                                    │
+│  ════════════════════════                                                    │
+│  Without External ID:                                                        │
+│  → Malicious actor in Account X tells Account B's service:                   │
+│    "Assume Account A's role on my behalf"                                    │
+│  → Account B's service (confused deputy) assumes Account A's role            │
+│  → Malicious actor gains access to Account A's data                          │
+│                                                                              │
+│  With External ID:                                                           │
+│  → Account A's trust policy: "Allow Account B IF ExternalId=secret123"       │
+│  → Malicious actor doesn't know the External ID                              │
+│  → AssumeRole fails → attack prevented                                       │
+│  → External ID is shared OUT OF BAND between Account A and B admins          │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "AccessDenied even though bucket policy allows Account B"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Account B's identity policy ALSO needs to allow the action
+→ Cross-account = BOTH sides must allow (AND logic, not OR)
+→ Bucket policy allows ✅ + Identity policy missing ❌ = DENIED
+→ Fix: add s3:GetObject permission to Account B's role policy
+
+PITFALL 2: "AssumeRole succeeds but S3 access denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Account A's assumed role lacks S3 permissions
+→ AssumeRole gives you the ROLE's permissions, not Account A's admin access
+→ Role must have explicit s3:GetObject on the target bucket
+→ Fix: attach S3 read policy to the cross-account role in Account A
+
+PITFALL 3: "Trust policy allows Account B but AssumeRole still fails"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: External ID required but not provided
+→ Cause 2: Trust policy specifies specific role ARN, caller is different role
+→ Cause 3: SCP (Service Control Policy) in Organization blocks sts:AssumeRole
+→ Debug: check trust policy conditions EXACTLY match the caller
+
+PITFALL 4: "Bucket policy exceeds 20 KB limit"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: granting access to too many individual principals/prefixes
+→ Bucket policy max: 20 KB (about 20-30 policy statements)
+→ Fix: use S3 Access Points (each has its own policy, up to 10,000 per bucket)
+→ Fix: use AssumeRole pattern (no bucket policy needed)
+
+PITFALL 5: "Objects written by Account B can't be read by Account A"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: S3 object ownership — objects belong to the WRITING account
+→ Account B writes object → Account B owns it → Account A can't read
+→ Fix 1: bucket-owner-full-control ACL on put
+→ Fix 2: S3 Object Ownership = BucketOwnerEnforced (recommended since 2022)
+→ Fix 3: use AssumeRole pattern (writes as Account A's role → A owns object)
+
+PITFALL 6: "Temporary credentials expired mid-Glue-job"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Default session: 1 hour
+→ Glue job runs for 2 hours → credentials expire → job fails at hour 1
+→ Fix: set DurationSeconds in AssumeRole (max 12 hours for IAM roles)
+→ Fix: Glue's native cross-account support handles credential refresh
+→ Better: use Glue Connection with cross-account role (Project 60)
+
+PITFALL 7: "Works from CLI but fails from Glue/Lambda"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CLI uses your user credentials (admin). Glue uses its service role.
+→ Trust policy allows your user but NOT the Glue service role
+→ Fix: trust policy must list the EXACT ARN of the Glue/Lambda role
+→ Always test with the ACTUAL service role, not your admin user</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ACCESS PATTERNS AT SCALE:
+</span>→ 1 cross-account role: simple, works for small teams
+→ 5 cross-account roles: one per service (Glue, Athena, DataBrew, etc.)
+→ 20+ cross-account roles: consider AWS Organizations + SCPs
+→ 100+ accounts: use AWS RAM (Resource Access Manager) or Lake Formation
+
+BUCKET POLICY LIMITS:
+→ Max size: 20 KB
+→ ~20-30 statements per policy
+→ If exceeded: use S3 Access Points (10,000 per bucket)
+→ Each Access Point has its own 20 KB policy
+
+TRUST POLICY LIMITS:
+→ Max size: 20 KB (same as bucket policy)
+→ ~20-30 principals per trust policy
+→ If exceeded: use aws:PrincipalOrgID condition (allows entire Organization)
+
+STS LIMITS:
+→ AssumeRole: 2,000 calls/second per account (adjustable)
+→ Session duration: 1-12 hours (IAM roles), 15 min-12 hours (IAM users)
+→ Max active sessions per role: no hard limit
+
+COST:
+→ Cross-account S3 access: $0/additional (no extra charge)
+→ Data transfer same-region: $0
+→ Data transfer cross-region: $0.01-$0.02/GB
+→ STS AssumeRole API calls: $0 (free)
+→ CloudTrail logging: included in free tier (first trail per region)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CROSS-ACCOUNT ACCESS:
+</span>
+1. Test from Account B's CLI (assuming role):
+   → aws sts assume-role --role-arn &lt;Account A role&gt; --role-session-name test
+   → Use returned credentials to: aws s3 ls s3://account-a-bucket/
+   → Should succeed for allowed prefixes, fail for denied prefixes
+
+2. Test negative cases:
+   → Try to WRITE (should fail — read-only role)
+   → Try to access denied prefix (should fail)
+   → Try to assume role from Account C (should fail)
+   → Try without External ID (should fail if required)
+
+3. CloudTrail verification:
+   → Account A: check for s3:GetObject events from assumed role
+   → Account B: check for sts:AssumeRole events
+   → Both should show: who, what, when, from where
+
+4. IAM Policy Simulator:
+   → AWS console → IAM → Policy Simulator
+   → Select Account A's cross-account role
+   → Simulate: s3:GetObject on specific bucket/key
+   → Shows: allowed/denied and which policy caused the decision
+
+5. S3 Access Analyzer:
+   → Account A → IAM → Access Analyzer
+   → Automatically detects: "this bucket is accessible from Account B"
+   → Flags unexpected cross-account access
+   → Review findings quarterly</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(56)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Pattern 1 — Bucket Policy Approach (Account A Setup)</h3>
+
+<h3>Step 2: Pattern 2 — AssumeRole Approach (Account A Setup)</h3>
+
+<h3>Step 3: Pattern 2 — AssumeRole from Account B</h3>
+
+<h3>Step 4: Account B IAM Policy Setup</h3>
+
+<h3>Step 5: Comprehensive Cross-Account Access Tester</h3>
+
+<h3>Step 6: CloudTrail Audit Verification</h3>
+
+<h3>Step 7: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Pattern 1: Set up bucket policy cross-account access (Account A)</span><span>
+</span>python 56_01_bucket_policy_pattern.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Pattern 2: Create cross-account role in Account A</span><span>
+</span>python 56_02_assume_role_account_a.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Pattern 2: Test AssumeRole from Account B</span><span>
+</span>python 56_03_assume_role_account_b.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Create Account B IAM roles with cross-account permissions</span><span>
+</span>python 56_04_account_b_iam_setup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run comprehensive test suite (both patterns)</span><span>
+</span>python 56_05_test_cross_account_access.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Verify CloudTrail audit logs</span><span>
+</span>python 56_06_audit_cross_account_access.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Cleanup</span><span>
+</span>python 56_07_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED TEST OUTPUT:
+</span>
+======================================================================
+🧪 CROSS-ACCOUNT ACCESS — COMPREHENSIVE TEST SUITE
+   Account A (dat[REDACTED:BANK_ACCOUNT_NUMBER]1111
+   Account B (analytics): 222222222222
+   Bucket: quickcart-data-prod
+======================================================================
+
+════════════════════════════════════════════════════════════
+🧪 TESTING PATTERN 1: BUCKET POLICY (Direct Access)
+════════════════════════════════════════════════════════════
+  Test 1.1: List allowed prefix (daily_exports/)...
+    ✅ PASS — Found 3 objects
+  Test 1.2: Read object in allowed prefix...
+    ✅ PASS — Read orders_20250115.csv (83942 bytes)
+  Test 1.3: List denied prefix (internal/) — should FAIL...
+    ✅ PASS — correctly denied
+  Test 1.4: Write attempt — should FAIL...
+    ✅ PASS — correctly denied
+  Test 1.5: Delete attempt — should FAIL...
+    ✅ PASS — correctly denied
+
+════════════════════════════════════════════════════════════
+🧪 TESTING PATTERN 2: ASSUME ROLE (STS Temporary Credentials)
+════════════════════════════════════════════════════════════
+  Test 2.1: AssumeRole with correct External ID...
+    ✅ PASS — Got temporary credentials
+  Test 2.2: AssumeRole with WRONG External ID — should FAIL...
+    ✅ PASS — correctly denied
+  Test 2.3: AssumeRole WITHOUT External ID — should FAIL...
+    ✅ PASS — correctly denied
+  Test 2.4: S3 access with assumed role credentials...
+    ✅ PASS — Listed 3 objects via assumed role
+  Test 2.5: Denied prefix via assumed role — should FAIL...
+    ✅ PASS — correctly denied
+  Test 2.6: Write via assumed role — should FAIL...
+    ✅ PASS — correctly denied
+
+======================================================================
+📊 FINAL TEST REPORT
+======================================================================
+  Total tests:  11
+  ✅ Passed:    11
+  ❌ Failed:    0
+  ⚠️  Warnings: 0
+
+  🟢 ALL TESTS PASSED — cross-account access is correctly configured
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Cross-account S3 access has TWO patterns: Bucket Policy and AssumeRole
+→ Pattern 1 (Bucket Policy): simpler — Account A's bucket policy grants Account B
+→ Pattern 2 (AssumeRole): more secure — Account B assumes a role IN Account A
+→ Cross-account requires BOTH sides to allow (AND logic, not OR)
+→ External ID prevents confused deputy attacks (mandatory for third-party access)
+→ STS returns TEMPORARY credentials that auto-expire (1-12 hours)
+→ CloudTrail logs every AssumeRole call and every S3 access (full audit trail)
+→ Least privilege: specific prefixes, specific actions, specific roles
+→ NEGATIVE testing is MORE important than positive testing for security
+→ Object ownership matters for writes (BucketOwnerEnforced recommended)
+
+PATTERN COMPARISON:
+━━━━━━━━━━━━━━━━━
+→ Bucket Policy: simpler setup, no STS call, good for native service access
+→ AssumeRole: more secure, temporary creds, better audit trail, more flexible
+→ Production recommendation: AssumeRole for everything except simple Athena/Glue
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 3:  Bucket policies (single-account) → now cross-account
+→ Project 6:  IAM Instance Profiles → same concept, now across accounts
+→ Project 7:  IAM deep dive → trust policies, policy evaluation logic
+→ Project 55: Step Functions → will orchestrate cross-account pipelines (Project 60)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 57: "Account B's Glue Must See Account A's Data Catalog"
+  - S3 data accessible (this project ✅)
+  - But: Glue in Account B can't see Account A's Catalog tables
+  - Athena in Account B can't see Account A's databases
+  - Need: cross-account Glue Data Catalog access
+  - Uses: Glue Resource Policy (similar to bucket policy concept)
+  - Builds directly on Pattern 1 and Pattern 2 from this project</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Account B can now READ Account A's S3 data ✅
+</span>
+BUT: Account B's Glue ETL job says:
+  "I can read the S3 files... but I don't know the SCHEMA.
+   Account A's Glue Data Catalog has the table definitions.
+   I need to see Account A's Catalog from Account B's Glue."
+
+Account B's Athena says:
+  "I can query S3 files with explicit schema...
+   but I want to query Account A's Catalog TABLES by name.
+   SELECT * FROM account_a_db.orders — this doesn't work cross-account."
+
+YOU: "We need cross-account Glue Data Catalog access.
+      Account A puts a RESOURCE POLICY on its Glue Catalog
+      that allows Account B to read databases and tables.
+      Same two-door model: Account A allows + Account B is allowed."
+
+→ Project 57: "Account B's Glue Must See Account A's Data Catalog"
+→ Introduces: Glue Resource Policy, Cross-Account Catalog Access,
+   Catalog ID parameter, cross-account Athena queries</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-55.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 56 of 80</span>
+    <span class="nav-project-title">ACCOUNT B NEEDS TO READ ACCOUNT A&#x27;S S3 BUCKET</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-57.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-57.html") window.location = "project-57.html";
+  if (e.key === 'ArrowLeft' && "project-55.html") window.location = "project-55.html";
+});
+</script>
+</body>
+</html>

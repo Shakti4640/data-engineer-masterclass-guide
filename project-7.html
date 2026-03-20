@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 7: MANAGER ASKS — WHO CAN ACCESS WHAT AND WHY? — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:9%"></div></div>
+<div id="progress-label">9%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 7 of 80</div>
+  <div class="project-title">MANAGER ASKS — WHO CAN ACCESS WHAT AND WHY?</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — growing fast, now 25 employees
+</span>Current State After Projects 1-6:
+→ 5 S3 buckets (raw-data, processed, logs, backups, temp)
+→ 3 IAM Roles (EC2-S3-ReadWrite, EC2-S3-ReadOnly, Glue-ETL-Role)
+→ 2 IAM Groups (DataEngineers, Analysts)
+→ 8 IAM Users across those groups
+→ 3 Bucket Policies (on raw-data, processed, logs)
+→ 1 Permission Boundary (applied to all contractor accounts)
+
+THE CHAOS:
+→ Incident 1: Data engineer "Raj" has AdministratorAccess policy
+   but gets AccessDenied on s3://quickcart-logs-prod
+   → Manager: "How? He's an ADMIN!"
+
+→ Incident 2: Analyst "Sara" can read s3://quickcart-raw-data-prod
+   but nobody remembers granting her access
+   → Manager: "WHO gave her this access? Through which policy?"
+
+→ Incident 3: Contractor "Alex" created an IAM user with
+   AdministratorAccess for himself — bypassing all controls
+   → CISO: "How do we PREVENT this from ever happening again?"
+
+→ Incident 4: EC2 instance can PutObject to the raw bucket
+   but suddenly gets AccessDenied after someone updated the bucket policy
+   → DevOps: "Role policy says Allow, but it still fails!"
+
+CTO: "I need someone to explain the COMPLETE logic of how AWS
+      decides Allow vs Deny. Draw me the flowchart."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand that AWS has MULTIPLE policy types
+</span>→ They all evaluate TOGETHER for every single API call
+→ One "Allow" is not enough — ALL layers must agree
+→ One "Deny" at ANY layer kills the request
+
+Step 2: Catalog all policy types
+→ Identity-based policies (attached to IAM users/groups/roles)
+→ Resource-based policies (attached to S3 buckets, SQS queues, etc.)
+→ Permission Boundaries (ceiling on identity-based policies)
+→ Service Control Policies / SCPs (ceiling on entire AWS account)
+→ Session Policies (ceiling on temporary credentials)
+→ VPC Endpoint Policies (ceiling on traffic through VPC endpoint)
+
+Step 3: Learn the EVALUATION ORDER
+→ AWS evaluates ALL applicable policies simultaneously
+→ Explicit Deny → always wins, no override possible
+→ Explicit Allow → only works if no Deny exists
+→ Implicit Deny → default state if nothing says Allow
+
+Step 4: Map each incident to a specific policy interaction
+→ Incident 1: Explicit Deny in bucket policy overrides Admin
+→ Incident 2: Resource-based policy grants access directly
+→ Incident 3: Permission Boundary missing
+→ Incident 4: Bucket policy Deny overrides role Allow
+
+Step 5: Build tooling to diagnose any access question
+→ Policy Simulator
+→ Access Analyzer
+→ CloudTrail
+→ Custom diagnostic script</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION: Build a COMPLETE understanding of IAM policy evaluation
+</span>
+LAYER MAP — Every API call passes through these gates:
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        API CALL: s3:GetObject                       │
+│                 Caller: User "Raj" / Role "EC2-S3-Role"             │
+│                 Resource: arn:aws:s3:::quickcart-raw-data-prod/*     │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 1: Service Control Policy (SCP)                        │    │
+│  │ → Applied at AWS Organization level                         │    │
+│  │ → Restricts what the ENTIRE ACCOUNT can do                  │    │
+│  │ → If SCP says Deny → DENIED (game over)                     │    │
+│  │ → If SCP says nothing → Implicit Deny → blocked             │    │
+│  │ → If SCP says Allow → proceed to next gate                  │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 2: Permission Boundary                                  │    │
+│  │ → Applied to IAM user or role                                │    │
+│  │ → Sets MAXIMUM permissions (ceiling, not floor)              │    │
+│  │ → If boundary doesn't include the action → DENIED            │    │
+│  │ → If boundary includes the action → proceed                  │    │
+│  │ → No boundary attached → this gate is SKIPPED                │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 3: Identity-Based Policies                              │    │
+│  │ → Inline policies on the user/role                           │    │
+│  │ → Managed policies attached to the user/role                 │    │
+│  │ → Group policies (if user is in a group)                     │    │
+│  │ → Need EXPLICIT Allow here (for same-account requests)       │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 4: Resource-Based Policies                              │    │
+│  │ → Bucket policy, SQS queue policy, SNS topic policy          │    │
+│  │ → CAN grant access even WITHOUT identity-based Allow         │    │
+│  │ → This is the EXCEPTION to "both must allow"                 │    │
+│  │ → Only for SAME-ACCOUNT requests                             │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 5: Session Policies (if using temp credentials)         │    │
+│  │ → Passed during AssumeRole or GetFederationToken             │    │
+│  │ → Further restricts what the session can do                  │    │
+│  │ → If present → acts as ceiling on the role's permissions     │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ GATE 6: VPC Endpoint Policy (if request goes through VPCE)  │    │
+│  │ → Restricts which API calls can traverse the endpoint        │    │
+│  │ → If endpoint policy doesn't allow → DENIED                  │    │
+│  └────────────────────────┬────────────────────────────────────┘    │
+│                           ▼                                         │
+│                    ✅ ACCESS GRANTED                                 │
+│                                                                     │
+│  AT ANY GATE: Explicit Deny found → IMMEDIATELY DENIED              │
+│  → No subsequent gate can override a Deny                           │
+│  → This is the CARDINAL RULE of IAM                                 │
+└─────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Give everyone AdministratorAccess and hope for the best
+</span>→ Eliminates AccessDenied errors — also eliminates security
+→ One compromised user = entire account compromised
+→ VERDICT: negligent, fireable offense in enterprise
+
+Option B: Use only identity-based policies (ignore resource-based)
+→ Simpler to understand but misses S3's most powerful feature
+→ Can't do cross-account access without resource policies
+→ VERDICT: works for small teams, breaks at scale
+
+Option C: Use BOTH identity-based AND resource-based, with boundaries ✅
+→ Defense in depth: multiple independent gates
+→ Permission Boundaries prevent privilege escalation
+→ SCPs prevent account-level misuse
+→ VERDICT: correct production approach
+
+Option D: Lock everything down and approve access via tickets
+→ Secure but paralyzes the team
+→ Every new pipeline needs a 3-day approval cycle
+→ VERDICT: too rigid — balance security with velocity
+
+DECISION: Option C — layered policies with diagnostic tooling</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ALWAYS apply Permission Boundaries to contractor/limited users
+</span>   → Prevents them from creating more powerful permissions than intended
+   → Even if they have iam:CreatePolicy, the boundary caps what it can do
+
+2. Use EXPLICIT Deny for critical protections
+   → "Nobody deletes from production bucket" = Deny s3:DeleteObject
+   → Explicit Deny cannot be overridden by ANY Allow anywhere
+   → Put these in bucket policies (resource-based) for maximum protection
+
+3. Tag-based access control (ABAC) for scalable permissions
+   → Instead of listing 50 bucket ARNs in a policy
+   → Tag buckets with Team=DataEngineering
+   → Policy: Allow if resource tag Team matches principal tag Team
+
+4. Use IAM Access Analyzer to find unintended access
+   → Continuously scans policies for public or cross-account access
+   → Flags resources accessible from outside your account
+
+5. Use IAM Policy Simulator before deploying policies
+   → Test "Can user X do action Y on resource Z?" without actually doing it
+   → Saves hours of deploy-test-debug cycles
+
+6. Separate READ and WRITE into different policy statements
+   → Easier to audit: "Who can write?" is a separate question from "Who can read?"
+   → Easier to revoke: remove write statement without touching read
+
+7. Use policy conditions for extra precision
+   → aws:SourceIp: only from office IP
+   → aws:PrincipalTag: only if user is tagged correctly
+   → s3:prefix: only for specific S3 prefixes
+   → aws:SecureTransport: only via HTTPS (deny HTTP)
+
+8. Review policies quarterly
+   → Permissions accumulate like clutter
+   → IAM Access Advisor shows which permissions are actually USED
+   → Remove unused permissions (principle of least privilege)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT rely on a single policy layer
+</span>   → "The IAM policy says Allow so it should work" — WRONG
+   → Bucket policy Deny overrides IAM Allow
+   → SCP restriction overrides IAM Allow
+   → Permission Boundary restriction overrides IAM Allow
+   → You must check ALL layers
+
+2. DO NOT use NotAction / NotResource unless absolutely necessary
+   → NotAction: "Allow everything EXCEPT these actions"
+   → Extremely dangerous: new AWS services auto-get access
+   → If AWS launches a new destructive API → your NotAction policy allows it
+
+3. DO NOT use wildcard resources ("Resource": "*") with powerful actions
+   → "s3:*" on "*" = full S3 access on all buckets in the account
+   → Always scope to specific ARNs
+
+4. DO NOT assume Allow + Allow = Allow
+   → If Policy A says Allow and Policy B says Deny → DENIED
+   → Deny ALWAYS wins, regardless of how many Allows exist
+   → 100 policies saying Allow + 1 statement saying Deny = DENIED
+
+5. DO NOT confuse same-account and cross-account evaluation
+   → Same account: resource policy CAN grant access alone
+   → Cross account: BOTH identity policy AND resource policy must Allow
+   → This is the #1 cross-account debugging confusion (Project 56)
+
+6. DO NOT put sensitive Deny rules only in identity policies
+   → User can detach their own identity policy (if they have iam:DetachUserPolicy)
+   → Put critical Deny in RESOURCE policies or SCPs — user can't modify those
+
+7. DO NOT forget that the ROOT user bypasses almost everything
+   → Root ignores IAM policies entirely
+   → Root IS restricted by SCPs (only in AWS Organizations)
+   → Never use root for daily operations</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────┬─────────────────────────────────────────┐
+</span>│ Policy Type                      │ When to Use          │ Key Characteristic                      │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ IAM User/Role Inline Policy      │ One-off, tightly     │ Embedded in the identity, deleted       │
+│                                  │ coupled permission   │ with it. 1:1 relationship               │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ IAM Managed Policy (AWS)         │ Common patterns like │ AWS maintains them (e.g.,               │
+│                                  │ ReadOnlyAccess       │ AmazonS3ReadOnlyAccess)                 │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ IAM Managed Policy (Customer)    │ Reusable policy for  │ You create &amp; maintain. Attach to        │
+│                                  │ multiple roles/users │ multiple identities. Versioned          │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ S3 Bucket Policy                 │ Control access TO    │ Attached to bucket. Can grant           │
+│ (Resource-Based)                 │ the bucket itself    │ cross-account access. Can Deny          │
+│                                  │                      │ even Admin users                        │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Permission Boundary              │ Cap maximum perms    │ Ceiling, not floor. Intersection        │
+│                                  │ for delegated users  │ with identity policy = effective         │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ SCP (Service Control Policy)     │ Org-wide guardrails  │ Restricts ENTIRE account. Even          │
+│                                  │ "No one uses us-     │ Admin can't override. Applied           │
+│                                  │ west-1 in our org"   │ via AWS Organizations                   │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ Session Policy                   │ Narrow temp creds    │ Passed during AssumeRole. Further       │
+│                                  │ for specific task    │ restricts role's permissions             │
+├──────────────────────────────────┼──────────────────────┼─────────────────────────────────────────┤
+│ VPC Endpoint Policy              │ Control which APIs   │ Only affects traffic through that        │
+│                                  │ go through endpoint  │ specific VPC endpoint                    │
+└──────────────────────────────────┴──────────────────────┴─────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use Permission Boundaries for service roles (EC2, Glue, Lambda)
+</span>   → Boundaries are for HUMAN users you don't fully trust
+   → Service roles are controlled by YOU — use tight policies directly
+   → Exception: if a team self-manages their Lambda roles → add boundary
+
+2. DO NOT use SCPs if you're not using AWS Organizations
+   → SCPs only work within an Organization
+   → Single standalone account → SCPs don't apply
+   → Use: Permission Boundaries as the closest alternative
+
+3. DO NOT use resource-based policies on services that don't support them
+   → S3, SQS, SNS, KMS, Lambda → YES (support resource policies)
+   → DynamoDB, Redshift, EC2 → NO (use identity-based only)
+   → Glue Data Catalog → YES (Project 57 cross-account)
+
+4. DO NOT use Session Policies for regular EC2 Instance Profile usage
+   → Session policies are for sts:AssumeRole with a narrowing scope
+   → EC2 metadata service doesn't pass session policies
+   → Use: only when programmatically calling AssumeRole in code
+
+5. DO NOT use inline policies for shared, reusable permissions
+   → If 10 roles need the same S3 read access
+   → Create ONE managed policy → attach to all 10
+   → Inline = duplication = maintenance nightmare</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│              COMPLETE IAM POLICY EVALUATION FLOWCHART                        │
+│                                                                              │
+│  Every AWS API call goes through this EXACT sequence internally              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ API Request arrives at AWS endpoint   │                                   │
+│  │ (e.g., s3.us-east-2.amazonaws.com)    │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 1: Authentication               │                                    │
+│  │ → Verify signature (SigV4)           │                                    │
+│  │ → Validate access key exists         │                                    │
+│  │ → Check if key is active             │                                    │
+│  │ → If temp creds: validate token      │                                    │
+│  │ → FAIL → 403 InvalidClientTokenId    │                                    │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 2: Gather ALL applicable        │                                    │
+│  │ policies                             │                                    │
+│  │                                       │                                   │
+│  │ AWS collects:                         │                                   │
+│  │ → All identity-based policies         │                                   │
+│  │   (inline + managed on user/role)     │                                   │
+│  │ → All group policies (if user)        │                                   │
+│  │ → Resource-based policy (if exists)   │                                   │
+│  │ → Permission Boundary (if attached)   │                                   │
+│  │ → SCP chain (if in Organization)      │                                   │
+│  │ → Session policy (if temp creds)      │                                   │
+│  │ → VPC Endpoint policy (if through     │                                   │
+│  │   VPC endpoint)                       │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 3: Evaluate for EXPLICIT DENY   │                                    │
+│  │                                       │                                   │
+│  │ Scan ALL collected policies for:      │                                   │
+│  │ {                                     │                                   │
+│  │   "Effect": "Deny",                  │                                    │
+│  │   "Action": "s3:GetObject",           │                                   │
+│  │   "Resource": "&lt;matching ARN&gt;"        │                                   │
+│  │ }                                     │                                   │
+│  │                                       │                                   │
+│  │ Found ANY Deny? ──YES──→ 🔴 DENIED    │                                   │
+│  │                                       │                                   │
+│  │ No Deny found → continue              │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 4: Check SCPs (if applicable)   │                                    │
+│  │                                       │                                   │
+│  │ Is this account in an Organization?   │                                   │
+│  │ → NO → skip this gate                 │                                   │
+│  │ → YES → check SCP chain:             │                                    │
+│  │   Root OU SCP → Parent OU SCP →      │                                    │
+│  │   Account-level SCP                   │                                   │
+│  │                                       │                                   │
+│  │ ALL SCPs in chain must Allow          │                                   │
+│  │ (SCPs are allowlists by default)      │                                   │
+│  │                                       │                                   │
+│  │ Any SCP missing Allow? ──→ 🔴 DENIED   │                                  │
+│  │                                       │                                   │
+│  │ All SCPs Allow → continue             │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 5: Check Permission Boundary    │                                    │
+│  │ (if attached to the principal)        │                                   │
+│  │                                       │                                   │
+│  │ Boundary attached?                    │                                   │
+│  │ → NO → skip this gate                 │                                   │
+│  │ → YES → does boundary Allow           │                                   │
+│  │   this action on this resource?       │                                   │
+│  │                                       │                                   │
+│  │ Boundary doesn't Allow? ──→ 🔴 DENIED  │                                  │
+│  │                                       │                                   │
+│  │ Boundary Allows → continue            │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 6: Check Session Policy         │                                    │
+│  │ (if temp credentials with session    │                                    │
+│  │  policy were used)                    │                                   │
+│  │                                       │                                   │
+│  │ Session policy present?               │                                   │
+│  │ → NO → skip this gate                 │                                   │
+│  │ → YES → does session policy Allow     │                                   │
+│  │   this action?                        │                                   │
+│  │                                       │                                   │
+│  │ Session policy doesn't Allow?         │                                   │
+│  │ ──→ 🔴 DENIED                          │                                  │
+│  │                                       │                                   │
+│  │ Session policy Allows → continue      │                                   │
+│  └─────────────────┬────────────────────┘                                    │
+│                    ▼                                                         │
+│  ┌──────────────────────────────────────┐                                    │
+│  │ STEP 7: Check for EXPLICIT ALLOW     │                                    │
+│  │                                       │                                   │
+│  │ SAME-ACCOUNT request:                 │                                   │
+│  │ → Identity policy Allow? → ✅ GRANTED  │                                   │
+│  │ → Resource policy Allow?  → ✅ GRANTED │                                   │
+│  │ → EITHER ONE is sufficient            │                                   │
+│  │                                       │                                   │
+│  │ CROSS-ACCOUNT request:                │                                   │
+│  │ → Identity policy Allow? AND          │                                   │
+│  │   Resource policy Allow?              │                                   │
+│  │ → BOTH required simultaneously        │                                   │
+│  │                                       │                                   │
+│  │ No Allow found anywhere?              │                                   │
+│  │ ──→ 🔴 IMPLICIT DENY (default state)   │                                  │
+│  │                                       │                                   │
+│  │ Allow found (and no Deny anywhere)?   │                                   │
+│  │ ──→ ✅ ACCESS GRANTED                   │                                  │
+│  └──────────────────────────────────────┘                                    │
+│                                                                              │
+│                                                                              │
+│  CRITICAL CONCEPTS:                                                          │
+│  ━━━━━━━━━━━━━━━━━━                                                          │
+│                                                                              │
+│  EXPLICIT DENY:                                                              │
+│  → A policy statement with "Effect": "Deny"                                 │
+│  → ALWAYS wins — no override possible                                        │
+│  → 1000 Allows + 1 Deny = DENIED                                            │
+│  → Cannot be overridden by root (except for SCPs)                            │
+│                                                                              │
+│  EXPLICIT ALLOW:                                                             │
+│  → A policy statement with "Effect": "Allow"                                 │
+│  → Only works if NO Deny exists anywhere                                     │
+│  → Must pass through ALL gates (SCP, boundary, session)                      │
+│                                                                              │
+│  IMPLICIT DENY:                                                              │
+│  → The DEFAULT state — if nothing says Allow, it's denied                    │
+│  → Not a policy statement — it's the ABSENCE of Allow                        │
+│  → Can be overcome by adding an Allow                                        │
+│  → Different from Explicit Deny (which can NEVER be overcome)                │
+│                                                                              │
+│  PERMISSION BOUNDARY — THE "INTERSECTION" CONCEPT:                           │
+│  → Boundary = {s3:GetObject, s3:PutObject, s3:ListBucket}                   │
+│  → Identity Policy = {s3:*, ec2:*, rds:*}                                   │
+│  → Effective = INTERSECTION = {s3:GetObject, s3:PutObject, s3:ListBucket}   │
+│  → Boundary CAPS the identity policy — never ADDS to it                      │
+│  → Identity policy says s3:DeleteObject → Boundary doesn't → DENIED          │
+│  → Like a ceiling: you can't reach higher than the ceiling                   │
+│     even if you jump (add more identity policies)                            │
+│                                                                              │
+│                                                                              │
+│  SAME-ACCOUNT vs CROSS-ACCOUNT — THE CRITICAL DIFFERENCE:                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                   │
+│                                                                              │
+│  SAME-ACCOUNT (user in Account A accessing bucket in Account A):             │
+│  → Identity policy Allow → ✅ ENOUGH (even without bucket policy)            │
+│  → Bucket policy Allow → ✅ ENOUGH (even without identity policy)            │
+│  → EITHER path works independently                                           │
+│  → This is why Sara can read the bucket: bucket policy grants her access     │
+│    even though her IAM policy says nothing about S3                          │
+│                                                                              │
+│  CROSS-ACCOUNT (user in Account B accessing bucket in Account A):            │
+│  → Identity policy in Account B: MUST Allow                                  │
+│  → Bucket policy in Account A: MUST ALSO Allow                               │
+│  → BOTH required — one alone is insufficient                                 │
+│  → This is the #1 cross-account debugging confusion (Project 56)             │
+│                                                                              │
+│                                                                              │
+│  POLICY STRUCTURE — ANATOMY:                                                 │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━                                                 │
+│  {                                                                           │
+│    "Version": "2012-10-17",      ← Always this date (policy language ver)    │
+│    "Statement": [                                                            │
+│      {                                                                       │
+│        "Sid": "HumanReadableName", ← Optional identifier                    │
+│        "Effect": "Allow|Deny",     ← The decision                           │
+│        "Principal": "...",          ← WHO (only in resource policies)        │
+│        "Action": "s3:GetObject",    ← WHAT operation                        │
+│        "Resource": "arn:...",       ← ON WHICH resource                     │
+│        "Condition": {               ← UNDER WHAT circumstances              │
+│          "StringEquals": {                                                   │
+│            "aws:PrincipalTag/Team": "DataEngineering"                        │
+│          }                                                                   │
+│        }                                                                     │
+│      }                                                                       │
+│    ]                                                                         │
+│  }                                                                           │
+│                                                                              │
+│  IDENTITY POLICY vs RESOURCE POLICY:                                         │
+│  → Identity policy: attached to user/role — NO "Principal" field             │
+│    (the principal IS the user/role it's attached to)                          │
+│  → Resource policy: attached to bucket/queue — HAS "Principal" field         │
+│    (must specify WHO this applies to)                                        │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Admin user gets AccessDenied — impossible!"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Bucket policy has EXPLICIT DENY
+→ Example:
+  {
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:*",
+    "Resource": "arn:aws:s3:::quickcart-logs-prod/*",
+    "Condition": {
+      "StringNotEquals": {
+        "aws:PrincipalTag/Team": "Security"
+      }
+    }
+  }
+→ This says: DENY everyone who is NOT tagged Team=Security
+→ Raj has AdministratorAccess but is tagged Team=DataEngineering
+→ Explicit Deny in bucket policy → DENIED regardless of Admin
+
+PITFALL 2: "I removed all Allow policies but user can still access"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Resource-based policy (bucket policy) grants access directly
+→ Same-account: resource policy Allow alone is sufficient
+→ Must check BOTH identity policies AND resource policies
+
+PITFALL 3: "Policy Simulator says Allow but real request is Denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: Policy Simulator doesn't evaluate resource-based policies
+→ Cause 2: SCP applied at Organization level (Simulator doesn't check SCPs)
+→ Cause 3: VPC Endpoint policy restricting the request path
+→ Cause 4: Condition key in policy doesn't match (IP, MFA, tag mismatch)
+
+PITFALL 4: "NotAction confuses everyone on the team"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ "NotAction": "s3:DeleteObject" with "Effect": "Allow"
+→ Means: Allow EVERYTHING EXCEPT DeleteObject
+→ This includes iam:CreateUser, ec2:TerminateInstances, etc.
+→ EXTREMELY dangerous — almost never what you want
+→ Use explicit Action list instead
+
+PITFALL 5: "ListBucket gets 403 but GetObject works"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: ListBucket operates on BUCKET ARN → arn:aws:s3:::mybucket
+→ GetObject operates on OBJECT ARN → arn:aws:s3:::mybucket/*
+→ Policy has Resource: "arn:aws:s3:::mybucket/*" only
+→ ListBucket doesn't match the /* pattern → denied
+→ FIX: add BOTH resource ARN patterns (Project 6 showed this)
+
+PITFALL 6: "Cross-account: bucket policy says Allow but still denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Cross-account requires BOTH sides to Allow
+→ Bucket policy in Account A: Allow ✅
+→ Identity policy in Account B: missing Allow ❌
+→ Result: DENIED
+→ Same-account would work with bucket policy alone — cross-account won't
+
+PITFALL 7: "Permission Boundary attached but nothing changed"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Boundary only CAPS permissions — it never GRANTS them
+→ If identity policy already has fewer permissions than boundary → no visible effect
+→ Boundary matters when someone tries to ADD broader permissions later
+→ Think of it as a FUTURE-PROOFING mechanism</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>POLICY SIZE LIMITS:
+</span>→ Inline policy per user/role: 2,048 characters (user), 10,240 (role)
+→ Managed policy: 6,144 characters
+→ Bucket policy: 20 KB
+→ SCP: 5,120 characters
+→ These limits force you to design EFFICIENT policies
+
+SCALING STRATEGY:
+→ 10 users: individual policies work fine
+→ 50 users: use IAM Groups + managed policies
+→ 200 users: use tag-based (ABAC) policies
+→ 1000+ users: use AWS SSO + Permission Sets + ABAC
+→ Multi-account: use SCPs + AWS Organizations OUs
+
+ABAC (Attribute-Based Access Control) — THE SCALE SOLUTION:
+→ Instead of:
+  "Resource": [
+    "arn:aws:s3:::team-a-bucket/*",
+    "arn:aws:s3:::team-a-logs/*",
+    "arn:aws:s3:::team-a-data/*"
+  ]
+→ Use:
+  "Condition": {
+    "StringEquals": {
+      "s3:ResourceTag/Team": "${aws:PrincipalTag/Team}"
+    }
+  }
+→ ONE policy works for ALL teams — tag the user, tag the resource
+→ New team joins? Tag their resources and users — no policy change
+
+EVALUATION PERFORMANCE:
+→ AWS evaluates ALL policies in &lt;10ms typically
+→ More policies = slightly longer evaluation but rarely noticeable
+→ AWS caches policy evaluation results internally
+→ Not a performance concern for 99.9% of use cases</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO DEBUG ANY "AccessDenied" IN 5 STEPS:
+</span>
+Step 1: WHO is making the request?
+→ aws sts get-caller-identity
+→ Gives you the ARN of the actual principal
+
+Step 2: WHAT policies apply to this principal?
+→ Identity-based: aws iam list-attached-user-policies / list-user-policies
+→ Group-based: aws iam list-groups-for-user → list-attached-group-policies
+→ Permission Boundary: aws iam get-user → PermissionsBoundary
+→ Resource-based: aws s3api get-bucket-policy (for S3)
+
+Step 3: Is there an EXPLICIT DENY anywhere?
+→ Search ALL collected policies for "Effect": "Deny"
+→ Check conditions — the Deny might be conditional
+
+Step 4: Is there an EXPLICIT ALLOW?
+→ Does any policy grant the specific Action on the specific Resource?
+→ Same-account: identity OR resource policy is enough
+→ Cross-account: BOTH must Allow
+
+Step 5: Check the GATES
+→ SCP: aws organizations list-policies-for-target
+→ Permission Boundary: aws iam get-user
+→ Session Policy: check the AssumeRole call parameters
+→ VPC Endpoint: aws ec2 describe-vpc-endpoints</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(7)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Solve Incident 1 — Admin User Denied by Bucket Policy</h3>
+
+<h3>Step 2: Solve Incident 2 — User Has Access Nobody Remembers Granting</h3>
+
+<h3>Step 3: Solve Incident 3 — Contractor Escalated Own Privileges</h3>
+
+<h3>Step 4: Solve Incident 4 — Role Policy Says Allow But Request Denied</h3>
+
+<h3>Step 5: Complete Diagnostic Tool — Debug Any AccessDenied</h3>
+
+<h3>Step 6: Quick-Reference Policy Condition Cheat Sheet</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PROJECT 7 — EXECUTION SEQUENCE</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 1: Understand how Explicit Deny overrides Admin</span><span>
+</span>python 07_01_incident_admin_denied.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 2: Trace mystery access through all policy paths</span><span>
+</span>python 07_02_incident_mystery_access.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 3: Set up Permission Boundaries for contractors</span><span>
+</span>python 07_03_incident_privilege_escalation.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 4: Understand role Allow vs bucket policy Deny</span><span>
+</span>python 07_04_incident_role_vs_bucket_policy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 5: Run the complete debugger on any AccessDenied</span><span>
+</span>python 07_05_access_denied_debugger.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 6: Reference conditions for policy writing</span><span>
+</span>python 07_06_policy_conditions_reference.py</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ AWS evaluates 6 policy layers for EVERY API call
+→ Explicit Deny ALWAYS wins — no override possible
+→ Implicit Deny = default state — absence of Allow = denied
+→ Same-account: identity OR resource policy Allow is sufficient
+→ Cross-account: identity AND resource policy BOTH must Allow
+→ Permission Boundary = ceiling — intersection with identity policy
+→ SCP = organization-level ceiling — restricts entire account
+→ Conditions are the precision tool — IP, tags, time, MFA, encryption
+→ "Admin gets AccessDenied" is usually Explicit Deny in resource policy
+→ "Mystery access" is usually resource-based policy granting directly
+→ Always check ALL layers — never assume one policy tells the whole story
+
+THE THREE TYPES OF DENY:
+━━━━━━━━━━━━━━━━━━━━━━━
+1. Explicit Deny → policy says "Effect": "Deny" → UNBREAKABLE
+2. Implicit Deny → nothing says Allow → fixable by adding Allow
+3. Boundary/SCP Deny → ceiling exceeded → must expand the ceiling
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 3: Bucket policies (resource-based) — now fully understood
+→ Project 6: IAM Role (identity-based) — now understand why it might fail
+   despite Allow (bucket policy Deny, boundary, SCP)
+
+CONNECTION TO FUTURE PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 21: Redshift COPY needs role → same IAM evaluation applies
+→ Project 25: Glue role needs S3 + Glue permissions → multi-service policy
+→ Project 56: Cross-account S3 → BOTH sides must Allow (the critical difference)
+→ Project 57: Cross-account Glue Catalog → resource policy on Catalog
+→ Project 59: Cross-account SNS→SQS → topic policy + queue policy both needed
+→ Project 74: Lake Formation → adds ANOTHER permission layer on top of IAM</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ S3 bucket with versioning, lifecycle, bucket policies (Projects 1-4)
+→ EC2 running scripts securely with IAM Roles (Projects 5-6)
+→ Complete understanding of IAM policy evaluation (Project 7) ← YOU ARE HERE
+
+NEXT PROBLEM:
+→ The upload script sends CSVs to S3 — but the analytics team
+   needs to run SQL queries against this data
+→ They currently download CSVs manually and open them in Excel
+→ 200K rows × 50 MB per file → Excel crashes
+→ CTO: "We need a REAL database. What's cheapest for a startup?"
+
+→ Project 8: "Team Needs a Relational Database on a Budget"
+→ Introduces: MariaDB on EC2 → installation, configuration,
+   mysql CLI, engine internals, why EC2-hosted vs RDS</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-6.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 7 of 80</span>
+    <span class="nav-project-title">MANAGER ASKS — WHO CAN ACCESS WHAT AND WHY?</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-8.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-8.html") window.location = "project-8.html";
+  if (e.key === 'ArrowLeft' && "project-6.html") window.location = "project-6.html";
+});
+</script>
+</body>
+</html>

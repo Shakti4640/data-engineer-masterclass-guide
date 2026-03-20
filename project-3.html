@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 3: FINANCE TEAM WANTS ONLY THEIR DEPARTMENT TO ACCESS A FOLDER — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:4%"></div></div>
+<div id="progress-label">4%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 3 of 80</div>
+  <div class="project-title">FINANCE TEAM WANTS ONLY THEIR DEPARTMENT TO ACCESS A FOLDER</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 6 months old, growing fast
+</span>Teams:
+→ Data Engineering (3 people) — builds pipelines, uploads to S3
+→ Finance (2 people) — needs access to revenue/billing CSVs
+→ Marketing (2 people) — needs access to customer analytics CSVs
+→ Interns (2 people) — should only READ, never WRITE or DELETE
+
+Current S3 Structure (from Projects 1 &amp; 2):
+s3://quickcart-raw-data-prod/
+├── daily_exports/
+│   ├── orders/          ← Finance needs this
+│   ├── customers/       ← Marketing needs this
+│   └── products/        ← Both teams need this
+├── finance_reports/     ← ONLY Finance should see this
+│   ├── revenue/
+│   └── billing/
+└── marketing_data/      ← ONLY Marketing should see this
+    ├── campaigns/
+    └── segments/
+
+Current Problem:
+→ Everyone uses the same IAM user with AdministratorAccess
+→ Marketing analyst can see finance_reports/ (salary data, revenue)
+→ Interns can delete production files (Project 2 incident)
+→ No audit trail of who accessed what
+→ CTO demands: "Lock it down — each team sees only their data"
+→ Compliance officer: "We may face SOC 2 audit next quarter"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the TWO places access is controlled in AWS
+</span>→ IDENTITY-BASED POLICIES (IAM): attached to users/groups/roles
+   "What can THIS PERSON do?"
+→ RESOURCE-BASED POLICIES (Bucket Policy): attached to the S3 bucket
+   "Who can touch THIS BUCKET?"
+→ BOTH are evaluated together — access granted only if BOTH allow
+
+Step 2: Map out the access matrix
+┌──────────────────┬──────────────────┬────────────────┬──────────────┐
+│ Prefix           │ Data Engineering │ Finance        │ Marketing    │
+├──────────────────┼──────────────────┼────────────────┼──────────────┤
+│ daily_exports/   │ Read + Write     │ Read Only      │ Read Only    │
+│ finance_reports/ │ Read + Write     │ Read Only      │ NO ACCESS    │
+│ marketing_data/  │ Read + Write     │ NO ACCESS      │ Read Only    │
+├──────────────────┼──────────────────┼────────────────┼──────────────┤
+│ Interns          │                  │ Read Only on   │ Read Only on │
+│                  │                  │ their team's   │ their team's │
+│                  │                  │ prefixes       │ prefixes     │
+└──────────────────┴──────────────────┴────────────────┴──────────────┘
+
+Step 3: Choose the right mechanism
+→ IAM Groups: group users by team, attach team-specific policies
+→ IAM Policies: define WHAT each group can do on WHICH prefixes
+→ Bucket Policy: add DENY rules as a safety net (defense in depth)
+→ S3 Block Public Access: already done in Project 1 — verify
+
+Step 4: Implement with Principle of Least Privilege
+→ Start with ZERO access
+→ Grant ONLY what's needed
+→ DENY explicitly where critical
+→ Test every permission path</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+AWS ACCOUNT
+│
+├── IAM Groups (identity-based control)
+│   ├── DataEngineering-Group
+│   │   └── Policy: full S3 access to all prefixes in this bucket
+│   ├── Finance-Group
+│   │   └── Policy: read-only to daily_exports/ + finance_reports/
+│   ├── Marketing-Group
+│   │   └── Policy: read-only to daily_exports/ + marketing_data/
+│   └── Interns-Group
+│       └── Policy: read-only to daily_exports/ only
+│
+├── IAM Users
+│   ├── alice → DataEngineering-Group
+│   ├── bob → Finance-Group
+│   ├── carol → Marketing-Group
+│   └── intern_dave → Interns-Group
+│
+└── S3 Bucket: quickcart-raw-data-prod
+    └── Bucket Policy (resource-based control):
+        ├── EXPLICIT DENY: delete on finance_reports/ unless DataEngineering
+        └── EXPLICIT DENY: any access to finance_reports/ from Marketing
+
+EVALUATION FLOW:
+User makes request → IAM Policy checked → Bucket Policy checked
+→ If EITHER has explicit DENY → DENIED (always wins)
+→ If BOTH have ALLOW → ALLOWED
+→ If one ALLOWS and other is silent → ALLOWED
+→ If neither ALLOWS → DENIED (implicit deny)</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: IAM Policies Only (no bucket policy)
+</span>→ Works for simple setups
+→ All control lives in IAM
+→ Risk: someone creates a new IAM user and forgets to restrict
+→ No safety net on the resource side
+
+Option B: Bucket Policy Only (no IAM restrictions)
+→ Works but harder to manage per-user
+→ Bucket policies reference principals (users/roles/accounts)
+→ Gets messy with many users
+→ Better for cross-account access (Project 56)
+
+Option C: IAM Groups + Bucket Policy DENY (RECOMMENDED)
+→ IAM Groups: ALLOW what each team needs (positive permissions)
+→ Bucket Policy: DENY what must never happen (safety net)
+→ Defense in depth: even if IAM policy is misconfigured,
+   bucket policy DENY still blocks unauthorized access
+→ DENY always wins over ALLOW in AWS policy evaluation
+
+Option D: S3 Access Points (enterprise scale)
+→ Named endpoints with dedicated policies per application/team
+→ Overkill for 4 teams, designed for hundreds of consumers
+→ Covered conceptually but not implemented here
+
+DECISION: Option C — IAM Groups + Bucket Policy DENY
+→ Reason: clean separation, defense in depth, interview gold</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create IAM GROUPS — never attach policies to individual users
+</span>   → Users come and go; groups persist
+   → New hire joins Finance → add to Finance-Group → done
+   → Employee leaves → remove from group → access revoked
+
+2. Use PREFIX-BASED resource ARNs in policies
+   → arn:aws:s3:::quickcart-raw-data-prod/finance_reports/*
+   → This restricts to SPECIFIC "folders" within the bucket
+   → Two ARNs needed: bucket-level (for ListBucket) + object-level (for GetObject)
+
+3. Always include BOTH bucket-level AND object-level permissions
+   → s3:ListBucket on arn:aws:s3:::bucket-name (with Condition for prefix)
+   → s3:GetObject on arn:aws:s3:::bucket-name/prefix/*
+   → Missing either = confusing "Access Denied" errors
+
+4. Use EXPLICIT DENY in bucket policy for critical data
+   → Deny ALWAYS overrides Allow in AWS
+   → Even if someone accidentally grants admin access,
+     bucket policy DENY still blocks the action
+
+5. Use Conditions in policies for fine-grained control
+   → s3:prefix condition limits ListBucket to specific "folders"
+   → aws:PrincipalTag condition for tag-based access (advanced)
+   → s3:x-amz-server-side-encryption for encryption enforcement
+
+6. Test with AWS Policy Simulator BEFORE applying
+   → IAM → Policy Simulator → select user → select action → simulate
+   → Shows: allowed, denied, and WHY
+
+7. Enable CloudTrail S3 data events for audit
+   → Logs every GetObject, PutObject, DeleteObject
+   → Required for SOC 2 compliance
+   → Costs ~$0.10 per 100K events</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT attach policies directly to IAM users
+</span>   → alice-policy, bob-policy, carol-policy = unmanageable at scale
+   → When alice leaves and dave joins her role, you must recreate everything
+   → Groups abstract the person from the permission
+
+2. DO NOT use "Resource": "*" in IAM policies
+   → Grants access to ALL S3 buckets in the account (and possibly others)
+   → Always scope to specific bucket ARN + prefix
+
+3. DO NOT confuse bucket ARN formats
+   → WRONG: arn:aws:s3:::quickcart-raw-data-prod/* (for ListBucket)
+   → RIGHT: arn:aws:s3:::quickcart-raw-data-prod   (for ListBucket)
+   → RIGHT: arn:aws:s3:::quickcart-raw-data-prod/* (for GetObject/PutObject)
+   → Bucket-level actions need bucket ARN (no /*)
+   → Object-level actions need object ARN (with /*)
+
+4. DO NOT rely solely on ALLOW policies
+   → Someone with AdministratorAccess bypasses your carefully crafted IAM policies
+   → Bucket policy DENY stops even administrators
+   → Only the account root user bypasses bucket policy DENY
+
+5. DO NOT forget the s3:ListBucket + Condition trick
+   → Without Condition: user can LIST the entire bucket (sees all prefixes)
+   → Even if they can't GET objects in other prefixes, they see the NAMES
+   → File names alone can leak sensitive info (e.g., "layoff_plan_2025.csv")
+
+6. DO NOT create overly complex policies
+   → AWS policy size limit: 6,144 characters (managed policy)
+   → AWS policy size limit: 2,048 characters (inline policy)
+   → Too many prefix conditions → hit size limits
+   → Solution: one policy per access pattern, attach multiple to group
+
+7. DO NOT test with your admin account
+   → Admin account has full access — tests always pass
+   → Create a test user in each group and test from their perspective
+   → Or use AWS Policy Simulator</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────┬────────────────────────────┬────────────────────────────────────┐
+</span>│ Mechanism                  │ Best For                   │ Limitation                         │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ IAM User Policy            │ Individual exceptions      │ Doesn't scale; hard to audit       │
+│ (inline or managed)        │ (rare — avoid if possible) │                                    │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ IAM Group Policy           │ Team-based access          │ User must be in group; no cross-   │
+│                            │ (MOST COMMON)              │ account support                    │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ IAM Role Policy            │ Services (EC2, Glue,       │ Must be assumed; temporary creds   │
+│                            │ Lambda) accessing S3       │ (covered in Project 6)             │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ S3 Bucket Policy           │ Cross-account access       │ Max 20KB per policy; harder to     │
+│ (resource-based)           │ DENY safety nets           │ manage per-user granularity        │
+│                            │ Public access control      │                                    │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ S3 Access Points           │ Hundreds of consumers      │ Additional endpoint management;    │
+│                            │ each with unique policy    │ overkill for small teams           │
+├────────────────────────────┼────────────────────────────┼────────────────────────────────────┤
+│ S3 ACLs (Access Control    │ NOTHING — legacy           │ AWS recommends disabling ACLs      │
+│ Lists)                     │ DO NOT USE                 │ Bucket owner enforced (default)    │
+└────────────────────────────┴────────────────────────────┴────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use S3 ACLs for access control
+</span>   → Legacy mechanism from pre-IAM era
+   → Cannot express conditions, time-based access, or MFA requirements
+   → AWS default since April 2023: "Bucket owner enforced" (ACLs disabled)
+   → Use IAM Policies + Bucket Policies instead
+
+2. DO NOT use bucket policies as the ONLY access control for same-account users
+   → Bucket policies are best for cross-account + DENY rules
+   → IAM groups are cleaner for same-account team-based access
+   → Combining both = defense in depth
+
+3. DO NOT use S3 Access Points for &lt; 10 consumer applications
+   → Management overhead exceeds benefit
+   → Each access point = separate DNS name + policy
+   → Simple prefix-based IAM policies suffice for small teams
+
+4. DO NOT use IAM policies for temporary/time-limited access
+   → Use: Pre-signed URLs (time-limited, per-object)
+   → Use: STS AssumeRole with session duration
+   → IAM policy changes take effect globally and permanently
+
+5. DO NOT use resource-based policies for fine-grained user-level control
+   → Bucket policy with 50 user ARNs = unmanageable
+   → Use IAM groups + role-based access instead
+   → Bucket policy for: account-level, DENY rules, cross-account</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│              AWS POLICY EVALUATION — INTERNAL MECHANICS                       │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  WHEN A USER MAKES AN S3 REQUEST, AWS EVALUATES IN THIS ORDER:              │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐     │
+│  │                    STEP 1: EXPLICIT DENY CHECK                      │     │
+│  │                                                                     │     │
+│  │  Scan ALL applicable policies for DENY matching this action:        │     │
+│  │  → IAM user inline policies                                        │     │
+│  │  → IAM user attached managed policies                              │     │
+│  │  → IAM group policies (all groups user belongs to)                  │     │
+│  │  → S3 bucket policy                                                 │     │
+│  │  → Service Control Policies (SCPs) if AWS Organizations             │     │
+│  │  → Permission boundaries (if set on user/role)                      │     │
+│  │                                                                     │     │
+│  │  If ANY policy has explicit Deny → REQUEST DENIED                   │     │
+│  │  DENY ALWAYS WINS. Period. No exception.                            │     │
+│  │  (except: bucket policy cannot deny the root account)               │     │
+│  └─────────────────────────────────────────────────────────────────────┘     │
+│                          │                                                    │
+│                          ▼ (no explicit deny found)                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐     │
+│  │                    STEP 2: ALLOW CHECK                              │     │
+│  │                                                                     │     │
+│  │  FOR SAME-ACCOUNT REQUESTS:                                         │     │
+│  │  → If IAM policy ALLOWS  → ALLOWED                                  │     │
+│  │  → If Bucket policy ALLOWS → ALLOWED                                │     │
+│  │  → EITHER one is sufficient (union of permissions)                  │     │
+│  │                                                                     │     │
+│  │  FOR CROSS-ACCOUNT REQUESTS (Project 56):                           │     │
+│  │  → BOTH IAM policy AND bucket policy must ALLOW                     │     │
+│  │  → Intersection, not union                                          │     │
+│  │                                                                     │     │
+│  │  If at least one ALLOW found → REQUEST ALLOWED                      │     │
+│  └─────────────────────────────────────────────────────────────────────┘     │
+│                          │                                                    │
+│                          ▼ (no explicit allow found)                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐     │
+│  │                    STEP 3: IMPLICIT DENY                            │     │
+│  │                                                                     │     │
+│  │  No DENY found, but no ALLOW found either                           │     │
+│  │  → REQUEST DENIED (implicit deny = default state)                   │     │
+│  │                                                                     │     │
+│  │  "Everything not explicitly allowed is denied"                      │     │
+│  └─────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│  VISUAL FLOW:                                                                │
+│                                                                              │
+│  Request ──→ Explicit DENY? ──YES──→ ❌ DENIED                              │
+│                   │                                                          │
+│                   NO                                                         │
+│                   ▼                                                           │
+│              Explicit ALLOW? ──YES──→ ✅ ALLOWED                             │
+│                   │                                                          │
+│                   NO                                                         │
+│                   ▼                                                           │
+│              ❌ DENIED (implicit)                                             │
+│                                                                              │
+│                                                                              │
+│  S3 BUCKET POLICY — STRUCTURE:                                               │
+│  ┌──────────────────────────────────────────────────────────────────┐        │
+│  │ {                                                                │        │
+│  │   "Version": "2012-10-17",      ← MUST be this exact string     │        │
+│  │   "Statement": [                                                 │        │
+│  │     {                                                            │        │
+│  │       "Sid": "human-readable-id",                                │        │
+│  │       "Effect": "Allow" | "Deny",                                │        │
+│  │       "Principal": {             ← WHO (user, role, account, *)  │        │
+│  │         "AWS": "arn:aws:iam::123456789012:group/Finance"         │        │
+│  │       },                                                         │        │
+│  │       "Action": [                ← WHAT (S3 API actions)         │        │
+│  │         "s3:GetObject",                                          │        │
+│  │         "s3:ListBucket"                                          │        │
+│  │       ],                                                         │        │
+│  │       "Resource": [              ← WHERE (bucket/object ARNs)    │        │
+│  │         "arn:aws:s3:::bucket-name",                              │        │
+│  │         "arn:aws:s3:::bucket-name/prefix/*"                      │        │
+│  │       ],                                                         │        │
+│  │       "Condition": {             ← WHEN (optional constraints)   │        │
+│  │         "StringLike": {                                          │        │
+│  │           "s3:prefix": ["finance_reports/*"]                     │        │
+│  │         }                                                        │        │
+│  │       }                                                          │        │
+│  │     }                                                            │        │
+│  │   ]                                                              │        │
+│  │ }                                                                │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  IAM POLICY — STRUCTURE:                                                     │
+│  ┌──────────────────────────────────────────────────────────────────┐        │
+│  │ Same JSON structure as bucket policy EXCEPT:                     │        │
+│  │ → NO "Principal" field (principal = whoever policy is attached to)│       │
+│  │ → Attached to user/group/role (not to the resource)              │        │
+│  │ → Can reference ANY AWS service (not just S3)                    │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  S3:LISTBUCKET + CONDITION TRICK:                                            │
+│  ┌──────────────────────────────────────────────────────────────────┐        │
+│  │ Problem: s3:ListBucket applies to the BUCKET (not objects)       │        │
+│  │ → Cannot use object ARN (bucket-name/prefix/*)                   │        │
+│  │ → Must use bucket ARN (bucket-name) + Condition                  │        │
+│  │                                                                  │        │
+│  │ Solution:                                                        │        │
+│  │ "Action": "s3:ListBucket",                                      │        │
+│  │ "Resource": "arn:aws:s3:::bucket-name",   ← bucket level        │        │
+│  │ "Condition": {                                                   │        │
+│  │   "StringLike": {                                                │        │
+│  │     "s3:prefix": ["finance_reports/*"]    ← restrict to prefix   │        │
+│  │   }                                                              │        │
+│  │ }                                                                │        │
+│  │                                                                  │        │
+│  │ Without Condition: user can list ALL prefixes (sees file names)  │        │
+│  │ With Condition: user only sees files under specified prefix       │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  KEY S3 ACTIONS CHEAT SHEET:                                                 │
+│  ┌─────────────────────────┬────────────┬──────────────────────────┐         │
+│  │ Action                  │ Level      │ Resource ARN Format      │         │
+│  ├─────────────────────────┼────────────┼──────────────────────────┤         │
+│  │ s3:ListBucket           │ Bucket     │ arn:aws:s3:::bucket      │         │
+│  │ s3:ListBucketVersions   │ Bucket     │ arn:aws:s3:::bucket      │         │
+│  │ s3:GetBucketLocation    │ Bucket     │ arn:aws:s3:::bucket      │         │
+│  │ s3:GetObject            │ Object     │ arn:aws:s3:::bucket/*    │         │
+│  │ s3:GetObjectVersion     │ Object     │ arn:aws:s3:::bucket/*    │         │
+│  │ s3:PutObject            │ Object     │ arn:aws:s3:::bucket/*    │         │
+│  │ s3:DeleteObject         │ Object     │ arn:aws:s3:::bucket/*    │         │
+│  │ s3:DeleteObjectVersion  │ Object     │ arn:aws:s3:::bucket/*    │         │
+│  └─────────────────────────┴────────────┴──────────────────────────┘         │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Access Denied on ListObjects but GetObject works"
+</span>→ Cause: policy grants s3:GetObject on bucket/* but NOT s3:ListBucket on bucket
+→ User can download a file if they know the EXACT key
+→ But cannot browse/list the contents of a prefix
+→ Fix: add s3:ListBucket with Condition for the prefix
+
+PITFALL 2: "User can list ALL prefixes even though I restricted GetObject"
+→ Cause: s3:ListBucket without Condition on s3:prefix
+→ ListBucket is a BUCKET-level action — applies to entire bucket
+→ Must add Condition to restrict which prefixes appear in LIST results
+→ Fix: add "Condition": {"StringLike": {"s3:prefix": ["allowed_prefix/*"]}}
+
+PITFALL 3: "Bucket policy DENY blocks even the admin"
+→ Cause: DENY in bucket policy overrides ALL IAM ALLOW policies
+→ This is BY DESIGN — it's the safety net
+→ Only the account ROOT USER can bypass bucket policy DENY
+→ Fix: carefully scope the DENY with Condition or NotPrincipal
+
+PITFALL 4: "NotPrincipal DENY locks everyone out including me"
+→ Cause: "Effect": "Deny", "NotPrincipal": {"AWS": "arn:...:user/alice"}
+→ This means: DENY everyone EXCEPT alice
+→ But: NotPrincipal doesn't work as expected with assumed roles
+→ Fix: use "Condition": {"StringNotEquals": {"aws:PrincipalArn": "..."}}
+→ This is a CLASSIC interview trap question
+
+PITFALL 5: "Policy works for IAM user but not for EC2 instance"
+→ Cause: EC2 uses an IAM Role (instance profile), not IAM user
+→ Bucket policy references IAM user ARN but EC2 presents role ARN
+→ Fix: add the role ARN to the policy (covered in Project 6)
+
+PITFALL 6: "Policy change doesn't take effect immediately"
+→ IAM policy changes: eventual consistency (usually &lt; 60 seconds)
+→ Bucket policy changes: usually immediate but can take minutes
+→ Don't test immediately after change — wait 1-2 minutes
+
+PITFALL 7: "I used 'aws:username' condition but it's empty for roles"
+→ Cause: roles don't have a username — they have a RoleSessionName
+→ Use aws:PrincipalArn or aws:PrincipalTag instead
+→ aws:username only works for IAM users</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>POLICY SIZE LIMITS:
+</span>→ IAM managed policy: max 6,144 characters
+→ IAM inline policy: max 2,048 characters
+→ S3 bucket policy: max 20 KB (20,480 characters)
+→ Max managed policies per group: 10
+→ Max groups per user: 10
+→ Max IAM users per account: 5,000 (soft limit)
+→ Max IAM groups per account: 300 (soft limit)
+
+SCALING FROM 4 TEAMS TO 40 TEAMS:
+→ 40 IAM groups × 2-3 policies each = 80-120 managed policies
+→ AWS limit: 1,500 managed policies per account
+→ Still well within limits
+
+→ Bucket policy with 40 DENY statements = approaches 20KB limit
+→ Solution: use IAM policies for ALLOW, bucket policy only for critical DENY
+→ Or: migrate to S3 Access Points (one per team, each with own policy)
+
+SCALING FROM 1 BUCKET TO 50 BUCKETS:
+→ Each bucket has its own bucket policy
+→ IAM policies can reference multiple bucket ARNs
+→ Use wildcards carefully: arn:aws:s3:::quickcart-*-prod/*
+→ Better: use IAM policy variables: ${aws:PrincipalTag/team}
+
+TAG-BASED ACCESS CONTROL (ABAC) — FUTURE SCALING:
+→ Instead of explicit prefix per team in policy:
+→ Tag S3 objects with "team=finance"
+→ Tag IAM users with "team=finance"
+→ Policy: allow if object tag matches user tag
+→ Zero policy changes when new teams/prefixes added
+→ Covered at advanced level in Project 74 (Lake Formation)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO DEBUG "ACCESS DENIED" ERRORS:
+</span>
+1. AWS Policy Simulator (IAM Console):
+   → Select the user/role
+   → Select the service (S3) and action (GetObject)
+   → Enter the resource ARN
+   → Click "Run Simulation"
+   → Shows: Allowed/Denied + WHICH policy caused it
+
+2. CloudTrail:
+   → Every API call logged with:
+     - Who (IAM principal ARN)
+     - What (API action)
+     - When (timestamp)
+     - Result (success/failure)
+     - Error code (AccessDenied, etc.)
+   → Search: EventName=GetObject, errorCode=AccessDenied
+
+3. S3 Server Access Logs:
+   → Per-request logs including:
+     - Requester ARN
+     - Bucket + Key
+     - HTTP status (403 = denied)
+     - Error code
+
+4. IAM Access Analyzer:
+   → Identifies resources shared with external entities
+   → Flags bucket policies that grant public or cross-account access
+   → Generates findings with recommended fixes
+
+5. Manual Policy Debugging Checklist:
+   → Is there an explicit DENY anywhere? (check all policies)
+   → Does the IAM policy ALLOW this specific action?
+   → Does the resource ARN match EXACTLY? (bucket vs object level)
+   → Is there a Condition that's not met?
+   → Is the user in the right group?
+   → Did the policy propagate? (wait 60 seconds)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(3)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create IAM Groups</h3>
+
+<h3>Step 2: Create and Attach IAM Policies</h3>
+
+<h3>Step 3: Create Bucket Policy (DENY Safety Net)</h3>
+
+<h3>Step 4: Create Test Users and Assign to Groups</h3>
+
+<h3>Step 5: Test Access Controls</h3>
+
+<h3>Step 6: Cleanup Script</h3>
+
+<h3>Step 7: Access Matrix Visualizer (Interview Bonus)</h3>
+
+<h3>Step 8: Execution Flow</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT — ACCESS MATRIX:
+</span>
+====================================================================
+📊 S3 ACCESS CONTROL MATRIX — quickcart-raw-data-prod
+====================================================================
+
+🏷️  TEAM: DataEngineering
+------------------------------------------------------------------------
+  Prefix                         LIST     READ     WRITE    DELETE
+------------------------------------------------------------------------
+  daily_exports/orders/          ✅       ✅       ✅       ✅
+  daily_exports/customers/       ✅       ✅       ✅       ✅
+  daily_exports/products/        ✅       ✅       ✅       ✅
+  finance_reports/               ✅       ✅       ✅       ✅
+  marketing_data/                ✅       ✅       ✅       ✅
+
+🏷️  TEAM: Finance
+------------------------------------------------------------------------
+  Prefix                         LIST     READ     WRITE    DELETE
+------------------------------------------------------------------------
+  daily_exports/orders/          ✅       ✅       ❌       ❌
+  daily_exports/customers/       ❌       ❌       ❌       ❌
+  daily_exports/products/        ✅       ✅       ❌       ❌
+  finance_reports/               ✅       ✅       ❌       ❌
+  marketing_data/                ❌       ❌       ❌       ❌
+
+🏷️  TEAM: Marketing
+------------------------------------------------------------------------
+  Prefix                         LIST     READ     WRITE    DELETE
+------------------------------------------------------------------------
+  daily_exports/orders/          ❌       ❌       ❌       ❌
+  daily_exports/customers/       ✅       ✅       ❌       ❌
+  daily_exports/products/        ✅       ✅       ❌       ❌
+  finance_reports/               ❌       ❌       ❌       ❌
+  marketing_data/                ✅       ✅       ❌       ❌
+
+🏷️  TEAM: Interns
+------------------------------------------------------------------------
+  Prefix                         LIST     READ     WRITE    DELETE
+------------------------------------------------------------------------
+  daily_exports/orders/          ✅       ✅       ❌       ❌
+  daily_exports/customers/       ✅       ✅       ❌       ❌
+  daily_exports/products/        ✅       ✅       ❌       ❌
+  finance_reports/               ❌       ❌       ❌       ❌
+  marketing_data/                ❌       ❌       ❌       ❌
+
+====================================================================</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT — TEST RESULTS:
+</span>
+==========================================================================================
+🧪 ACCESS CONTROL TEST RESULTS
+==========================================================================================
+
+📌 Test: List daily_exports/orders/
+   Action: list
+----------------------------------------------------------------------
+   ✅ DataEngineering      Expected: ALLOW  Got: ALLOW
+   ✅ Finance              Expected: ALLOW  Got: ALLOW
+   ✅ Marketing            Expected: DENY   Got: DENY
+   ✅ Interns              Expected: ALLOW  Got: ALLOW
+
+📌 Test: List finance_reports/
+   Action: list
+----------------------------------------------------------------------
+   ✅ DataEngineering      Expected: ALLOW  Got: ALLOW
+   ✅ Finance              Expected: ALLOW  Got: ALLOW
+   ✅ Marketing            Expected: DENY   Got: DENY
+   ✅ Interns              Expected: DENY   Got: DENY
+
+📌 Test: Upload to daily_exports/orders/
+   Action: put
+----------------------------------------------------------------------
+   ✅ DataEngineering      Expected: ALLOW  Got: ALLOW
+   ✅ Finance              Expected: DENY   Got: DENY
+   ✅ Marketing            Expected: DENY   Got: DENY
+   ✅ Interns              Expected: DENY   Got: DENY
+
+📌 Test: Delete from daily_exports/orders/
+   Action: delete
+----------------------------------------------------------------------
+   ✅ DataEngineering      Expected: ALLOW  Got: ALLOW
+   ✅ Finance              Expected: DENY   Got: DENY
+   ✅ Marketing            Expected: DENY   Got: DENY
+   ✅ Interns              Expected: DENY   Got: DENY
+
+==========================================================================================
+✅ ALL TESTS PASSED — Access controls working correctly
+==========================================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ AWS has TWO policy attachment points: identity-based (IAM) + resource-based (bucket)
+→ Policy evaluation: Explicit DENY &gt; Explicit ALLOW &gt; Implicit DENY
+→ Same-account: EITHER IAM or bucket policy ALLOW is sufficient
+→ Cross-account: BOTH IAM AND bucket policy must ALLOW (Project 56)
+→ s3:ListBucket is bucket-level; s3:GetObject is object-level — different ARN formats
+→ Use Condition on s3:prefix to restrict LIST results to specific "folders"
+→ IAM Groups abstract users from permissions — always use groups
+→ Bucket policy DENY = safety net that even admin IAM policies cannot override
+→ S3 ACLs are legacy — disable them, use IAM + bucket policies only
+→ Test with Policy Simulator before deploying to production
+
+CONNECTING TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: Created bucket, uploaded files → now those files are ACCESS CONTROLLED
+→ Project 2: Versioning protects against deletion → but access control PREVENTS it first
+→ Together: 3-layer defense
+   Layer 1: IAM prevents unauthorized actions (Project 3)
+   Layer 2: Bucket policy DENY blocks even misconfgured IAM (Project 3)
+   Layer 3: Versioning recovers if both layers fail (Project 2)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 4: We know HOW to store and WHO can access
+   → But 6 months of daily files accumulate at $0.023/GB
+   → Old files rarely accessed — paying premium for cold data
+   → Storage classes: S3-IA, Glacier, Intelligent Tiering
+   → Lifecycle transitions for CURRENT versions (not just non-current)
+
+→ Project 6: We restricted HUMAN access via IAM users/groups
+   → But the upload script on EC2 still uses hardcoded credentials
+   → How does a SERVICE (EC2, Glue, Lambda) authenticate to S3?
+   → IAM Roles, Instance Profiles, STS AssumeRole
+
+→ Project 7: Deep dive into IAM policy evaluation engine
+   → Permission boundaries, SCPs, session policies
+   → The complete evaluation flowchart</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>✅ S3 bucket with organized structure (Project 1)
+✅ Versioning + lifecycle rules for protection (Project 2)
+✅ Team-based access control via IAM + bucket policies (Project 3)
+
+3 more months pass... bucket now holds 540+ files (~33 GB)
+
+CFO reviews AWS bill:
+→ S3 storage: $0.76/month (33 GB × $0.023)
+→ "Seems cheap, but in 2 years this will be 400 GB"
+→ "And 80% of those files are never accessed after the first week"
+
+Data engineer realizes:
+→ Files from 6 months ago: accessed 0 times in last 90 days
+→ Files from 3 months ago: accessed 1-2 times total
+→ Only last 7 days of files are actively queried
+→ Paying $0.023/GB for data that should be at $0.004/GB or less
+
+CTO: "Can we automatically move old files to cheaper storage
+      without changing any code or access patterns?"
+
+YOU: "Yes — S3 Storage Classes with lifecycle transitions.
+      We already set up transitions for NON-CURRENT versions in Project 2.
+      Now we need transitions for CURRENT versions too."
+
+→ Project 4: "Old Reports Must Move to Cheaper Storage After 90 Days"
+→ Introduces: S3 Storage Classes, Intelligent Tiering, Glacier, 
+              Current-version transitions, Retrieval costs &amp; times</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="11" ========== -->
+<div class="chat-message" data-index="11"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-2.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 3 of 80</span>
+    <span class="nav-project-title">FINANCE TEAM WANTS ONLY THEIR DEPARTMENT TO ACCESS A FOLDER</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-4.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-4.html") window.location = "project-4.html";
+  if (e.key === 'ArrowLeft' && "project-2.html") window.location = "project-2.html";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 60: GLUE IN ACCOUNT B EXTRACTS FROM ACCOUNT A&#x27;S S3, LOADS ACCOUN — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:75%"></div></div>
+<div id="progress-label">75%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 60 of 80</div>
+  <div class="project-title">GLUE IN ACCOUNT B EXTRACTS FROM ACCOUNT A&#x27;S S3, LOADS ACCOUNT B&#x27;S REDSHIFT</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag">Glue</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multi-account AWS setup fully established
+</span>Team: 15 engineers, 5 data engineers, 4 analysts, 1 BI lead
+
+CURRENT STATE (after Projects 56-59):
+→ Account A (111111111111): Production Data
+  - S3 data lake with Bronze/Silver/Gold ✅
+  - Glue Catalog with 25+ tables ✅
+  - Redshift production cluster ✅
+  - SNS pipeline events ✅
+  - Cross-account access granted to Account B ✅
+
+→ Account B (222222222222): Analytics
+  - Can READ Account A's S3 ✅ (Project 56)
+  - Can READ Account A's Catalog ✅ (Project 57)
+  - Can QUERY Account A's Redshift via Data Sharing ✅ (Project 58)
+  - Receives pipeline events via SQS ✅ (Project 59)
+  - Has its OWN Redshift Serverless for BI workloads
+  - Has its OWN Glue for ETL processing
+
+THE FINAL PIECE:
+→ Account B needs to run a COMPLETE ETL pipeline that:
+  1. Triggers when Account A's pipeline completes (via SQS event)
+  2. Reads data from Account A's S3 (cross-account)
+  3. Uses Account A's Catalog for schema (cross-account)
+  4. Transforms data using Account B's Glue compute
+  5. Writes results to Account B's OWN Redshift
+  6. Notifies Account B's team when complete
+
+WHY NOT JUST USE DATA SHARING (Project 58)?
+→ Data Sharing gives READ-ONLY access to Account A's exact tables
+→ But Account B needs CUSTOM transformations:
+  - Join Account A's orders with Account B's local forecast data
+  - Apply Account B's proprietary ML scoring model
+  - Create Account B-specific aggregations (different from Account A's)
+  - Add columns from Account B's local reference tables
+  - Materialize results for Account B's dashboard tool (Tableau/QuickSight)
+→ These transformations require: read from A → process in B → write to B's Redshift
+→ Data Sharing can't do transformations — it's passthrough only
+
+THE COMPLETE FLOW:
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  Account A                          Account B                            │
+│  ────────                          ────────                              │
+│                                                                          │
+│  Pipeline completes                                                      │
+│       │                                                                  │
+│       ▼                                                                  │
+│  SNS: "etl_completed" ─────────→ SQS: receives event                    │
+│                                       │                                  │
+│                                       ▼                                  │
+│                                  Consumer triggers                       │
+│                                  Step Functions                          │
+│                                       │                                  │
+│                                       ▼                                  │
+│  S3: Gold data ←──────────────── Glue ETL Job                           │
+│  Catalog: schema ←───────────────  │ reads from A                       │
+│                                    │ transforms in B                     │
+│                                    │ writes to B                         │
+│                                    ▼                                     │
+│                                  Redshift Serverless                     │
+│                                  (Account B's own)                       │
+│                                    │                                     │
+│                                    ▼                                     │
+│                                  BI Dashboards                           │
+│                                  (Tableau/QuickSight)                    │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+CHALLENGES:
+→ Glue job in Account B must AssumeRole into Account A (for S3 + Catalog)
+→ Same Glue job must also write to Account B's Redshift (local)
+→ IAM chain: Glue Service Role → AssumeRole → Account A's cross-account role
+→ Credential management: two sets of permissions in one job
+→ Error handling: cross-account failures need clear diagnostics
+→ Orchestration: event-driven trigger + multi-step pipeline</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the IAM chain for cross-account Glue
+</span>→ Glue job runs as: Account B's "GlueRole-B"
+→ GlueRole-B has permission to: sts:AssumeRole on Account A's cross-account role
+→ Inside the job: call sts:AssumeRole → get temp credentials for Account A
+→ Use temp credentials: read S3 + Catalog from Account A
+→ Use GlueRole-B's own credentials: write to Account B's Redshift
+→ TWO credential contexts in ONE job
+
+Step 2: Understand Glue's native cross-account Catalog support
+→ Glue from_catalog() supports catalog_id parameter
+→ But: Glue's service role needs direct permissions on Account A's Catalog
+→ Alternative: AssumeRole in job code, then use boto3 for Catalog + Spark for S3
+→ We implement BOTH approaches for comparison
+
+Step 3: Design the Glue job
+→ Phase 1: Read from Account A (cross-account)
+  - Get table metadata from Account A's Catalog
+  - Read data from Account A's S3
+→ Phase 2: Read from Account B (local)
+  - Read local reference tables (forecast, segments)
+→ Phase 3: Transform (Account B's compute)
+  - Join cross-account data with local data
+  - Apply business logic, aggregations, scoring
+→ Phase 4: Write to Account B's Redshift (local)
+  - Load transformed results via Glue Redshift connector
+  - Uses Account B's Redshift connection
+
+Step 4: Design the orchestration
+→ SQS event → Lambda (or EventBridge) → Step Functions → Glue job
+→ Reuses: Project 59 (event), Project 55 (Step Functions)
+→ Error handling: catch cross-account failures, notify Account B's team
+
+Step 5: Design monitoring
+→ CloudWatch metrics for: Glue job duration, rows processed, errors
+→ SNS notification on completion/failure (Account B's own topics)
+→ Dashboard showing cross-account pipeline health</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE (detailed):
+</span>
+Account A[REDACTED:BANK_ACCOUNT_NUMBER]11)              Account B[REDACTED:BANK_ACCOUNT_NUMBER]22)
+┌─────────────────────────┐          ┌──────────────────────────────────┐
+│                         │          │                                  │
+│ SNS: pipeline-events    │──event──→│ SQS: acct-a-pipeline-events      │
+│                         │          │        │                         │
+│                         │          │        ▼                         │
+│                         │          │ Step Functions:                  │
+│                         │          │ "acct-b-analytics-pipeline"      │
+│                         │          │        │                         │
+│                         │          │        ▼                         │
+│                         │          │ Glue ETL Job:                    │
+│ IAM Role:               │  assume  │ "cross-account-analytics-etl"    │
+│ CrossAccount-S3Read ←───│──role────│ (runs as GlueRole-B)             │
+│                         │          │                                  │
+│ S3: Gold data ←─────────│──read────│ Phase 1: Read Account A          │
+│ Catalog: schema ←───────│──read────│   from_catalog(catalog_id=A)     │
+│                         │          │   OR boto3 + spark.read          │
+│                         │          │                                  │
+│                         │          │ Phase 2: Read Account B (local)  │
+│                         │          │   Local reference tables         │
+│                         │          │                                  │
+│                         │          │ Phase 3: Transform               │
+│                         │          │   Join, aggregate, score         │
+│                         │          │                                  │
+│                         │          │ Phase 4: Write to Redshift       │
+│                         │          │   Glue Redshift connector ──────→│
+│                         │          │                        ┌────────┐│
+│                         │          │                        │Redshift││
+│                         │          │                        │Server- ││
+│                         │          │                        │less    ││
+│                         │          │                        └────────┘│
+│                         │          │                                  │
+│                         │          │ Phase 5: Notify                  │
+│                         │          │   SNS: "analytics-pipeline-done" │
+│                         │          │                                  │
+└─────────────────────────┘          └──────────────────────────────────┘
+
+IAM CHAIN:
+┌───────────────────────────────────────────────────────────────┐
+│                                                               │
+│  Glue Service ──assumes──→ GlueRole-B (Account B)            │
+│                              │                                │
+│                              ├── Has: glue:*, s3:* on B's    │
+│                              │   own resources                │
+│                              │                                │
+│                              ├── Has: sts:AssumeRole on      │
+│                              │   Account A's cross-account    │
+│                              │   role                         │
+│                              │                                │
+│                              └── Has: redshift-data:* on     │
+│                                  Account B's Redshift         │
+│                                                               │
+│  Inside Glue job code:                                        │
+│  sts.assume_role(Account A's role) → temp_credentials         │
+│                                                               │
+│  temp_credentials used for:                                   │
+│  → glue.get_table(CatalogId=A) → schema                     │
+│  → spark.read.parquet(s3://acct-a-bucket/gold/) → data       │
+│                                                               │
+│  GlueRole-B's own credentials used for:                      │
+│  → glue.write_dynamic_frame(redshift connection) → load      │
+│  → s3.put_object(s3://acct-b-bucket/staging/) → temp files   │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Account A runs ETL and pushes results to Account B
+</span>→ Account A owns the transformation logic
+→ Problems: Account A doesn't know Account B's requirements
+→ Every new Account B requirement = change request to Account A team
+→ Tight coupling between teams
+
+Option B: UNLOAD from Account A's Redshift → S3 → COPY to Account B's Redshift
+→ From Project 58 discussion — already rejected
+→ 500 GB transfer, 75-min stale, no custom transforms
+
+Option C: Account B reads via Data Sharing, transforms locally via Redshift SQL
+→ Account B queries Account A's Redshift → joins with local → INSERT INTO local table
+→ Works but: Redshift SQL is limited for complex transforms
+→ No Spark, no ML libraries, no complex Python logic
+→ Good for simple aggregations, bad for complex ETL
+
+Option D: Cross-account Glue ETL (this project) ✅
+→ Glue in Account B: reads from A, transforms in B, writes to B's Redshift
+→ Full Spark/Python capabilities for complex transforms
+→ Account B owns the transformation logic entirely
+→ Uses established cross-account patterns (Projects 56-59)
+→ Event-driven: triggered by Account A's pipeline completion
+
+Option E: Lambda-based lightweight ETL
+→ Lambda reads from A, transforms, writes to B
+→ Limited: 15-min timeout, 10 GB memory max
+→ Good for small datasets (&lt;1 GB), bad for large transforms
+→ Not suitable for 500 GB Gold layer processing
+
+DECISION: Option D — Cross-account Glue ETL
+→ Reason: full Spark power, Account B owns logic, event-driven, scalable
+→ Combines ALL cross-account patterns from Phase 4</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use AssumeRole INSIDE Glue job code (not Glue Connection)
+</span>   → Glue Connections for cross-account: limited and finicky
+   → AssumeRole in code: full control, explicit, debuggable
+   → Create boto3 session with temp credentials for Account A
+   → Use default session for Account B operations
+
+2. Separate cross-account and local operations clearly
+   → First: do ALL Account A reads (using assumed credentials)
+   → Convert to Spark DataFrames (now in Account B's memory)
+   → Then: do ALL Account B operations (using local credentials)
+   → Never mix credential contexts in the same API call
+
+3. Cache Account A's data in Account B's S3 staging area
+   → Read from Account A → write to s3://acct-b/staging/
+   → Subsequent operations read from staging (local, fast)
+   → Benefits: if Glue job fails mid-transform, don't re-read cross-account
+   → Cleanup: delete staging after successful load to Redshift
+
+4. Handle credential expiry for long-running jobs
+   → Default AssumeRole session: 1 hour
+   → Glue job may run 2+ hours for large datasets
+   → Set DurationSeconds=14400 (4 hours) when assuming role
+   → Or: re-assume role periodically in long jobs
+
+5. Pass cross-account config via Glue job arguments
+   → --source_catalog_id, --source_database, --cross_account_role_arn
+   → --external_id (for confused deputy prevention)
+   → Don't hardcode account IDs in job script
+   → Same script works for dev/staging/prod by changing arguments
+
+6. Add comprehensive logging for cross-account operations
+   → Log: "Assuming role ARN: ..."
+   → Log: "Reading table from Catalog ID: ..."
+   → Log: "Read N rows from Account A's S3"
+   → Log: "Writing N rows to Account B's Redshift"
+   → Cross-account debugging is HARD without good logs
+
+7. Implement idempotent writes to Redshift
+   → If job reruns (retry after failure): don't duplicate data
+   → Use: TRUNCATE + INSERT, or MERGE (upsert) pattern
+   → Or: staging table → DELETE existing → INSERT new → swap
+   → From Project 49: Redshift stored procedures for atomic operations
+
+8. Monitor BOTH accounts' CloudTrail
+   → Account A: who assumed the cross-account role? When?
+   → Account A: which S3 objects were read? How much data?
+   → Account B: Glue job execution, Redshift writes
+   → Correlated view: full audit trail of cross-account ETL</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT store Account A's credentials in Glue job code
+</span>   → No hardcoded access keys EVER
+   → Use AssumeRole for temporary credentials
+   → Credentials rotate automatically
+
+2. DO NOT read Account A's data directly into Redshift COPY
+   → Redshift COPY from cross-account S3: requires Redshift IAM role
+   → Complex: Redshift role → AssumeRole → Account A's role → S3
+   → Simpler: Glue reads S3 → writes to Account B's staging S3 → COPY locally
+
+3. DO NOT skip error handling for cross-account operations
+   → Cross-account failures are MORE common than same-account:
+     - Role trust policy changed → AccessDenied
+     - Account A's data moved → FileNotFoundError
+     - Session expired → ExpiredTokenException
+   → Every cross-account call needs try/except with clear error message
+
+4. DO NOT assume Account A's schema never changes
+   → Account A drops a column → Glue job breaks
+   → Account A renames a table → Glue job breaks
+   → Defensive coding: validate schema before processing
+   → Alert if schema drift detected (from Project 45)
+
+5. DO NOT run cross-account Glue jobs as admin/superuser role
+   → GlueRole-B should have MINIMUM permissions needed
+   → Read-only on Account A (via cross-account role)
+   → Write-only to specific Account B resources
+   → Principle of least privilege across accounts
+
+6. DO NOT process ALL of Account A's data every run
+   → Use incremental processing: only new/changed data
+   → Glue Job Bookmarks (from Project 33) for S3 sources
+   → Watermark columns for database sources (from Project 42)
+   → Reduces: cross-account data transfer, compute cost, run time</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬──────────────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                           │ Use                      │ Why                                  │
+├────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ Complex cross-account ETL with     │ Glue ETL + AssumeRole    │ Full Spark, Python, custom transforms│
+│ joins, ML, aggregations            │ (this project)           │ Account B owns logic                 │
+├────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ Simple read-only queries on        │ Redshift Data Sharing    │ Zero-copy, real-time, no ETL needed  │
+│ Account A's Redshift tables        │ (Project 58)             │ Read-only, no transformation         │
+├────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ SQL-only transforms on Account A's │ Athena cross-account +   │ Serverless SQL, no Glue infrastructure│
+│ S3 data                            │ CTAS (Projects 57+36)    │ Limited to SQL capabilities          │
+├────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ Small dataset (&lt;1 GB) transform    │ Lambda + AssumeRole      │ Serverless, fast startup, cheap      │
+│ triggered by events                │                          │ Limited by 15-min timeout            │
+├────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+│ Analyst-driven data cleaning       │ DataBrew + cross-account │ Visual, no-code, reads from A's S3   │
+│ across accounts                    │ S3 (Projects 53+56)      │ Writes to B's S3                     │
+└────────────────────────────────────┴──────────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│         CROSS-ACCOUNT GLUE ETL — INTERNAL MECHANICS                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  EXECUTION FLOW (step by step):                                              │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐          │
+│  │ STEP 1: Glue Service launches job                              │          │
+│  │ → Provisions Spark cluster in Account B's VPC                  │          │
+│  │ → Attaches GlueRole-B as execution role                        │          │
+│  │ → Downloads job script from Account B's S3                     │          │
+│  │ → Spark session initialized with GlueRole-B's credentials      │          │
+│  │                                                                 │          │
+│  │ STEP 2: Job script calls sts:AssumeRole                        │          │
+│  │ → sts_client = boto3.client("sts")                             │          │
+│  │ → response = sts_client.assume_role(                           │          │
+│  │     RoleArn="arn:aws:iam::111111111111:role/CrossAccount-S3Read"│         │
+│  │     ExternalId="quickcart-analytics-2025-xK9mP2"              │          │
+│  │     DurationSeconds=14400                                       │          │
+│  │   )                                                             │          │
+│  │ → STS returns: AccessKeyId, SecretAccessKey, SessionToken       │          │
+│  │ → These are ACCOUNT A's temporary credentials                   │          │
+│  │                                                                 │          │
+│  │ STEP 3: Read Account A's Catalog (using temp creds)             │          │
+│  │ → cross_glue = boto3.client("glue",                            │          │
+│  │     aws_access_key_id=creds["AccessKeyId"],                     │          │
+│  │     aws_secret_access_key=creds["SecretAccessKey"],             │          │
+│  │     aws_session_token=creds["SessionToken"])                    │          │
+│  │ → table = cross_glue.get_table(CatalogId="111111111111",       │          │
+│  │     DatabaseName="quickcart_db", Name="orders_gold")            │          │
+│  │ → Extract: S3 location, column schema, partition info           │          │
+│  │                                                                 │          │
+│  │ STEP 4: Read Account A's S3 data (using Spark + Hadoop config)  │          │
+│  │ → Configure Spark's Hadoop with Account A's temp credentials:   │          │
+│  │   sc._jsc.hadoopConfiguration().set(                            │          │
+│  │     "fs.s3a.access.key", creds["AccessKeyId"])                  │          │
+│  │   sc._jsc.hadoopConfiguration().set(                            │          │
+│  │     "fs.s3a.secret.key", creds["SecretAccessKey"])              │          │
+│  │   sc._jsc.hadoopConfiguration().set(                            │          │
+│  │     "fs.s3a.session.token", creds["SessionToken"])              │          │
+│  │ → df = spark.read.parquet("s3a://acct-a-bucket/gold/orders/")  │          │
+│  │ → Data loaded into Spark DataFrame (Account B's memory)         │          │
+│  │                                                                 │          │
+│  │ IMPORTANT: After this step, data is IN Account B's Spark        │          │
+│  │ No more cross-account calls needed for this data                │          │
+│  │                                                                 │          │
+│  │ STEP 5: Reset Hadoop config to Account B's credentials          │          │
+│  │ → Remove Account A's credentials from Hadoop config             │          │
+│  │ → Spark now uses GlueRole-B's credentials for all S3 ops        │          │
+│  │ → Account B's S3 accessible again with default credentials      │          │
+│  │                                                                 │          │
+│  │ STEP 6: Read Account B's local data (using default creds)       │          │
+│  │ → forecast_df = spark.read.parquet("s3://acct-b/reference/")   │          │
+│  │ → Uses GlueRole-B's credentials (Account B's own S3)           │          │
+│  │                                                                 │          │
+│  │ STEP 7: Transform (all in Account B's Spark memory)             │          │
+│  │ → joined_df = orders_df.join(forecast_df, "order_date")        │          │
+│  │ → aggregated_df = joined_df.groupBy(...).agg(...)              │          │
+│  │ → No cross-account calls — pure Spark processing               │          │
+│  │                                                                 │          │
+│  │ STEP 8: Write to Account B's Redshift                           │          │
+│  │ → Uses Glue Redshift connector (Account B's connection)         │          │
+│  │ → Writes to staging S3 → Redshift COPY from staging             │          │
+│  │ → All within Account B — no cross-account                       │          │
+│  │                                                                 │          │
+│  │ STEP 9: Cleanup staging + publish completion event              │          │
+│  │ → Delete temp files in Account B's staging S3                   │          │
+│  │ → Publish to Account B's SNS: "analytics-pipeline-complete"     │          │
+│  └────────────────────────────────────────────────────────────────┘          │
+│                                                                              │
+│  CREDENTIAL CONTEXT SWITCHING:                                               │
+│  ═══════════════════════════                                                 │
+│  → Steps 1-2: GlueRole-B credentials (Account B)                            │
+│  → Steps 3-4: Account A's temp credentials (cross-account)                  │
+│  → Steps 5-9: GlueRole-B credentials again (Account B)                      │
+│  → Clean separation: cross-account reads FIRST, then local operations        │
+│                                                                              │
+│  ALTERNATIVE: Glue Native catalog_id Support                                 │
+│  ═══════════════════════════════════════════                                  │
+│  → from_catalog(database="db", table_name="tbl",                            │
+│       additional_options={"catalogId": "111111111111"})                       │
+│  → Requires: GlueRole-B has DIRECT glue:GetTable permission on Account A    │
+│  → Account A's Catalog Resource Policy must allow GlueRole-B                 │
+│  → Simpler code but: S3 read still needs cross-account S3 access             │
+│  → Works for Catalog but NOT for S3 data (separate permission)               │
+│  → We implement BOTH approaches in the code below                            │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Glue reads Catalog successfully but S3 read fails"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Catalog permission ≠ S3 permission
+→ GlueRole-B can read Catalog (Project 57) but NOT S3 (Project 56 not done for this role)
+→ Catalog returns S3 location → Spark tries to read → AccessDenied on S3
+→ Fix: ensure BOTH Catalog AND S3 cross-account access for the same role
+
+PITFALL 2: "Hadoop S3A credentials override default credentials"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ After setting Account A's creds in Hadoop config for S3 read
+→ ALL subsequent S3 operations use Account A's credentials
+→ Writing to Account B's S3 fails (Account A's role can't write to B)
+→ Fix: RESET Hadoop config after cross-account reads are done
+→ Or: use separate Spark sessions (complex but clean)
+
+PITFALL 3: "AssumeRole credentials expire mid-job"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Default session: 1 hour
+→ Large dataset: 500 GB read takes 90 minutes
+→ Credentials expire at 60 minutes → read fails at 60%
+→ Fix: set DurationSeconds=14400 (4 hours) in AssumeRole
+→ Or: complete ALL cross-account reads in first phase, then transform locally
+
+PITFALL 4: "Glue job writes to Redshift but data is duplicated"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: job reruns after partial failure
+→ First run: wrote 50% of data → failed → retried
+→ Second run: wrote 100% of data → first 50% now duplicated
+→ Fix: use staging table pattern:
+  1. Write to staging_table
+  2. BEGIN TRANSACTION
+  3. DELETE FROM target WHERE date = processing_date
+  4. INSERT INTO target SELECT * FROM staging_table
+  5. COMMIT
+  6. DROP staging_table
+
+PITFALL 5: "Cross-account Glue job takes 3x longer than same-account"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: cross-account S3 reads have higher latency
+→ Same-region: ~5-10ms additional latency per request
+→ But: Spark reads many small files → thousands of requests → adds up
+→ Fix: Account A stores data as large Parquet files (from Project 62)
+→ Fix: use s3a:// protocol with readahead and connection pooling
+→ Fix: cache in Account B's staging S3 before processing</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME:
+</span>→ 1 GB: 5-min Glue job, 2 DPUs, ~$0.15
+→ 10 GB: 15-min Glue job, 5 DPUs, ~$1.25
+→ 100 GB: 60-min Glue job, 20 DPUs, ~$20
+→ 500 GB: 2-hour Glue job, 50 DPUs, ~$100
+→ Cross-account overhead: ~10-20% additional time vs same-account
+
+COST BREAKDOWN (daily 100 GB cross-account ETL):
+┌─────────────────────────┬──────────────┐
+│ Component               │ Daily Cost   │
+├─────────────────────────┼──────────────┤
+│ Glue ETL (20 DPUs × 1hr)│ $8.80       │
+│ S3 cross-account reads  │ $0.00 (same  │
+│                         │  region)     │
+│ STS AssumeRole calls    │ $0.00 (free) │
+│ Redshift Serverless     │ $12.00       │
+│ (write + queries)       │ (128 RPU)    │
+│ S3 staging (temp)       │ $0.02        │
+│ SNS/SQS events          │ $0.00 (free  │
+│                         │  tier)       │
+│                         │              │
+│ TOTAL                   │ ~$21/day     │
+│                         │ ~$630/month  │
+└─────────────────────────┴──────────────┘
+
+OPTIMIZATION:
+→ Incremental processing: only new data → reduces 100 GB to ~5 GB/day
+→ Incremental cost: ~$3/day instead of $21/day
+→ Glue Job Bookmarks (Project 33) enable this automatically</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(60)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Cross-Account Glue ETL Job Script</h3>
+
+<h3>Step 2: Create Glue Job in Account B</h3>
+
+<h3>Step 3: Event-Driven Trigger — SQS → Step Functions → Glue</h3>
+
+<h3>Step 4: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Project 56: Cross-account S3 access ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Project 57: Cross-account Catalog access ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Project 59: Cross-account SNS → SQS events ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account B has Redshift Serverless (or RA3 cluster)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account B has Glue Connection to its Redshift</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Upload Glue ETL script to Account B's S3</span><span>
+</span><span>aws s3 </span><span class="token" style="color: rgb(57, 58, 52);">cp</span><span> 60_01_cross_account_glue_etl.py </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span>  s3://quickcart-analytics-scripts-222222222222/glue/cross_account_etl.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create the Glue job in Account B</span><span>
+</span>python 60_02_create_glue_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create event-driven trigger chain</span><span>
+</span>python 60_03_event_driven_trigger.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Deploy the Step Functions state machine</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Connect SQS event to Step Functions</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Test: manually start the Glue job</span><span>
+</span><span>aws glue start-job-run </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --job-name cross-account-analytics-etl </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --arguments </span><span class="token" style="color: rgb(163, 21, 21);">'{"--execution_date":"2025-01-15"}'</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Monitor job execution</span><span>
+</span><span>aws glue get-job-run </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --job-name cross-account-analytics-etl </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --run-id </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span>run-id-from-step-</span><span class="token file-descriptor" style="color: rgb(238, 153, 0); font-weight: bold;">4</span><span class="token" style="color: rgb(57, 58, 52);">&gt;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Verify Redshift data</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Connect to Account B's Redshift and run:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SELECT * FROM bi.daily_revenue_summary LIMIT 10;</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SELECT * FROM bi.tier_revenue_summary LIMIT 10;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Test end-to-end: trigger from Account A</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Publish event to Account A's SNS → flows through to Glue job</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Cleanup</span><span>
+</span>python 60_04_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED GLUE JOB LOG OUTPUT:
+</span>
+═══════════════════════════════════════════════════
+CROSS-ACCOUNT ANALYTICS ETL — Started
+Source Catalog: 111111111111
+Source Database: quickcart_db
+Target: analytics.bi
+Execution Date: 2025-01-15
+═══════════════════════════════════════════════════
+
+PHASE 1: Assuming cross-account role...
+AssumeRole succeeded — expires: 2025-01-15T05:15:00Z
+
+PHASE 2: Reading from Account A...
+Reading orders_gold metadata from Account A's Catalog...
+orders_gold S3 location: s3://quickcart-data-prod/gold/orders/
+orders_gold columns: ['order_id', 'customer_id', 'total_amount', ...]
+Reading customers_silver metadata from Account A's Catalog...
+customers_silver S3 location: s3://quickcart-data-prod/cleaned/customers/
+Configuring Spark for cross-account S3 read...
+Reading orders data from: s3://quickcart-data-prod/gold/orders/
+Orders loaded: 245,000 rows
+Reading customers data from: s3://quickcart-data-prod/cleaned/customers/
+Customers loaded: 48,500 rows
+
+PHASE 3: Resetting credentials to Account B...
+Hadoop credentials reset to Account B's Glue role
+
+PHASE 4: Reading Account B's local reference data...
+Forecast data loaded: 365 rows
+
+PHASE 5: Transforming data...
+Enriched orders: 245,000 rows
+Daily summary: 30 rows
+Tier summary: 120 rows
+
+PHASE 6: Writing to Account B's Redshift...
+Writing daily_revenue_summary to Redshift...
+daily_revenue_summary written successfully
+Writing tier_revenue_summary to Redshift...
+tier_revenue_summary written successfully
+
+PHASE 7: Publishing completion event...
+Completion event published to SNS
+
+═══════════════════════════════════════════════════
+CROSS-ACCOUNT ANALYTICS ETL — COMPLETED SUCCESSFULLY
+Orders read from Account A: 245,000
+Customers read from Account A: 48,500
+Daily summary written to Account B: 30
+Tier summary written to Account B: 120
+═══════════════════════════════════════════════════</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Cross-account Glue ETL uses AssumeRole INSIDE job code for Account A access
+→ TWO credential contexts in ONE job: Account A (temp) + Account B (default)
+→ Hadoop S3A configuration switches between cross-account and local credentials
+→ CRITICAL: reset Hadoop credentials after cross-account reads complete
+→ Read ALL cross-account data first → then process locally → then write locally
+→ Set DurationSeconds=14400 (4 hours) to prevent credential expiry mid-job
+→ Idempotent writes: DELETE + INSERT pattern prevents duplicates on retry
+→ Pass config via Glue job arguments (not hardcoded) for environment portability
+→ Event-driven trigger: SQS event → Step Functions → Glue job (zero polling)
+→ Comprehensive logging for cross-account operations (debugging is harder)
+→ Monitor BOTH accounts' CloudTrail for complete audit trail
+
+THIS PROJECT IS THE CULMINATION OF PHASE 4 CROSS-ACCOUNT PATTERNS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 56: S3 data access ──────────→ Used in Phase 2 (read S3)
+→ Project 57: Catalog metadata ────────→ Used in Phase 2 (read schema)
+→ Project 58: Redshift sharing ────────→ Alternative for read-only queries
+→ Project 59: Event flow ─────────────→ Used for trigger chain
+→ Project 60: ALL COMBINED ───────────→ Complete cross-account ETL pipeline
+
+COMPLETE END-TO-END FLOW:
+━━━━━━━━━━━━━━━━━━━━━━━━
+Account A Pipeline completes (Project 55)
+  → Publishes "etl_completed" to SNS (Project 54)
+    → Cross-account delivery to Account B's SQS (Project 59)
+      → Triggers Account B's Step Functions
+        → Starts cross-account Glue ETL (Project 60)
+          → Reads Account A's Catalog (Project 57)
+          → Reads Account A's S3 (Project 56)
+          → Transforms in Account B's Spark
+          → Writes to Account B's Redshift
+            → BI dashboards refresh with fresh data
+              → Total latency: ~25 minutes (vs 5+ hours with cron)
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 6:  IAM roles → foundation for AssumeRole chain
+→ Project 7:  IAM policy evaluation → cross-account AND logic
+→ Project 25: Glue ETL basics → same concepts, now cross-account
+→ Project 33: Job Bookmarks → incremental cross-account processing
+→ Project 49: Redshift stored procedures → idempotent write patterns
+→ Project 55: Step Functions → orchestrates the trigger chain
+→ Projects 56-59: ALL cross-account access patterns → used here
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 61: "Account A's MariaDB on EC2 Must Feed Account B's Redshift"
+  - So far: cross-account via S3 and Glue Catalog (serverless)
+  - Now: cross-account via VPC Peering (network-level)
+  - MariaDB on EC2 in Account A → Glue JDBC in Account B
+  - Requires: VPC Peering, Route Tables, Security Group references
+  - Adds NETWORK-LEVEL cross-account access to our toolkit
+  - Completes Phase 4: data + metadata + events + network</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's cross-account data platform handles:
+</span>→ S3 data access (Project 56) ✅
+→ Catalog metadata (Project 57) ✅
+→ Redshift sharing (Project 58) ✅
+→ Event flow (Project 59) ✅
+→ Complete ETL pipeline (Project 60) ✅
+
+ALL of these work via AWS SERVICE-LEVEL access (IAM, resource policies, STS)
+
+BUT: Account A has MariaDB running on EC2 (from Project 8)
+→ MariaDB is NOT an AWS service — it's a database on a VM
+→ No IAM integration, no resource policies, no STS
+→ Account B's Glue needs to connect via JDBC (network connection)
+→ EC2 is in Account A's VPC — Account B's Glue is in Account B's VPC
+→ Different VPCs in different accounts → NO network connectivity by default
+
+Network Lead: "We need VPC Peering between Account A and Account B.
+  Account B's Glue must reach Account A's EC2 on port 3306 (MariaDB).
+  Security Group must allow only Glue's traffic, nothing else."
+
+→ Project 61: "Account A's MariaDB on EC2 Must Feed Account B's Redshift"
+→ Introduces: VPC Peering, Route Tables, Security Group cross-account
+   references, Glue JDBC Connection cross-VPC, network-level access
+→ Completes the Phase 4 cross-account toolkit:
+   Service-level (56-60) + Network-level (61)</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-59.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 60 of 80</span>
+    <span class="nav-project-title">GLUE IN ACCOUNT B EXTRACTS FROM ACCOUNT A&#x27;S S3, LOADS ACCOUNT B&#x27;S REDSHIFT</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-61.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-61.html") window.location = "project-61.html";
+  if (e.key === 'ArrowLeft' && "project-59.html") window.location = "project-59.html";
+});
+</script>
+</body>
+</html>

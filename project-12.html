@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 12: ALERT THE TEAM WHEN A PIPELINE FINISHES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:15%"></div></div>
+<div id="progress-label">15%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 12 of 80</div>
+  <div class="project-title">ALERT THE TEAM WHEN A PIPELINE FINISHES</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — data warehouse operational (Projects 10-11)
+</span>Situation:
+→ ETL pipeline runs every night at 2 AM
+→ Loads MariaDB data → S3 → Redshift staging → merge to analytics
+→ Takes 15-45 minutes depending on data volume
+
+MONDAY MORNING DISASTER:
+→ Data analyst opens dashboard at 9 AM
+→ Dashboard shows YESTERDAY's data — ETL didn't run
+→ Checks ETL logs: failed at 2:15 AM with "S3 Access Denied"
+→ IAM role permission was accidentally modified Friday afternoon
+→ Nobody knew for 7 HOURS
+→ Finance team sent wrong revenue numbers to CEO
+→ CEO is furious
+
+TEAM REACTIONS:
+
+Data Engineer (You):
+"If I had known at 2:15 AM, I could have fixed it in 10 minutes.
+ Instead, the entire company ran on stale data for half a day."
+
+On-Call Engineer:
+"I was awake at 2:15 AM. I could have fixed this immediately
+ if someone had TOLD me. But I had no idea the pipeline ran."
+
+Analyst:
+"I need to know BEFORE I open the dashboard whether the data
+ is fresh or stale. A simple email would have saved us."
+
+CTO:
+"Every pipeline must notify on success AND failure.
+ No exceptions. No silent failures. Ever again."
+
+REQUIREMENTS:
+→ Send email when pipeline SUCCEEDS (data team knows data is fresh)
+→ Send email + SMS when pipeline FAILS (on-call responds immediately)
+→ Different recipients for success vs failure
+→ Must work with any AWS service (Glue, Lambda, Step Functions, custom scripts)
+→ Cost: essentially free (SNS email is free, SMS &lt; $0.01/message)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the notification landscape on AWS
+</span>
+  OPTION 1: Amazon SNS (Simple Notification Service)
+  → Pub/sub messaging service
+  → Topics: named channels that messages are published to
+  → Subscriptions: who receives messages (email, SMS, SQS, Lambda, HTTP)
+  → Fan-out: one publish → multiple subscribers receive
+  → Cost: free for email, $0.50/million API calls
+
+  OPTION 2: Amazon SES (Simple Email Service)
+  → Full email service (send/receive)
+  → HTML templates, bulk sending
+  → Overkill for pipeline notifications
+
+  OPTION 3: Custom SMTP (send via Gmail, SendGrid)
+  → Requires managing credentials
+  → No native AWS integration
+  → Not recommended
+
+  OPTION 4: Slack/Teams webhooks
+  → Great for team chat notifications
+  → Can be an SNS HTTP subscriber
+  → Complementary to SNS, not a replacement
+
+  DECISION: Amazon SNS
+  → Native AWS integration with every service
+  → Multiple delivery protocols (email, SMS, SQS, Lambda)
+  → Fan-out pattern (one event → many recipients)
+  → Free tier: first 1,000 email notifications free
+
+Step 2: Design the notification architecture
+  → Topic 1: pipeline-success → email to data team
+  → Topic 2: pipeline-failure → email + SMS to on-call
+  → Publish from: Python scripts, Glue jobs, Step Functions
+  → Message format: structured JSON with pipeline details
+
+Step 3: Plan for future integration
+  → Project 14: SNS → SQS fan-out
+  → Project 17: S3 events → SNS notifications
+  → Project 28: Full pipeline with notifications
+  → Project 54: CloudWatch alarms → SNS
+  → Project 78: SLA monitoring with SNS escalation</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NOTIFICATION ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────────┐
+  │                    PUBLISHERS                            │
+  │                                                          │
+  │  Python Script  │  Glue Job  │  Step Functions  │  CW   │
+  │  (Project 21)   │ (Proj 32)  │  (Project 55)    │ Alarm │
+  └───────┬─────────┴─────┬──────┴────────┬─────────┴───┬───┘
+          │               │               │             │
+          ▼               ▼               ▼             ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │                  AMAZON SNS                              │
+  │                                                          │
+  │  ┌────────────────────────┐  ┌────────────────────────┐ │
+  │  │ Topic:                 │  │ Topic:                  │ │
+  │  │ quickcart-pipeline-    │  │ quickcart-pipeline-     │ │
+  │  │ success                │  │ failure                 │ │
+  │  │                        │  │                         │ │
+  │  │ Subscribers:           │  │ Subscribers:            │ │
+  │  │ ├── Email: data-team@  │  │ ├── Email: data-team@  │ │
+  │  │ ├── Email: analyst@    │  │ ├── Email: oncall@     │ │
+  │  │ └── SQS: audit-queue   │  │ ├── SMS: +1555123456  │ │
+  │  │     (Project 14)       │  │ └── SQS: alert-queue   │ │
+  │  └────────────────────────┘  └────────────────────────┘ │
+  └─────────────────────────────────────────────────────────┘
+          │               │               │             │
+          ▼               ▼               ▼             ▼
+  ┌──────────────┐ ┌──────────┐ ┌──────────────┐ ┌─────────┐
+  │ Email Inbox  │ │ SMS Phone│ │ SQS Queue    │ │ Lambda  │
+  │ data-team@   │ │ On-Call  │ │ (downstream  │ │(future) │
+  │ quickcart    │ │ Engineer │ │  processing) │ │         │
+  └──────────────┘ └──────────┘ └──────────────┘ └─────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Single topic for all notifications
+</span>→ One topic, all subscribers get everything (success + failure)
+→ Pros: simplest setup
+→ Cons: on-call gets 365 success emails/year they don't need
+→ Can use message filtering (Project 51) but adds complexity
+
+Option B: Separate topics for success vs failure (RECOMMENDED)
+→ quickcart-pipeline-success: data team only
+→ quickcart-pipeline-failure: on-call + data team
+→ Pros: clean separation, different subscriber lists
+→ Cons: must publish to correct topic based on outcome
+
+Option C: Single topic with filter policies
+→ One topic, subscribers filter by message attributes
+→ Pros: one topic to manage
+→ Cons: filter policy complexity, covered in Project 51
+
+Option D: EventBridge instead of SNS
+→ Event-driven routing with rules
+→ Pros: more flexible routing, content-based filtering
+→ Cons: overkill for simple notifications, covered in Project 66
+
+DECISION: Option B — separate topics
+→ Clear mental model: success topic vs failure topic
+→ Easy to add/remove subscribers per topic
+→ No filter complexity
+→ Extensible: add more topics later (warnings, SLA breaches)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create SEPARATE topics for different severity levels
+</span>   → success: informational — data team cares
+   → failure: critical — on-call must respond
+   → Future: warning (degraded but not failed)
+
+2. Use meaningful topic names with environment prefix
+   → quickcart-prod-pipeline-success
+   → quickcart-prod-pipeline-failure
+   → quickcart-dev-pipeline-failure (dev alerts go to dev team only)
+
+3. Require subscription CONFIRMATION
+   → SNS sends confirmation email/SMS
+   → Subscriber must click "Confirm" link
+   → Prevents spam — you can't subscribe random people
+
+4. Structure messages as JSON
+   → Include: pipeline_name, status, timestamp, duration, error_message
+   → Parseable by downstream systems (SQS consumers, Lambda)
+   → Human-readable subject line for email
+
+5. Add message attributes for filtering
+   → Attribute: severity = "info" | "warning" | "critical"
+   → Attribute: pipeline = "etl_daily" | "etl_hourly"
+   → Enables filter policies in Project 51
+
+6. Tag topics for cost tracking
+   → Environment=Production, Team=Data-Engineering
+   → SNS is cheap but tagging enables accountability
+
+7. Set delivery retry policy
+   → SNS retries failed deliveries (HTTP endpoints)
+   → Email: SNS handles retries internally
+   → SQS: guaranteed delivery (messages persist in queue)
+
+8. Test notifications BEFORE connecting to real pipelines
+   → Publish test message manually
+   → Verify all subscribers receive it
+   → Check spam folders (SNS emails sometimes land there initially)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT hardcode email addresses in application code
+</span>   → Subscribe via SNS — adding/removing subscribers needs no code change
+   → Application publishes to TOPIC ARN, not to email addresses
+   → Subscriber management is decoupled from publisher code
+
+2. DO NOT send raw error stack traces in notifications
+   → Include: error type, error message, pipeline name, timestamp
+   → Exclude: full stack trace (put that in CloudWatch Logs)
+   → On-call needs to know WHAT failed, not every line of code
+
+3. DO NOT subscribe personal phones to production failure topic
+   → Use a shared on-call number/email
+   → PagerDuty/OpsGenie integration is better for rotation
+   → Personal phone = single point of failure when that person is on vacation
+
+4. DO NOT create topics without encryption
+   → Enable SSE (Server-Side Encryption) with KMS
+   → Messages may contain pipeline details, error info
+   → Encryption at rest is a security best practice
+
+5. DO NOT publish synchronously in the critical path
+   → SNS publish is fast (~50ms) but not zero
+   → If pipeline has 1000 steps, don't publish after each step
+   → Publish ONCE at the end: success or failure
+
+6. DO NOT ignore subscription confirmation
+   → Unconfirmed subscriptions receive NOTHING
+   → Common mistake: create subscription, forget to confirm, wonder why no emails
+   → Check: aws sns list-subscriptions-by-topic → look for "PendingConfirmation"
+
+7. DO NOT use SNS for large payloads
+   → Max message size: 256 KB
+   → If you need to send large data: publish reference (S3 key) not data itself
+   → Pattern: "ETL output available at s3://bucket/path"</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────┬──────────────────┬──────────────────────────────────────────┐
+</span>│ Scenario                       │ Use              │ Why                                      │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Pipeline success/failure alert │ SNS Email/SMS    │ Simple, free, native AWS integration     │
+│                                │ (This Project)   │                                          │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Buffer messages for async      │ SQS              │ Persistent queue, consumer pulls at      │
+│ processing                     │ (Project 13)     │ own pace, no message loss                │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ One event → multiple consumers │ SNS → SQS        │ Fan-out: SNS publishes, multiple SQS     │
+│                                │ (Project 14)     │ queues receive                           │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Complex event routing based on │ EventBridge      │ Content-based rules, schedule triggers    │
+│ content                        │ (Project 66)     │                                          │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Team chat notifications        │ SNS → Lambda     │ Lambda formats and posts to Slack/Teams   │
+│ (Slack, Teams)                 │ → Webhook        │ webhook URL                              │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Rich HTML email with templates │ SES              │ Full email service, templates, tracking   │
+│                                │                  │ Overkill for pipeline alerts              │
+├────────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Metric-based alerting          │ CloudWatch Alarm │ CPU &gt; 80% → SNS → email                  │
+│ (CPU, disk, custom metrics)    │ → SNS (Proj 54)  │ Metric thresholds, not event-based        │
+└────────────────────────────────┴──────────────────┴──────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE SNS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When consumer needs to process messages at its own pace
+</span>   → SNS is PUSH-based: delivers immediately to all subscribers
+   → If consumer is down: email still delivered, but HTTP endpoint misses it
+   → Use: SQS (PULL-based) — messages persist until consumer reads them
+   → Best: SNS → SQS (fan-out + persistence) — Project 14
+
+2. When you need guaranteed exactly-once processing
+   → SNS delivers at-least-once (may deliver duplicates)
+   → Use: SQS FIFO for exactly-once processing
+
+3. When message payload &gt; 256 KB
+   → SNS max: 256 KB per message
+   → Use: S3 + SNS notification (store data in S3, send S3 key via SNS)
+
+4. When you need complex content-based routing
+   → SNS filter policies are limited to attribute matching
+   → Use: EventBridge for complex rules (Project 66)
+
+5. When you need bidirectional communication
+   → SNS is one-way: publisher → subscriber
+   → Use: SQS for request/response patterns
+   → Use: API Gateway + Lambda for synchronous request/response
+
+6. When you need to replay historical messages
+   → SNS doesn't store messages after delivery
+   → Use: Kinesis Data Streams (7-day retention, replay from any point)
+   → Or: SNS → SQS (SQS retains up to 14 days)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                    SNS INTERNAL ARCHITECTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  1. CORE CONCEPTS                                                           │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  TOPIC:                                                                     │
+│  → Named communication channel                                              │
+│  → Identified by ARN: arn:aws:sns:us-east-2:123456789012:my-topic          │
+│  → Publishers send messages TO topics                                       │
+│  → Topics have ZERO or more subscriptions                                   │
+│  → Topics do NOT store messages — they ROUTE them                           │
+│                                                                             │
+│  SUBSCRIPTION:                                                              │
+│  → Binds a PROTOCOL + ENDPOINT to a TOPIC                                  │
+│  → Protocols: email, email-json, sms, sqs, lambda, http, https             │
+│  → Each subscription has its own ARN                                        │
+│  → Must be CONFIRMED before receiving messages                              │
+│                                                                             │
+│  MESSAGE:                                                                   │
+│  → Published to a topic by a publisher                                      │
+│  → Contains: Subject, Body (message), MessageAttributes                    │
+│  → Max size: 256 KB                                                         │
+│  → Delivered to ALL confirmed subscriptions on the topic                   │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  2. PUBLISH FLOW (what happens when you call sns.publish())                │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Publisher                  SNS Service                  Subscribers         │
+│  ────────                  ───────────                  ───────────         │
+│      │                         │                             │              │
+│      │  publish(TopicArn,      │                             │              │
+│      │   Message, Subject,     │                             │              │
+│      │   MessageAttributes)    │                             │              │
+│      │ ───────────────────────&gt;│                             │              │
+│      │                         │                             │              │
+│      │  Response:              │  1. Validate message        │              │
+│      │  MessageId: "abc-123"   │  2. Check topic exists      │              │
+│      │ &lt;───────────────────────│  3. Check IAM permissions   │              │
+│      │                         │  4. Enumerate subscriptions  │              │
+│      │                         │                             │              │
+│      │                         │  For EACH subscription:     │              │
+│      │                         │  ┌──────────────────────┐   │              │
+│      │                         │  │ Check filter policy   │   │              │
+│      │                         │  │ If match OR no filter:│   │              │
+│      │                         │  │   Deliver message     │──&gt;│              │
+│      │                         │  │ If no match:          │   │              │
+│      │                         │  │   Skip (filtered out) │   │              │
+│      │                         │  └──────────────────────┘   │              │
+│      │                         │                             │              │
+│                                                                             │
+│  DELIVERY IS ASYNCHRONOUS:                                                  │
+│  → publish() returns immediately after SNS accepts message                  │
+│  → Actual delivery to subscribers happens in background                     │
+│  → Publisher does NOT wait for all subscribers to receive                    │
+│  → This is why publish() is fast (~50ms)                                    │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  3. DELIVERY PROTOCOLS — HOW EACH WORKS                                     │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  EMAIL:                                                                     │
+│  → SNS sends via Amazon SES infrastructure                                  │
+│  → Subject line = message Subject parameter                                │
+│  → Body = message Body parameter (plain text)                              │
+│  → From: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="640a0b49160114081d24170a174a0509051e0b0a0513174a070b09">[email&#160;protected]</a>                                         │
+│  → Delivery time: seconds to minutes                                       │
+│  → No retry tracking (email is fire-and-forget)                            │
+│  → Free: first 1,000 notifications/month                                   │
+│                                                                             │
+│  EMAIL-JSON:                                                                │
+│  → Same as email but body is raw JSON envelope                             │
+│  → Includes: MessageId, TopicArn, Subject, Message, Timestamp             │
+│  → Useful for automated email processing                                   │
+│                                                                             │
+│  SMS:                                                                       │
+│  → SNS sends via SMS gateway                                               │
+│  → Max 160 characters (SMS limit)                                          │
+│  → Message truncated if longer                                             │
+│  → Cost: $0.00645 per message (US)                                         │
+│  → Delivery: seconds                                                       │
+│  → Types: Promotional (cheaper) vs Transactional (reliable)                │
+│                                                                             │
+│  SQS:                                                                       │
+│  → SNS writes message directly into SQS queue                              │
+│  → Guaranteed delivery (SQS persists until consumed)                       │
+│  → No confirmation needed — SQS subscription auto-confirmed               │
+│  → This is the SNS → SQS fan-out pattern (Project 14)                     │
+│                                                                             │
+│  LAMBDA:                                                                    │
+│  → SNS invokes Lambda function with message as event                       │
+│  → Synchronous invocation — SNS waits for Lambda response                  │
+│  → Retry: 3 attempts on failure                                            │
+│  → Use for: custom notification formatting, Slack webhooks                 │
+│                                                                             │
+│  HTTP/HTTPS:                                                                │
+│  → SNS sends HTTP POST to specified URL                                    │
+│  → Expects 200 response for success                                        │
+│  → Retry policy: 3 retries immediately, then exponential backoff           │
+│  → Total retry period: up to 1 hour                                        │
+│  → Use for: webhooks, external systems                                     │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  4. SUBSCRIPTION CONFIRMATION                                               │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  EMAIL/HTTP subscriptions require confirmation:                             │
+│  1. Subscribe request sent to SNS                                           │
+│  2. SNS sends confirmation message to endpoint                             │
+│     Email: link in email body                                              │
+│     HTTP: POST with SubscribeURL in body                                   │
+│  3. Subscriber clicks link or GETs the SubscribeURL                        │
+│  4. Subscription status changes: PendingConfirmation → Confirmed           │
+│  5. Only CONFIRMED subscriptions receive messages                          │
+│                                                                             │
+│  AUTO-CONFIRMED (no confirmation needed):                                   │
+│  → SQS subscriptions (same AWS account)                                    │
+│  → Lambda subscriptions                                                     │
+│  → Cross-account SQS needs queue policy (Project 59)                       │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  5. MESSAGE STRUCTURE                                                       │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  What you PUBLISH:                                                          │
+│  {                                                                          │
+│    "TopicArn": "arn:aws:sns:us-east-2:123:quickcart-pipeline-success",    │
+│    "Subject": "✅ ETL Pipeline Succeeded",                                 │
+│    "Message": "{\"pipeline\":\"daily_etl\",\"status\":\"success\"...}",    │
+│    "MessageAttributes": {                                                   │
+│      "severity": {"DataType":"String", "StringValue":"info"},              │
+│      "pipeline": {"DataType":"String", "StringValue":"daily_etl"}          │
+│    }                                                                        │
+│  }                                                                          │
+│                                                                             │
+│  What EMAIL subscriber receives:                                            │
+│  Subject: ✅ ETL Pipeline Succeeded                                        │
+│  Body: {"pipeline":"daily_etl","status":"success"...}                      │
+│                                                                             │
+│  What SQS subscriber receives (wrapped in SNS envelope):                   │
+│  {                                                                          │
+│    "Type": "Notification",                                                  │
+│    "MessageId": "abc-123-def",                                             │
+│    "TopicArn": "arn:aws:sns:...",                                          │
+│    "Subject": "✅ ETL Pipeline Succeeded",                                 │
+│    "Message": "{\"pipeline\":\"daily_etl\"...}",                           │
+│    "Timestamp": "2025-07-15T02:45:00.000Z",                               │
+│    "MessageAttributes": {...}                                               │
+│  }                                                                          │
+│  → SQS consumer must parse the outer SNS envelope                          │
+│  → Then parse the inner Message JSON                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Subscribed but never receive messages"
+</span>→ Cause #1: Subscription not confirmed — still "PendingConfirmation"
+→ Fix: check email (including spam folder) for confirmation link
+→ Cause #2: filter policy doesn't match message attributes
+→ Fix: verify filter policy matches published attributes exactly
+→ Debug: aws sns list-subscriptions-by-topic --topic-arn &lt;arn&gt;
+
+PITFALL 2: "Email goes to spam folder"
+→ Cause: SNS sends from <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="593736742b3c293520192a372a77383438233637382e2a773a3634">[email&#160;protected]</a>
+→ Some email providers flag this as spam
+→ Fix: add <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="2d4342005f485d41546d5e435e034c404c5742434c5a5e034e4240">[email&#160;protected]</a> to contacts/safe senders
+→ Fix: use SES with custom domain for branded emails (overkill for alerts)
+
+PITFALL 3: "SMS not received"
+→ Cause #1: account in SMS sandbox (default for new accounts)
+→ Fix: request production SMS access via AWS Support
+→ Cause #2: phone number format wrong (must include country code)
+→ Fix: use E.164 format: +15551234567 (not 555-123-4567)
+→ Cause #3: spending limit reached ($1/month default)
+→ Fix: increase SMS spending limit in SNS settings
+
+PITFALL 4: "Published message but publish() returned error"
+→ Cause: IAM user/role lacks sns:Publish permission
+→ Fix: add policy with sns:Publish on the topic ARN
+→ Debug: check IAM Policy Simulator
+
+PITFALL 5: "Message body is empty in email"
+→ Cause: published with Message="" (empty string)
+→ SNS accepts empty messages — no validation
+→ Fix: always validate message content before publishing
+
+PITFALL 6: "Cross-account publish fails"
+→ Cause: topic doesn't have resource policy allowing other account
+→ Fix: add topic policy allowing sns:Publish from other account
+→ Covered in detail in Project 59
+
+PITFALL 7: "Getting duplicate notifications"
+→ Cause: SNS delivers at-least-once — duplicates are possible
+→ For email: minor annoyance
+→ For SQS: consumer must handle idempotency
+→ For Lambda: use idempotency key in message</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SNS LIMITS:
+</span>→ Topics per account: 100,000
+→ Subscriptions per topic: 12,500,000
+→ Messages per second per topic: 30,000 (default, can increase)
+→ Message size: 256 KB max
+→ QuickCart: 2 topics × ~10 messages/day = trivially within limits
+
+COST AT SCALE:
+→ First 1,000 email notifications: FREE
+→ After: $2 per 100,000 emails
+→ SMS: $0.00645 per message (US)
+→ HTTP/HTTPS: $0.60 per million
+→ SNS → SQS: free (same account)
+→ QuickCart: ~$0/month (well within free tier)
+
+SCALING PATTERNS:
+→ 1-10 pipelines: 2 topics (success/failure) is fine
+→ 10-50 pipelines: consider per-pipeline topics or filter policies
+→ 50+ pipelines: use filter policies (Project 51) or EventBridge (Project 66)
+→ Multi-account: cross-account topic policies (Project 59)
+
+HIGH-VOLUME NOTIFICATIONS:
+→ If publishing 1000+ messages/second:
+   → SNS handles it (30K msg/sec default)
+   → But email subscribers get overwhelmed
+   → Use SQS subscriber → batch digest Lambda → single daily email
+→ QuickCart: nowhere near this — maybe 10 notifications/day</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY SNS IS WORKING:
+</span>
+1. List topics:
+   → aws sns list-topics
+   → Verify your topics exist
+
+2. List subscriptions:
+   → aws sns list-subscriptions-by-topic --topic-arn &lt;arn&gt;
+   → Check: SubscriptionArn is NOT "PendingConfirmation"
+   → If pending: subscriber hasn't confirmed yet
+
+3. Publish test message:
+   → aws sns publish --topic-arn &lt;arn&gt; --subject "Test" --message "Test body"
+   → Should return MessageId
+   → Check subscriber's inbox
+
+4. CloudWatch metrics for SNS:
+   → NumberOfMessagesPublished
+   → NumberOfNotificationsDelivered
+   → NumberOfNotificationsFailed
+   → Set alarm on NumberOfNotificationsFailed &gt; 0
+
+5. Delivery status logging (for SQS/Lambda/HTTP):
+   → Enable in topic delivery status settings
+   → Logs to CloudWatch: success/failure per delivery
+   → Not available for email (no delivery tracking)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(12)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create SNS Topics</h3>
+
+<h3>Step 2: Subscribe Endpoints to Topics</h3>
+
+<h3>Step 3: Publish Notifications (Reusable Module)</h3>
+
+<h3>Step 4: Integration Example — Wrapping Any Pipeline</h3>
+
+<h3>Step 5: Management Utilities</h3>
+
+<h3>Step 6: Cleanup / Teardown Script</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Prerequisites:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → AWS account with SNS permissions</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → boto3 installed (from Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Valid email addresses for testing</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create SNS topics</span><span>
+</span>python3 01_create_topics.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Subscribe endpoints (email, SMS)</span><span>
+</span>python3 02_subscribe_endpoints.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. ⚠️ CHECK EMAIL — confirm subscriptions!</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Look for emails from <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="741a1b59061104180d34071a075a1519150e1b1a1503075a171b19">[email&#160;protected]</a></span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Click "Confirm subscription" link in each email</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Check spam folders if not in inbox</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Verify subscriptions are confirmed</span><span>
+</span>python3 05_manage_subscriptions.py list
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Send test notifications</span><span>
+</span><span>python3 05_manage_subscriptions.py </span><span class="token builtin" style="color: rgb(43, 145, 175);">test</span><span> success
+</span><span>python3 05_manage_subscriptions.py </span><span class="token builtin" style="color: rgb(43, 145, 175);">test</span><span> failure
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Run demo with all notification types</span><span>
+</span>python3 03_publish_notification.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Run pipeline with integrated notifications</span><span>
+</span>python3 04_pipeline_with_notifications.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (run multiple times — ~30% chance of simulated failure)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Check delivery statistics</span><span>
+</span>python3 05_manage_subscriptions.py stats
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 9. View topic details</span><span>
+</span>python3 05_manage_subscriptions.py details success
+python3 05_manage_subscriptions.py details failure</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED EMAIL OUTPUT (Success):
+</span>
+From: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="3c5253114e594c50457c4f524f125d515d4653525d4b4f125f5351">[email&#160;protected]</a>
+Subject: ✅ daily_etl_mariadb_to_redshift SUCCEEDED (14m) — 523,847 rows
+
+{
+  "pipeline_name": "daily_etl_mariadb_to_redshift",
+  "status": "SUCCESS",
+  "timestamp": "2025-07-15T02:59:47.123456+00:00",
+  "environment": "production",
+  "duration_seconds": 847,
+  "duration_human": "14m 7s",
+  "rows_processed": 523847,
+  "details": {
+    "tables_loaded": ["fact_orders", "fact_order_items", "dim_customers"],
+    "staging_rows": {"stg_orders": 12500, "stg_items": 37500},
+    "scd2_changes": {"new": 15, "changed": 8, "unchanged": 477},
+    "redshift_cluster": "quickcart-analytics"
+  }
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EXPECTED EMAIL OUTPUT (Failure):
+
+From: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="3f5150124d5a4f53467f4c514c115e525e4550515e484c115c5052">[email&#160;protected]</a>
+Subject: 🔴 daily_etl_mariadb_to_redshift FAILED — Access Denied: Role Redsh...
+
+{
+  "pipeline_name": "daily_etl_mariadb_to_redshift",
+  "status": "FAILURE",
+  "timestamp": "2025-07-15T02:15:23.456789+00:00",
+  "environment": "production",
+  "error_message": "Access Denied: Role RedshiftS3AccessRole cannot access s3://quickcart-raw-data-prod/staging/",
+  "error_type": "ClientError",
+  "details": {
+    "failed_step": "COPY stg_orders FROM S3",
+    "failed_at": "2025-07-15T02:15:23Z",
+    "last_successful_run": "2025-07-14T02:45:00Z",
+    "action_required": "Check IAM role permissions for Redshift"
+  }
+}
+
+EXPECTED SMS OUTPUT (Failure):
+
+From: QuickCart
+🔴 daily_etl_mariadb_to_redshift FAILED — Access Denied: Role RedshiftS3Ac...</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED MANAGEMENT OUTPUT:
+</span>
+================================================================
+📋 ALL SNS SUBSCRIPTIONS
+================================================================
+
+📌 Topic: success
+   ARN: arn:aws:sns:us-east-2:123456789012:quickcart-prod-pipeline-success
+
+   Status       Protocol   Endpoint                                 ARN (last 20)
+   -------------------------------------------------------------------------------------
+   ✅ ACTIVE    email      <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="d5b1b4a1b4f8a1b0b4b895a4a0bcb6beb6b4a7a1fbb6bab8">[email&#160;protected]</a>                  ...ipeline-success:abc
+   ✅ ACTIVE    email      <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="aacbc4cbc6d3d9deeadbdfc3c9c1c9cbd8de84c9c5c7">[email&#160;protected]</a>                    ...ipeline-success:def
+
+📌 Topic: failure
+   ARN: arn:aws:sns:us-east-2:123456789012:quickcart-prod-pipeline-failure
+
+   Status       Protocol   Endpoint                                 ARN (last 20)
+   -------------------------------------------------------------------------------------
+   ✅ ACTIVE    email      <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="f692978297db8293979bb687839f959d95978482d895999b">[email&#160;protected]</a>                  ...ipeline-failure:ghi
+   ✅ ACTIVE    email      <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="a8c7c6cbc9c4c4e8d9ddc1cbc3cbc9dadc86cbc7c5">[email&#160;protected]</a>                     ...ipeline-failure:jkl
+   ✅ ACTIVE    sms        +15551234567                             ...ipeline-failure:mno</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SNS is a PUB/SUB messaging service — publishers don't know subscribers
+→ TOPICS: named channels that route messages to subscribers
+→ SUBSCRIPTIONS: bind protocol + endpoint to a topic
+   → Email, SMS, SQS, Lambda, HTTP — all supported
+   → Email/HTTP require CONFIRMATION before receiving messages
+   → SQS/Lambda are auto-confirmed (same account)
+→ MESSAGE ATTRIBUTES: metadata for filtering (Project 51)
+→ SEPARATE TOPICS for different severity levels
+   → success → data team (informational)
+   → failure → on-call (critical, requires response)
+→ NOTIFICATION FAILURES SHOULD NEVER CRASH THE PIPELINE
+   → Wrap publish in try/except
+   → Log the failure but continue pipeline execution
+→ STRUCTURED JSON messages enable machine processing
+   → Email subscribers read the JSON
+   → SQS consumers parse and route
+   → Lambda functions process and format
+
+THE PATTERN (used in every subsequent project):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    notifier = PipelineNotifier()
+    try:
+        result = run_pipeline()
+        notifier.notify_success(pipeline_name, ...)
+    except Exception as e:
+        notifier.notify_failure(pipeline_name, error_message=str(e))
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): topic policy allows S3 event notifications
+→ Projects 10-11 (Redshift): ETL pipelines trigger notifications
+→ Project 7 (IAM): publish requires sns:Publish permission
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 13 (SQS): buffer messages for async processing
+→ Project 14 (SNS → SQS Fan-out): one event → multiple consumers
+→ Project 17 (S3 → SNS): file arrival triggers notification
+→ Project 28 (End-to-end): S3 → SNS → SQS → EC2 consumer → notify
+→ Project 51 (Message Filtering): route different messages to different queues
+→ Project 54 (CloudWatch → SNS): metric alarms trigger notifications
+→ Project 78 (SLA Monitoring): SNS escalation chains</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has automated pipeline notifications:
+</span>→ Success emails confirm data freshness every morning
+→ Failure alerts page the on-call engineer immediately
+→ No more silent failures — the Monday morning disaster can't repeat
+
+BUT the data engineer notices a problem:
+"SNS delivers messages IMMEDIATELY to all subscribers.
+ What if a subscriber is temporarily down?
+ What if we need to PROCESS messages, not just display them?
+ What if messages arrive faster than the consumer can handle?
+
+ Example: S3 file arrival triggers SNS notification.
+ A Python processor on EC2 needs to handle each file.
+ If 100 files arrive in 1 minute and the processor takes 
+ 30 seconds per file — we lose 97 messages because SNS 
+ doesn't WAIT for the consumer.
+
+ We need a QUEUE — a buffer between producer and consumer."
+
+→ Project 13: "Buffer Incoming Messages So No Data Is Lost"
+→ Introduces: Amazon SQS → Standard vs FIFO → 
+   Visibility Timeout → Retention → Long Polling
+→ SQS is the complement to SNS: SNS pushes, SQS buffers
+→ Together (Project 14): SNS → SQS = fan-out + guaranteed delivery</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-11.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 12 of 80</span>
+    <span class="nav-project-title">ALERT THE TEAM WHEN A PIPELINE FINISHES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-13.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-13.html") window.location = "project-13.html";
+  if (e.key === 'ArrowLeft' && "project-11.html") window.location = "project-11.html";
+});
+</script>
+</body>
+</html>

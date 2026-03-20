@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 4: OLD REPORTS MUST MOVE TO CHEAPER STORAGE AFTER 90 DAYS — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:5%"></div></div>
+<div id="progress-label">5%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 4 of 80</div>
+  <div class="project-title">OLD REPORTS MUST MOVE TO CHEAPER STORAGE AFTER 90 DAYS</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 9 months old
+</span>Current S3 State:
+→ Bucket: quickcart-raw-data-prod
+→ Total size: ~50 GB across 800+ files
+→ All stored in S3 STANDARD ($0.023/GB/month)
+→ Monthly S3 cost: $1.15 (seems small)
+
+Data Access Analysis (S3 Storage Lens report):
+→ Files 0-7 days old:   accessed 10-20 times/week    (HOT)
+→ Files 8-30 days old:  accessed 2-3 times/month     (WARM)
+→ Files 31-90 days old: accessed 0-1 times/month     (COOL)
+→ Files 90+ days old:   accessed 0 times in 90 days  (COLD)
+→ Files 365+ days old:  NEVER accessed, kept for compliance (ARCHIVE)
+
+CFO's 2-Year Projection:
+→ Year 1: ~22 GB/year of new data
+→ Year 2: ~50 GB/year (business growing)
+→ Total by end of Year 2: ~120 GB
+→ Cost at Standard: 120 GB × $0.023 = $2.76/month
+→ "Seems cheap NOW — but at 10 TB it's $230/month for mostly dead data"
+
+CTO: "Set up automatic cost optimization — old files should
+      move to cheaper storage without anyone noticing"
+
+Compliance: "We must keep ALL files for 7 years minimum"
+Finance: "But we shouldn't pay premium rates for 7 years of dead data"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand S3 Storage Classes (the pricing tiers)
+</span>→ S3 is NOT one storage system — it's 7 different systems
+→ Each optimized for different access patterns
+→ Same API (GetObject, PutObject) works across all classes
+→ Difference: price per GB, retrieval cost, retrieval time, minimum duration
+
+Step 2: Map access patterns to storage classes
+→ HOT (0-7 days):      S3 Standard         — $0.023/GB, instant access
+→ WARM (8-30 days):     S3 Standard-IA      — $0.0125/GB, instant access
+→ COOL (31-90 days):    S3 Glacier IR       — $0.004/GB, instant access
+→ COLD (90-365 days):   S3 Glacier Flexible — $0.0036/GB, 3-5 hour retrieval
+→ ARCHIVE (365+ days):  S3 Glacier Deep     — $0.00099/GB, 12 hour retrieval
+
+Step 3: Calculate savings
+→ Without transitions: 120 GB × $0.023 = $2.76/month
+→ With transitions: ~$0.65/month (76% savings)
+→ At 10 TB: $230/month → $55/month (same percentage)
+
+Step 4: Implement lifecycle rules for CURRENT versions
+→ Project 2 handled NON-CURRENT versions (old versions after overwrite)
+→ This project handles CURRENT versions (active files aging out)
+→ BOTH rules work together on the same bucket</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+FILE LIFECYCLE TIMELINE:
+
+Day 0                  Day 30               Day 90              Day 365           Day 2555 (7 years)
+  │                      │                    │                   │                   │
+  ▼                      ▼                    ▼                   ▼                   ▼
+┌──────────┐      ┌─────────────┐      ┌────────────┐    ┌──────────────┐    ┌──────────────┐
+│ STANDARD │ ───→ │ STANDARD-IA │ ───→ │ GLACIER IR │──→ │   GLACIER    │──→ │ GLACIER DEEP │
+│ $0.023   │      │ $0.0125     │      │ $0.004     │    │ FLEXIBLE     │    │ ARCHIVE      │
+│ /GB/mo   │      │ /GB/mo      │      │ /GB/mo     │    │ $0.0036/GB   │    │ $0.00099/GB  │
+│          │      │             │      │            │    │              │    │              │
+│ Instant  │      │ Instant     │      │ Instant    │    │ 3-5 hours    │    │ 12 hours     │
+│ access   │      │ access      │      │ access     │    │ retrieval    │    │ retrieval    │
+│          │      │             │      │            │    │              │    │              │
+│ No min   │      │ 30 day min  │      │ 90 day min │    │ 90 day min   │    │ 180 day min  │
+│ duration │      │ 128KB min   │      │ 128KB min  │    │              │    │              │
+└──────────┘      └─────────────┘      └────────────┘    └──────────────┘    └──────────────┘
+     │                                                                              │
+     │                                                                              │
+     └──────────── total journey: 7 years ──────────────────────────────────────────┘
+                                                                                    │
+                                                                               EXPIRE (delete)
+                                                                               after 2555 days
+
+ALSO RUNNING (from Project 2):
+→ Non-current versions: Standard → S3-IA (30d) → Glacier IR (60d) → DELETE (90d)
+→ Delete markers: auto-cleaned when orphaned
+→ Incomplete multipart: aborted after 7 days</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Manual Transitions via API
+</span>→ Change storage class by copying object with new StorageClass parameter
+→ Works but requires scripting, scheduling, tracking
+→ Does not scale — must track every file individually
+
+Option B: Lifecycle Rules (RECOMMENDED)
+→ S3 evaluates rules daily — automatic, zero maintenance
+→ Handles transitions AND expirations
+→ Can target by prefix, tag, or entire bucket
+→ Set it once, works forever
+
+Option C: S3 Intelligent Tiering
+→ S3 automatically moves objects between tiers based on access patterns
+→ No lifecycle rules needed — fully automatic
+→ Small monthly monitoring fee: $0.0025 per 1000 objects
+→ Best for: unpredictable access patterns
+→ Limitation: doesn't cover Glacier Flexible or Deep Archive
+
+Option D: Combination — Lifecycle + Intelligent Tiering
+→ Use Intelligent Tiering for 0-90 day window (unpredictable access)
+→ Use lifecycle to transition to Glacier Flexible after 90 days (predictable)
+→ Use lifecycle to transition to Deep Archive after 365 days (predictable)
+→ Most cost-effective for mixed patterns
+
+DECISION: Option B for QuickCart (predictable patterns)
+→ We KNOW files are hot for 7 days, warm for 30, cold after 90
+→ Lifecycle rules are cheaper than IT monitoring fee for known patterns
+→ We'll also demonstrate Option C for interview knowledge</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Analyze ACTUAL access patterns before choosing tiers
+</span>   → S3 Storage Lens: free dashboard showing access frequency
+   → S3 Analytics — Storage Class Analysis: recommends transitions
+   → Don't guess — data-driven decisions
+
+2. Understand MINIMUM storage duration charges
+   → S3-IA: minimum 30 days (delete at day 15 = still charged for 30)
+   → Glacier IR: minimum 90 days
+   → Glacier Flexible: minimum 90 days
+   → Glacier Deep Archive: minimum 180 days
+   → Transition ONLY when object will stay long enough to justify
+
+3. Understand MINIMUM object size charges
+   → S3-IA: objects &lt; 128KB are charged as 128KB
+   → Glacier IR: objects &lt; 128KB are charged as 128KB
+   → Small files (&lt; 128KB) may COST MORE in IA/Glacier than Standard
+   → QuickCart's files are 2-50MB — no issue here
+
+4. Account for RETRIEVAL costs
+   → S3 Standard: $0.00 per GB retrieved
+   → S3-IA: $0.01 per GB retrieved
+   → Glacier IR: $0.03 per GB retrieved
+   → Glacier Flexible (standard): $0.01 per GB + 3-5 hour wait
+   → Glacier Deep Archive: $0.02 per GB + 12 hour wait
+   → If files are retrieved frequently, savings evaporate
+
+5. Set up S3 Storage Lens BEFORE implementing transitions
+   → Baseline current access patterns
+   → Monitor after transitions to verify cost savings
+   → Required evidence for CFO's cost report
+
+6. Use TAGS in lifecycle rules for different data categories
+   → Tag: retention=7years → transition to Deep Archive after 365 days
+   → Tag: retention=1year → delete after 365 days
+   → More flexible than prefix-based rules alone
+
+7. Test retrieval from each tier BEFORE a real emergency
+   → Glacier Flexible restore takes 3-5 hours — know this BEFORE you need data
+   → Deep Archive restore takes 12 hours — plan ahead
+   → Same lesson as Project 2: test recovery before disaster</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT transition tiny files to S3-IA or Glacier
+</span>   → Files &lt; 128KB are charged as 128KB in IA/Glacier
+   → A 1KB file in S3-IA costs MORE than in Standard
+   → Rule of thumb: only transition files &gt; 128KB
+   → Use lifecycle rule filter with ObjectSizeGreaterThan
+
+2. DO NOT transition files that are still being accessed
+   → S3-IA retrieval: $0.01/GB
+   → File retrieved 10 times/month × 50MB = $0.50/month retrieval
+   → Standard storage for same file: $0.00115/month
+   → Retrieval cost &gt;&gt; storage savings = net LOSS
+
+3. DO NOT skip minimum duration calculation
+   → Transition to Glacier IR (90-day minimum) on day 31
+   → Delete the file on day 45
+   → Charged for FULL 90 days of Glacier IR storage
+   → Plus: early deletion fee in some tiers
+
+4. DO NOT use Glacier for data that needs instant access
+   → Glacier Flexible: 3-5 HOURS to retrieve (expedited: 1-5 minutes at $$$)
+   → Deep Archive: 12 HOURS minimum
+   → If dashboard query needs this data → use Glacier IR (millisecond access)
+
+5. DO NOT create conflicting lifecycle rules
+   → Rule A: transition to S3-IA after 30 days
+   → Rule B: transition to Standard-IA after 60 days
+   → These conflict — S3 uses the EARLIEST matching rule
+   → Keep transitions in one rule with clear progression
+
+6. DO NOT forget the "waterfall" restriction
+   → Transitions must go "downward" in the storage class hierarchy
+   → Standard → S3-IA → Glacier IR → Glacier Flexible → Deep Archive
+   → CANNOT go backward: Glacier → Standard via lifecycle
+   → To go backward: must RESTORE then COPY (manual process)
+
+7. DO NOT apply Intelligent Tiering to files with known access patterns
+   → IT charges $0.0025 per 1000 objects/month for monitoring
+   → If you KNOW the pattern → lifecycle rules are cheaper
+   → IT is for UNPREDICTABLE patterns only</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────┬────────────────┬───────────┬──────────────┬──────────────────────────┐
+</span>│ Storage Class           │ Price /GB/mo   │ Retrieval │ Access Time  │ Best For                 │
+│                         │                │ Cost /GB  │              │                          │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Standard             │ $0.023         │ $0.000    │ Milliseconds │ Frequently accessed,     │
+│                         │                │           │              │ active pipeline data     │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Intelligent Tiering  │ $0.023-$0.004  │ $0.000    │ Milliseconds │ Unpredictable access     │
+│                         │ (auto-managed) │           │              │ patterns                 │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Standard-IA          │ $0.0125        │ $0.010    │ Milliseconds │ Infrequent but needs     │
+│ (Infrequent Access)     │                │           │              │ instant access           │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 One Zone-IA          │ $0.010         │ $0.010    │ Milliseconds │ Reproducible data,       │
+│                         │                │           │              │ not critical             │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Glacier Instant      │ $0.004         │ $0.030    │ Milliseconds │ Rarely accessed but      │
+│ Retrieval               │                │           │              │ needs instant when needed│
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Glacier Flexible     │ $0.0036        │ $0.010    │ 1-5 min      │ Backup, compliance,      │
+│ Retrieval               │                │ (std)     │ to 3-5 hours │ rarely retrieved         │
+├─────────────────────────┼────────────────┼───────────┼──────────────┼──────────────────────────┤
+│ S3 Glacier Deep Archive │ $0.00099       │ $0.020    │ 12-48 hours  │ 7-year compliance,       │
+│                         │                │           │              │ never/almost-never read  │
+└─────────────────────────┴────────────────┴───────────┴──────────────┴──────────────────────────┘
+
+QUICKCART DECISION MATRIX:
+┌────────────────────────────┬───────────────────────┬───────────────────────────────────┐
+│ Data Age                   │ Storage Class         │ Reasoning                         │
+├────────────────────────────┼───────────────────────┼───────────────────────────────────┤
+│ 0-30 days (current data)   │ Standard              │ Active queries, pipeline reads    │
+│ 30-90 days (recent data)   │ Standard-IA           │ Rare access, instant when needed  │
+│ 90-365 days (old data)     │ Glacier IR            │ Almost never accessed, instant OK │
+│ 365+ days (archive data)   │ Glacier Flexible      │ Compliance hold, 3-5hr retrieval  │
+│ 7 years (compliance done)  │ EXPIRE (delete)       │ No longer legally required        │
+└────────────────────────────┴───────────────────────┴───────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use S3-IA for objects accessed more than once per month
+</span>   → Breakeven: storage savings must exceed retrieval cost
+   → 50MB file: Standard = $0.00115/mo, S3-IA = $0.000625/mo + $0.0005/retrieval
+   → 1 retrieval/month: S3-IA wins by $0.0000250
+   → 3 retrievals/month: S3-IA LOSES by $0.000875
+   → Rule: &lt; 1 access/month → S3-IA; otherwise → Standard
+
+2. DO NOT use Glacier Flexible for data needed within minutes
+   → Standard retrieval: 3-5 hours
+   → Expedited retrieval: 1-5 minutes BUT costs $10 per 1000 requests + $0.03/GB
+   → If you need sub-minute access → use Glacier IR or S3-IA
+
+3. DO NOT use Glacier Deep Archive for data needed within hours
+   → Standard retrieval: 12 hours
+   → Bulk retrieval: 48 hours
+   → No expedited option
+   → Only for true archive: compliance, legal hold, historical backup
+
+4. DO NOT use S3 One Zone-IA for critical/irreplaceable data
+   → Stored in SINGLE Availability Zone (not 3+ like other classes)
+   → If that AZ has hardware failure → data LOST
+   → Use for: derived data, reproducible data, cached results
+   → NOT for: source data, compliance data, anything irreplaceable
+
+5. DO NOT use Intelligent Tiering for short-lived objects
+   → Objects deleted within 30 days never benefit from auto-tiering
+   → Monitoring fee paid regardless
+   → Use Standard + lifecycle expiration for transient data</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│               S3 STORAGE CLASSES — INTERNAL MECHANICS                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHYSICAL REALITY BEHIND STORAGE CLASSES:                                   │
+│                                                                             │
+│  S3 Standard:                                                               │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → Data stored across ≥ 3 Availability Zones              │               │
+│  │ → Stored on high-performance SSDs/HDDs                    │               │
+│  │ → Index kept in hot memory for instant lookups            │               │
+│  │ → Designed for 99.99% availability                        │               │
+│  │ → Designed for 99.999999999% (11 nines) durability        │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 Standard-IA:                                                            │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → SAME physical infrastructure as Standard                │               │
+│  │ → SAME 3+ AZ replication, same durability                 │               │
+│  │ → Lower storage price BUT per-GB retrieval fee            │               │
+│  │ → AWS trades: lower storage revenue for retrieval revenue │               │
+│  │ → 99.9% availability (slightly lower SLA)                 │               │
+│  │ → 128KB minimum object charge                             │               │
+│  │ → 30-day minimum storage charge                           │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 One Zone-IA:                                                            │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → Data stored in SINGLE Availability Zone                 │               │
+│  │ → 20% cheaper than Standard-IA                            │               │
+│  │ → Same durability WITHIN that AZ (11 nines)               │               │
+│  │ → BUT: if the AZ is destroyed → data GONE                │               │
+│  │ → 99.5% availability                                      │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 Glacier Instant Retrieval:                                              │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → Same 3+ AZ replication as Standard                      │               │
+│  │ → Millisecond access (same as Standard)                   │               │
+│  │ → 68% cheaper than Standard                               │               │
+│  │ → Higher retrieval fee: $0.03/GB                          │               │
+│  │ → 90-day minimum storage charge                           │               │
+│  │ → 128KB minimum object charge                             │               │
+│  │ → Ideal for: once-per-quarter access patterns             │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 Glacier Flexible Retrieval:                                             │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → Data moved to DIFFERENT physical infrastructure         │               │
+│  │ → Stored on magnetic tape-like systems (high density)     │               │
+│  │ → Index exists but data must be RESTORED before access    │               │
+│  │ → RESTORE process:                                        │               │
+│  │   1. You call RestoreObject API                           │               │
+│  │   2. S3 reads from archive storage                        │               │
+│  │   3. Creates TEMPORARY copy in S3 Standard                │               │
+│  │   4. Copy available for N days (you specify)              │               │
+│  │   5. After N days, temporary copy auto-deleted            │               │
+│  │   6. Archive copy remains in Glacier                      │               │
+│  │                                                           │               │
+│  │ Retrieval tiers:                                          │               │
+│  │   Expedited: 1-5 minutes   ($0.03/GB + $10/1000 req)     │               │
+│  │   Standard:  3-5 hours     ($0.01/GB + $0.05/1000 req)   │               │
+│  │   Bulk:      5-12 hours    ($0.0025/GB + $0.025/1000 req)│               │
+│  │                                                           │               │
+│  │ → 90-day minimum storage charge                           │               │
+│  │ → Cannot read object directly — MUST restore first        │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 Glacier Deep Archive:                                                   │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ → Cheapest storage in AWS: $0.00099/GB/month              │               │
+│  │ → Physically: offline/near-offline magnetic tape           │               │
+│  │ → Restore times:                                          │               │
+│  │   Standard: 12 hours                                      │               │
+│  │   Bulk: 48 hours                                          │               │
+│  │   NO expedited option                                     │               │
+│  │ → 180-day minimum storage charge                          │               │
+│  │ → Designed for: 7-10 year retention, compliance archives  │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  S3 Intelligent Tiering — AUTO-MANAGEMENT:                                  │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ S3 monitors access patterns PER OBJECT and auto-moves:    │               │
+│  │                                                           │               │
+│  │ ┌─────────────────┐  no access   ┌──────────────────┐    │               │
+│  │ │ Frequent Access  │───30 days──→ │ Infrequent Access│    │               │
+│  │ │ (Standard price) │              │ (IA price)       │    │               │
+│  │ └─────────────────┘              └──────────────────┘    │               │
+│  │        ▲                                │                 │               │
+│  │        │ accessed                       │ no access       │               │
+│  │        │ once                           │ 90 days         │               │
+│  │        │                                ▼                 │               │
+│  │        │                    ┌─────────────────────┐       │               │
+│  │        └────────────────────│ Archive Instant     │       │               │
+│  │                             │ (Glacier IR price)  │       │               │
+│  │                             └─────────────────────┘       │               │
+│  │                                         │                 │               │
+│  │                                         │ no access       │               │
+│  │                                         │ 180 days        │               │
+│  │                                         ▼                 │               │
+│  │                             ┌─────────────────────┐       │               │
+│  │                             │ Deep Archive Access  │       │               │
+│  │                             │ (optional — opt-in)  │       │               │
+│  │                             └─────────────────────┘       │               │
+│  │                                                           │               │
+│  │ KEY: Any access at any tier → moves back to Frequent      │               │
+│  │ Monitoring fee: $0.0025 per 1000 objects/month            │               │
+│  │ NO retrieval fees (unlike manual IA/Glacier)              │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  LIFECYCLE RULE EXECUTION MECHANICS:                                        │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ 1. S3 evaluates lifecycle rules ONCE per day             │               │
+│  │ 2. Evaluation is ASYNCHRONOUS and batch-processed        │               │
+│  │ 3. Large buckets (billions of objects) may take days      │               │
+│  │ 4. Transition creates a NEW version in target class       │               │
+│  │    (object key remains the same)                          │               │
+│  │ 5. The transition itself is FREE (no request charges)     │               │
+│  │ 6. But: lifecycle transition requests count toward        │               │
+│  │    request pricing ($0.01 per 1000 transitions to IA)     │               │
+│  │ 7. Glacier transitions: $0.05 per 1000 requests          │               │
+│  │ 8. Rules are evaluated based on object CREATION date      │               │
+│  │    (not last access date)                                 │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+│  TRANSITION WATERFALL RULES:                                                │
+│  ┌──────────────────────────────────────────────────────────┐               │
+│  │ Transitions must follow this hierarchy (top to bottom):   │               │
+│  │                                                           │               │
+│  │ S3 Standard                                               │               │
+│  │     ↓                                                     │               │
+│  │ S3 Intelligent Tiering                                    │               │
+│  │     ↓                                                     │               │
+│  │ S3 Standard-IA / S3 One Zone-IA                           │               │
+│  │     ↓                                                     │               │
+│  │ S3 Glacier Instant Retrieval                              │               │
+│  │     ↓                                                     │               │
+│  │ S3 Glacier Flexible Retrieval                             │               │
+│  │     ↓                                                     │               │
+│  │ S3 Glacier Deep Archive                                   │               │
+│  │                                                           │               │
+│  │ CANNOT skip levels? Actually YES — you can skip           │               │
+│  │ Standard → Glacier Deep Archive directly is valid          │               │
+│  │ But: you CANNOT go backward via lifecycle                 │               │
+│  │ Backward requires: RestoreObject + CopyObject             │               │
+│  └──────────────────────────────────────────────────────────┘               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Transitioned to S3-IA but bill INCREASED"
+</span>→ Cause: files are accessed frequently after transition
+→ S3-IA retrieval: $0.01/GB per access
+→ 50MB file × 20 accesses/month = $0.01 × 0.05 × 20 = $0.01/month retrieval
+→ vs Standard storage: $0.023 × 0.05 = $0.00115/month
+→ Fix: only transition files with &lt; 1 access/month
+→ Use S3 Analytics to validate access patterns BEFORE transitioning
+
+PITFALL 2: "Transitioned 1 million tiny files to Glacier — bill went UP"
+→ Cause: 128KB minimum charge per object
+→ 1 million × 1KB files at Standard: 1 GB × $0.023 = $0.023/month
+→ 1 million × 1KB files at Glacier (charged as 128KB each):
+   128 GB × $0.0036 = $0.46/month
+→ 20x MORE expensive in Glacier!
+→ Fix: filter by ObjectSizeGreaterThan: 131072 (128KB) in lifecycle rule
+
+PITFALL 3: "Deleted file from Glacier after 10 days — charged for 90 days"
+→ Cause: Glacier Flexible has 90-day minimum storage duration
+→ Pro-rated early deletion fee applies
+→ Same for: S3-IA (30-day min), Glacier IR (90-day), Deep Archive (180-day)
+→ Fix: don't delete objects early from cold tiers — let lifecycle handle it
+
+PITFALL 4: "GetObject on Glacier Flexible returns 403 InvalidObjectState"
+→ Cause: Glacier Flexible objects MUST be restored before reading
+→ Cannot GET directly — must call RestoreObject first, wait hours
+→ This is the #1 surprise for developers new to Glacier
+→ Glacier IR does NOT have this problem — instant access
+
+PITFALL 5: "Lifecycle rule set but objects not transitioning"
+→ Cause 1: rule evaluates on creation date, not upload date
+→ Cause 2: lifecycle runs once per day — may take 24-48 hours
+→ Cause 3: rule has wrong prefix filter — doesn't match objects
+→ Cause 4: object already in target storage class
+→ Debug: check S3 Inventory report for StorageClass per object
+
+PITFALL 6: "Intelligent Tiering monitoring fee eating our savings"
+→ 10 million objects × $0.0025/1000 = $25/month just for monitoring
+→ If objects are small (few KB each) and storage cost is $5/month
+→ Monitoring fee &gt; storage savings = net loss
+→ Fix: IT is cost-effective for objects &gt; 128KB with unpredictable access
+
+PITFALL 7: "Restored from Glacier but restore expired before I downloaded"
+→ Cause: RestoreObject creates temporary copy for N days (you specify)
+→ If you specify Days=1 and don't download within 24 hours → copy gone
+→ Must restore again (another 3-5 hour wait + retrieval cost)
+→ Fix: set restore duration generously (Days=7 or more)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QUICKCART COST PROJECTION — WITH vs WITHOUT LIFECYCLE:
+</span>
+                    WITHOUT Lifecycle          WITH Lifecycle
+                    (all Standard)             (tiered transitions)
+Year 1 (22 GB):    $0.51/month                $0.22/month
+Year 2 (72 GB):    $1.66/month                $0.45/month
+Year 3 (172 GB):   $3.96/month                $0.72/month
+Year 5 (472 GB):   $10.86/month               $1.35/month
+Year 7 (872 GB):   $20.06/month               $1.89/month
+
+Savings at Year 7: 91% cost reduction
+
+AT ENTERPRISE SCALE (100 TB):
+Without lifecycle: 100,000 GB × $0.023 = $2,300/month
+With lifecycle:
+  → 5 TB Standard (hot):         5,000 × $0.023  = $115.00
+  → 15 TB S3-IA (warm):          15,000 × $0.0125 = $187.50
+  → 30 TB Glacier IR (cool):     30,000 × $0.004  = $120.00
+  → 30 TB Glacier Flexible:      30,000 × $0.0036 = $108.00
+  → 20 TB Glacier Deep Archive:  20,000 × $0.00099 = $19.80
+  → Total: $550.30/month (76% savings)
+
+LIFECYCLE RULE LIMITS:
+→ Max 1000 rules per bucket
+→ Each rule can have multiple transitions
+→ Rules evaluated daily per object (not real-time)
+→ Billions of objects: evaluation may take multiple days
+
+TRANSITION REQUEST COSTS (often overlooked):
+→ Standard → S3-IA: $0.01 per 1000 requests
+→ Standard → Glacier IR: $0.02 per 1000 requests
+→ Standard → Glacier Flexible: $0.05 per 1000 requests
+→ Standard → Glacier Deep Archive: $0.05 per 1000 requests
+→ 1 million objects transitioning: $50 one-time cost
+→ Trivial for QuickCart; significant at millions of objects</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR STORAGE CLASS DISTRIBUTION:
+</span>
+1. S3 Storage Lens (FREE tier available):
+   → Dashboard showing: bytes by storage class, request patterns
+   → Metrics: % of data in each tier, average object size
+   → Recommendations: which prefixes should transition
+   → Enable once → auto-updates daily
+
+2. S3 Inventory Report:
+   → CSV/Parquet file listing EVERY object with:
+     Key, Size, StorageClass, LastModified, ETag
+   → Delivered to another S3 bucket daily/weekly
+   → Query with Athena (Project 16): 
+     SELECT StorageClass, COUNT(*), SUM(Size) GROUP BY StorageClass
+
+3. CloudWatch Metrics:
+   → BucketSizeBytes: total storage per storage class
+   → NumberOfObjects: count per storage class
+   → Set up alarm when Standard tier exceeds threshold
+
+4. AWS Cost Explorer:
+   → Filter by S3 → group by usage type
+   → Shows: StorageUsage, DataTransfer, Requests per tier
+   → Compare month-over-month savings after lifecycle deployment
+
+5. S3 Analytics — Storage Class Analysis:
+   → Run on specific prefix for 30+ days
+   → Shows: access frequency, age distribution
+   → Recommends: optimal transition point
+   → Best used BEFORE implementing lifecycle rules</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(4)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Analyze Current Storage (Before Optimization)</h3>
+
+<h3>Step 2: Configure Current-Version Lifecycle Transitions</h3>
+
+<h3>Step 3: Demonstrate Manual Storage Class Change (for Understanding)</h3>
+
+<h3>Step 4: Restore from Glacier (Critical Knowledge)</h3>
+
+<h3>Step 5: S3 Intelligent Tiering Setup (Alternative Approach)</h3>
+
+<h3>Step 6: Storage Cost Monitor</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Analyze current storage (before optimization)</span><span>
+</span>python 17_analyze_storage.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Apply lifecycle transitions</span><span>
+</span>python 18_configure_storage_transitions.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. (Optional) Manual storage class change demo</span><span>
+</span>python 19_manual_storage_class_change.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. (Reference) Glacier restore operations</span><span>
+</span>python 20_glacier_restore.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. (Optional) Configure Intelligent Tiering for marketing_data/</span><span>
+</span>python 21_intelligent_tiering.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Monitor cost savings (run monthly)</span><span>
+</span>python 22_storage_cost_monitor.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT — COST REPORT:
+</span>
+================================================================================
+💰 S3 STORAGE COST REPORT — quickcart-raw-data-prod
+   Generated: 2025-07-15 00:00 UTC
+================================================================================
+
+📦 OVERALL SUMMARY:
+   Total Objects: 810
+   Total Size: 48.2400 GB
+
+📋 COST BY STORAGE CLASS:
+   Class                     Objects    Size (MB)      $/GB/mo      Cost/mo
+   --------------------------------------------------------------------------
+   DEEP_ARCHIVE                   90     5,120.00 MB  $0.00099   $0.004950
+   GLACIER                       120     8,192.00 MB  $0.00360   $0.028800
+   GLACIER_IR                    150    10,240.00 MB  $0.00400   $0.040000
+   STANDARD                      200    12,288.00 MB  $0.02300   $0.276000
+   STANDARD_IA                   250    13,568.00 MB  $0.01250   $0.165625
+   --------------------------------------------------------------------------
+   ACTUAL TOTAL                  810    49,408.00 MB              $0.515375
+   IF ALL STANDARD                                                $1.109520
+
+   💰 Monthly Savings: $0.594145 (53.6%)
+
+================================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 has 7 storage classes — each optimized for different access patterns
+→ Lifecycle rules automate transitions based on object age (creation date)
+→ Intelligent Tiering automates based on actual access frequency
+→ Transitions must follow the waterfall: Standard → IA → Glacier IR → Glacier → Deep Archive
+→ Cannot go backward via lifecycle — must restore + copy
+→ Glacier Flexible/Deep Archive require RESTORE before reading (3-48 hours)
+→ Glacier IR provides instant access at 83% lower cost than Standard
+→ Minimum storage durations: IA=30d, Glacier IR=90d, Glacier=90d, Deep=180d
+→ Objects &lt; 128KB cost MORE in IA/Glacier than Standard (minimum charge)
+→ Lifecycle rules replace entire config — always merge with existing rules
+→ Cost monitoring is essential — use S3 Storage Lens and custom reports
+
+CONNECTING TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: Created bucket, uploaded files → now stored COST-EFFECTIVELY
+→ Project 2: Versioning + lifecycle for non-current versions
+   → Project 4 EXTENDS this with current-version transitions
+   → Both rule sets coexist in same lifecycle configuration
+→ Project 3: Access control → users can read files regardless of storage class
+   → S3-IA and Glacier IR: same GET API, just different pricing
+   → Glacier Flexible/Deep: requires restore first (different workflow)
+
+COMPLETE STORAGE PROTECTION STACK NOW:
+Layer 1: IAM + Bucket Policy → WHO can access (Project 3)
+Layer 2: Versioning → protect against accidental delete (Project 2)
+Layer 3: Lifecycle → cost optimization + compliance retention (Project 4)
+Layer 4: Encryption → data at rest protection (Project 1)
+Layer 5: Block Public Access → prevent internet exposure (Project 1)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 5: We've mastered S3 — now we need COMPUTE
+   → Files are in S3 but processing requires a machine
+   → EC2: the virtual server where scripts run
+   → Launch, connect, install Python, run jobs
+
+→ Project 6: EC2 machine needs to ACCESS S3 securely
+   → Currently: hardcoded credentials (from Project 1 upload script)
+   → Should be: IAM Roles attached to EC2 (Instance Profiles)
+   → Connects Project 3 (IAM) + Project 5 (EC2)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>✅ S3 bucket with organized structure (Project 1)
+✅ Versioning + non-current version lifecycle (Project 2)
+✅ Team-based access control via IAM + bucket policy (Project 3)
+✅ Cost-optimized storage with class transitions (Project 4)
+
+BUT: All scripts so far assume they run on "some machine"
+→ Where does the upload script actually run?
+→ Where does the cost report script run?
+→ Where will future ETL scripts run?
+
+Currently: developer's laptop
+→ Works for testing but NOT for production
+→ Laptop goes to sleep → pipeline stops
+→ Laptop on home WiFi → slow uploads
+→ No monitoring, no scheduling, no reliability
+
+CTO: "We need a dedicated machine in the cloud to run these scripts
+      reliably, on schedule, 24/7"
+
+YOU: "That's EC2 — Elastic Compute Cloud.
+      We'll launch a Linux instance, install Python,
+      and move our scripts there."
+
+→ Project 5: "Data Team Needs a Linux Machine to Run Python Scripts"
+→ Introduces: EC2 launch, key pairs, security groups, SSH, user data
+→ Parallel start: EC2 knowledge needed independently of S3</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="15" ========== -->
+<div class="chat-message" data-index="15"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-3.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 4 of 80</span>
+    <span class="nav-project-title">OLD REPORTS MUST MOVE TO CHEAPER STORAGE AFTER 90 DAYS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-5.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-5.html") window.location = "project-5.html";
+  if (e.key === 'ArrowLeft' && "project-3.html") window.location = "project-3.html";
+});
+</script>
+</body>
+</html>

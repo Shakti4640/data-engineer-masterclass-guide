@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 77: TRACK DATA LINEAGE — WHERE DID THIS COLUMN COME FROM 5 HOPS  — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:96%"></div></div>
+<div id="progress-label">96%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 77 of 80</div>
+  <div class="project-title">TRACK DATA LINEAGE — WHERE DID THIS COLUMN COME FROM 5 HOPS AGO?</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now a 500-person company with a mature data platform
+</span>Platform: Full Data Mesh (Project 71) across 4 AWS accounts
+          Bronze → Silver → Gold lake (Project 44/73)
+          Lake Formation governing everything (Project 74)
+
+Situation:
+→ 380+ Glue ETL jobs running daily
+→ 120+ Redshift tables (some via Spectrum from Project 38)
+→ 90+ Athena views layered on top of each other
+→ 45+ MariaDB source tables feeding the lake
+→ 3 accounts: Ingestion (A), Processing (B), Serving (C)
+
+INCIDENT:
+→ CFO dashboard shows "total_revenue_adjusted" = $4.2M
+→ Finance team says actual revenue is $5.8M — a $1.6M discrepancy
+→ "total_revenue_adjusted" lives in:
+     Redshift table: gold.finance_summary
+→ That column is derived from:
+     Athena view: silver.order_metrics
+→ Which joins:
+     Glue table: silver.orders_cleaned + silver.refunds_processed
+→ "orders_cleaned" comes from:
+     Glue ETL job: job_clean_orders (transforms bronze.raw_orders)
+→ "raw_orders" comes from:
+     MariaDB: ecommerce.orders (Account A, via JDBC — Project 31)
+→ "refunds_processed" comes from:
+     Another MariaDB: payments.refunds (Account A, different DB)
+→ Somewhere in these 5+ hops, a filter is dropping valid rows
+
+CTO: "We need to trace ANY column back to its EXACT origin,
+      through every transformation, across every account.
+      Build a lineage system."
+
+CHALLENGE:
+→ AWS does NOT have a native end-to-end lineage service
+→ Glue tracks SOME metadata, CloudTrail tracks API calls
+→ But COLUMN-LEVEL lineage across 5 hops? — You must BUILD it</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the TWO types of lineage
+</span>
+  TABLE-LEVEL LINEAGE (coarse):
+  → "gold.finance_summary DEPENDS ON silver.order_metrics"
+  → Tells you which tables feed which
+  → Easier to build, less useful for debugging
+
+  COLUMN-LEVEL LINEAGE (fine):
+  → "gold.finance_summary.total_revenue_adjusted
+      = SUM(silver.order_metrics.order_total)
+        - SUM(silver.order_metrics.refund_amount)"
+  → "silver.order_metrics.order_total
+      = silver.orders_cleaned.quantity × silver.orders_cleaned.unit_price"
+  → "silver.orders_cleaned.quantity
+      = bronze.raw_orders.qty (renamed + cast to INT)"
+  → "bronze.raw_orders.qty
+      = MariaDB ecommerce.orders.quantity (JDBC extract)"
+  → FULL TRACE: 5 hops from dashboard to source row
+
+Step 2: Understand ACTIVE vs PASSIVE lineage collection
+
+  PASSIVE (after-the-fact):
+  → Parse Glue ETL scripts to infer transformations
+  → Analyze CloudTrail logs for data movement
+  → Inspect Glue Data Catalog for table dependencies
+  → Pros: no code changes needed
+  → Cons: incomplete, can't track column transforms
+
+  ACTIVE (instrumented):
+  → Each ETL job EMITS lineage events during execution
+  → Events say: "I read column X from table A, applied transform T,
+                  wrote result as column Y in table B"
+  → Pros: precise, column-level, tracks transformations
+  → Cons: requires modifying every ETL job
+
+  DECISION: Hybrid approach
+  → Active instrumentation for Glue ETL jobs (our code, we control)
+  → Passive collection for Redshift/Athena (SQL parsing)
+  → Catalog enrichment via Lake Formation tags (Project 74)
+
+Step 3: Choose lineage storage
+
+  → DynamoDB: fast lookups by node ID, good for graph traversal
+  → S3 + Athena: cheap, queryable, good for historical lineage
+  → Neptune (Graph DB): ideal for graph queries, but adds cost/complexity
+
+  DECISION: DynamoDB for live lineage graph + S3 for historical archive
+  → Neptune mentioned but not required for our scale
+
+Step 4: Define the lineage data model
+
+  NODE: any data asset (table, column, view, file)
+  EDGE: any relationship (derives_from, feeds_into, transforms_to)
+  EVENT: any execution that created an edge (job run, query, COPY)
+
+Step 5: Build the system in layers
+
+  Layer 1: Lineage Event Emitter (inside Glue jobs)
+  Layer 2: Lineage Store (DynamoDB + S3)
+  Layer 3: Lineage Query API (traverse the graph)
+  Layer 4: Passive Collectors (CloudTrail, Catalog, SQL parser)
+  Layer 5: Visualization (optional — graph rendering)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        LINEAGE SYSTEM ARCHITECTURE                      │
+│                                                                          │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐                │
+│  │  MariaDB     │    │  MariaDB      │    │  External    │                │
+│  │  (ecommerce) │    │  (payments)   │    │  API / CSV   │                │
+│  └──────┬───────┘    └──────┬────────┘    └──────┬───────┘                │
+│         │ JDBC              │ JDBC               │ S3 PUT                 │
+│         ▼                   ▼                    ▼                        │
+│  ┌──────────────────────────────────────────────────────┐                │
+│  │               BRONZE LAYER (S3 — Account A)          │                │
+│  │  raw_orders/  │  raw_refunds/  │  raw_clickstream/   │                │
+│  └──────────────────────┬───────────────────────────────┘                │
+│                         │                                                │
+│              ┌──────────▼──────────┐                                     │
+│              │   GLUE ETL JOBS     │◄── EMITS LINEAGE EVENTS            │
+│              │   (Account B)       │         │                           │
+│              └──────────┬──────────┘         │                           │
+│                         │                    ▼                            │
+│  ┌──────────────────────▼───────┐   ┌──────────────────┐                │
+│  │     SILVER LAYER (S3)        │   │  LINEAGE STORE   │                │
+│  │  orders_cleaned/             │   │  ┌─────────────┐ │                │
+│  │  refunds_processed/          │   │  │  DynamoDB    │ │                │
+│  └──────────────────────┬───────┘   │  │  (live DAG)  │ │                │
+│                         │           │  ├─────────────┤ │                │
+│              ┌──────────▼────────┐  │  │  S3          │ │                │
+│              │   GLUE ETL JOBS   │──│─▶│  (history)   │ │                │
+│              └──────────┬────────┘  │  └─────────────┘ │                │
+│                         │           └────────▲─────────┘                │
+│  ┌──────────────────────▼───────┐            │                          │
+│  │      GOLD LAYER (S3)         │            │                          │
+│  │  finance_summary/            │            │                          │
+│  └──────────────────────┬───────┘            │                          │
+│                         │                    │                           │
+│         ┌───────────────┼────────────┐       │                          │
+│         ▼               ▼            ▼       │                          │
+│  ┌───────────┐  ┌────────────┐  ┌─────────┐ │                          │
+│  │ Redshift   │  │  Athena     │  │ Lineage │ │                          │
+│  │ Spectrum   │  │  Views      │  │ Query   │◄┘                         │
+│  │ (Account C)│  │ (Account C) │  │ API     │                           │
+│  └───────────┘  └────────────┘  └─────────┘                            │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────┐                │
+│  │             PASSIVE COLLECTORS                        │                │
+│  │  CloudTrail Logs → S3 API calls tracked              │                │
+│  │  Glue Catalog    → Table/Column metadata             │                │
+│  │  Lake Formation  → Tags &amp; classification             │                │
+│  │  SQL Parser      → Athena/Redshift view definitions  │                │
+│  └──────────────────────────────────────────────────────┘                │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Use AWS-native services only (Glue Catalog + CloudTrail + Tags)
+</span>→ Free/cheap, no extra infrastructure
+→ Limited to table-level lineage, no column transforms
+→ Cannot trace 5 hops automatically
+
+Option B: Use Apache Atlas (open-source lineage tool)
+→ Powerful, Hadoop-native
+→ Heavy — requires dedicated EC2 cluster
+→ Overkill for AWS-native stack
+
+Option C: Use OpenLineage + Marquez (open standard)
+→ Industry standard for lineage events
+→ Requires running Marquez server
+→ Good if you plan multi-cloud
+
+Option D: Build custom lineage system (DynamoDB + S3 + Lambda)
+→ AWS-native, serverless, cost-effective
+→ Full control over column-level tracking
+→ Must instrument Glue jobs manually
+
+Option E: Commercial tool (DataHub, Atlan, Collibra)
+→ Beautiful UI, auto-discovery
+→ $50K-$500K/year licensing
+→ Startup cannot afford this yet
+
+DECISION: Option D with Option C's data model (OpenLineage-inspired)
+→ Reason: column-level precision, AWS-native, extensible
+→ Uses OpenLineage event schema but stores in DynamoDB/S3
+→ Can migrate to full OpenLineage later if needed</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Define lineage at COLUMN level, not just table level
+</span>   → Table lineage answers: "what feeds what"
+   → Column lineage answers: "WHERE did this specific number come from"
+   → Column lineage is what actually solves the CFO's $1.6M question
+
+2. Make lineage emission AUTOMATIC inside Glue jobs
+   → Wrap DynamicFrame operations with lineage-aware functions
+   → Every read, transform, write emits an event
+   → Developer doesn't need to remember to log lineage
+
+3. Store lineage events immutably
+   → S3 for append-only historical record
+   → DynamoDB for fast traversal queries
+   → Never delete lineage — it's your audit trail
+
+4. Include transformation semantics in edges
+   → Not just "A → B" but "A.qty RENAMED TO B.quantity, CAST TO INT"
+   → Without this, column lineage is useless
+
+5. Assign unique IDs to every data asset
+   → Format: {account}:{service}:{database}.{table}.{column}
+   → Example: 111111111111:glue:silver.orders_cleaned.quantity
+   → Enables cross-account lineage (from Project 71)
+
+6. Track JOB RUN context
+   → Which Glue job, which run ID, when, how long
+   → Links lineage edges to specific executions
+   → Essential for debugging "when did it break"
+
+7. Use Lake Formation tags (Project 74) as classification layer
+   → Tag columns as PII, Financial, Derived, etc.
+   → Lineage + classification = governance</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT try to infer lineage by parsing Glue scripts alone
+</span>   → PySpark code has dynamic logic (if/else, UDFs, joins)
+   → Static analysis misses runtime behavior
+   → Active instrumentation is the only reliable method
+
+2. DO NOT store lineage only in Glue Data Catalog "description" fields
+   → Description is free-text, no structure
+   → Cannot traverse programmatically
+   → Cannot query "show me all ancestors of column X"
+
+3. DO NOT build lineage as an afterthought
+   → Retrofitting lineage onto 380 existing jobs is 10x harder
+   → Should have started in Project 44 (Medallion Architecture)
+   → Lesson: instrument from Day 1
+
+4. DO NOT track only the latest lineage state
+   → Lineage changes over time (schema evolution — Project 45)
+   → Must keep historical snapshots
+   → "What was the lineage on March 15th?" is a real question
+
+5. DO NOT ignore Athena views and Redshift views
+   → Views are SQL-based transformations
+   → They create lineage edges that are invisible to Glue
+   → Must parse SQL definitions to extract column mappings
+
+6. DO NOT make lineage emission synchronous and blocking
+   → If DynamoDB write fails, ETL job should NOT fail
+   → Lineage is observability — it must not break production
+   → Use async/fire-and-forget with retry queue
+
+7. DO NOT build a custom graph database
+   → DynamoDB adjacency list pattern handles 95% of queries
+   → Neptune only if you need complex graph traversals (PageRank, shortest path)
+   → Premature complexity kills projects</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use                  │ Why                              │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ "Which tables feed this table?"  │ Glue Catalog +       │ Table-level lineage is enough    │
+│ (table-level, quick answer)      │ CloudTrail           │ Passive collection works here    │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ "Where did this column value     │ Active Column-Level  │ Must trace through transforms    │
+│ come from?" (debug a number)     │ Lineage (our system) │ Passive cannot track this        │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ "Who accessed this PII column    │ Lake Formation +     │ Access audit ≠ lineage           │
+│ last week?" (access audit)       │ CloudTrail           │ Different question entirely       │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ "What breaks if I drop this      │ Forward lineage      │ Impact analysis = downstream     │
+│ source column?" (impact analysis)│ (downstream trace)   │ traversal of lineage graph       │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ "Show full lineage for SOX       │ Historical lineage   │ Auditors need point-in-time      │
+│ audit on March 15" (compliance)  │ snapshots in S3      │ lineage, not just current        │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Complex graph queries: "What's   │ Neptune Graph DB     │ DynamoDB adjacency list can't    │
+│ the shortest path between X &amp; Y" │                      │ do complex graph algorithms       │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Enterprise-wide with 50+ teams   │ Commercial tool      │ Build vs buy — at scale,         │
+│                                  │ (DataHub, Atlan)     │ commercial tools win on UX       │
+└──────────────────────────────────┴──────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT build column-level lineage for ad-hoc notebooks
+</span>   → Jupyter notebooks change constantly
+   → Lineage of exploratory code = wasted effort
+   → Only track PRODUCTION pipelines
+
+2. DO NOT use lineage as a replacement for data quality checks
+   → Lineage tells you WHERE bad data came from
+   → Data quality (Project 68) tells you IF data is bad
+   → They complement each other, neither replaces the other
+
+3. DO NOT deploy Neptune just for lineage if you have &lt; 1000 nodes
+   → DynamoDB adjacency list handles small-to-medium graphs efficiently
+   → Neptune minimum cost: ~$200/month (even idle)
+   → Our graph: ~2000 nodes (tables + columns) — DynamoDB is fine
+
+4. DO NOT track lineage for temporary/staging tables
+   → Staging tables in Redshift (Project 65) are transient
+   → They exist for minutes during MERGE operations
+   → Track the logical flow: source → final target (skip staging)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────┐
+</span>│                    LINEAGE SYSTEM — INTERNAL MECHANICS                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ═══════════════════════════════════════════════════════                 │
+│  PART 1: THE LINEAGE DATA MODEL (OpenLineage-inspired)                 │
+│  ═══════════════════════════════════════════════════════                 │
+│                                                                         │
+│  NODE (Data Asset):                                                     │
+│  ┌──────────────────────────────────────────────────┐                   │
+│  │ node_id:    "111:glue:silver.orders_cleaned.qty" │                   │
+│  │ node_type:  "COLUMN"                             │                   │
+│  │ account_id: "[REDACTED:BANK_ACCOUNT_NUMBER]"                       │                   │
+│  │ service:    "glue"                               │                   │
+│  │ database:   "silver"                             │                   │
+│  │ table:      "orders_cleaned"                     │                   │
+│  │ column:     "qty"                                │                   │
+│  │ data_type:  "int"                                │                   │
+│  │ tags:       ["financial", "non-pii"]             │                   │
+│  │ created_at: "2025-01-15T00:00:00Z"               │                   │
+│  └──────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  EDGE (Lineage Relationship):                                           │
+│  ┌──────────────────────────────────────────────────┐                   │
+│  │ edge_id:      "e-abc123"                         │                   │
+│  │ source_id:    "111:glue:bronze.raw_orders.qty"   │                   │
+│  │ target_id:    "111:glue:silver.orders_cleaned.qty│                   │
+│  │ edge_type:    "TRANSFORMS_TO"                    │                   │
+│  │ transform:    "RENAME qty→quantity; CAST STRING→INT; FILTER qty&gt;0"   │
+│  │ job_name:     "job_clean_orders"                 │                   │
+│  │ job_run_id:   "jr_2025011500001"                 │                   │
+│  │ created_at:   "2025-01-15T02:30:00Z"             │                   │
+│  └──────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  EVENT (Execution Context):                                             │
+│  ┌──────────────────────────────────────────────────┐                   │
+│  │ event_id:     "evt-xyz789"                       │                   │
+│  │ event_type:   "JOB_COMPLETE"                     │                   │
+│  │ job_name:     "job_clean_orders"                 │                   │
+│  │ job_run_id:   "jr_2025011500001"                 │                   │
+│  │ account_id:   "[REDACTED:BANK_ACCOUNT_NUMBER]"                     │                   │
+│  │ inputs:       [{db: "bronze", table: "raw_orders", cols: [...]}]     │
+│  │ outputs:      [{db: "silver", table: "orders_cleaned", cols: [...]}] │
+│  │ started_at:   "2025-01-15T02:00:00Z"             │                   │
+│  │ ended_at:     "2025-01-15T02:30:00Z"             │                   │
+│  │ rows_read:    1200000                            │                   │
+│  │ rows_written: 1185000                            │                   │
+│  │ status:       "SUCCESS"                          │                   │
+│  └──────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════                 │
+│  PART 2: DynamoDB TABLE DESIGN (Adjacency List Pattern)                │
+│  ═══════════════════════════════════════════════════════                 │
+│                                                                         │
+│  Single table design for graph traversal:                               │
+│                                                                         │
+│  TABLE: DataLineage                                                     │
+│  ┌────────────────────────────┬─────────────────────────┬──────────┐    │
+│  │ PK (Partition Key)         │ SK (Sort Key)           │ Attrs    │    │
+│  ├────────────────────────────┼─────────────────────────┼──────────┤    │
+│  │ NODE#silver.orders.qty     │ META                    │ type,tags│    │
+│  │ NODE#silver.orders.qty     │ UPSTREAM#bronze.raw.qty │ transform│    │
+│  │ NODE#silver.orders.qty     │ DOWNSTREAM#gold.fin.rev │ transform│    │
+│  │ NODE#bronze.raw.qty        │ META                    │ type,tags│    │
+│  │ NODE#bronze.raw.qty        │ UPSTREAM#mariadb.ord.qty│ transform│    │
+│  │ NODE#bronze.raw.qty        │ DOWNSTREAM#silver.o.qty │ transform│    │
+│  │ JOB_RUN#jr_20250115_001   │ META                    │ job,time │    │
+│  │ JOB_RUN#jr_20250115_001   │ EDGE#e-abc123           │ src,tgt  │    │
+│  └────────────────────────────┴─────────────────────────┴──────────┘    │
+│                                                                         │
+│  QUERY PATTERNS:                                                        │
+│  → "Get all upstream of X": PK=NODE#X, SK begins_with "UPSTREAM#"      │
+│  → "Get all downstream of X": PK=NODE#X, SK begins_with "DOWNSTREAM#"  │
+│  → "Get metadata of X": PK=NODE#X, SK="META"                           │
+│  → "Get all edges from job run": PK=JOB_RUN#jr, SK begins_with "EDGE#" │
+│  → Recursive traversal: repeat upstream query on each result            │
+│                                                                         │
+│  GSI (Global Secondary Index):                                          │
+│  → GSI1: PK=account_id, SK=service#database#table                      │
+│  → Enables: "show all lineage nodes in Account A"                       │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════                 │
+│  PART 3: HOW TRAVERSAL WORKS (BFS/DFS on Adjacency List)              │
+│  ═══════════════════════════════════════════════════════                 │
+│                                                                         │
+│  To trace "gold.finance_summary.total_revenue_adjusted" to source:      │
+│                                                                         │
+│  Step 1: Query PK=NODE#gold.fin.total_rev_adj, SK begins_with UPSTREAM  │
+│          Result: silver.order_metrics.sum_order_total                    │
+│                  silver.order_metrics.sum_refund_amount                  │
+│          Transform: "total_rev_adj = sum_order_total - sum_refund_amt"  │
+│                                                                         │
+│  Step 2: Query PK=NODE#silver.om.sum_order_total, SK=UPSTREAM           │
+│          Result: silver.orders_cleaned.order_total                      │
+│          Transform: "SUM(order_total) GROUP BY date"                    │
+│                                                                         │
+│  Step 3: Query PK=NODE#silver.oc.order_total, SK=UPSTREAM               │
+│          Result: bronze.raw_orders.qty, bronze.raw_orders.unit_price    │
+│          Transform: "order_total = qty * unit_price"                    │
+│                                                                         │
+│  Step 4: Query PK=NODE#bronze.ro.qty, SK=UPSTREAM                       │
+│          Result: mariadb.ecommerce.orders.quantity                      │
+│          Transform: "RENAME quantity→qty, CAST VARCHAR→INT"             │
+│                                                                         │
+│  Step 5: Query PK=NODE#mariadb.eco.orders.quantity, SK=UPSTREAM         │
+│          Result: (none) — this is the ROOT SOURCE                       │
+│                                                                         │
+│  FULL LINEAGE CHAIN:                                                    │
+│  mariadb.ecommerce.orders.quantity                                      │
+│    → [RENAME+CAST] → bronze.raw_orders.qty                              │
+│    → [MULTIPLY by unit_price] → silver.orders_cleaned.order_total       │
+│    → [SUM GROUP BY date] → silver.order_metrics.sum_order_total         │
+│    → [SUBTRACT refunds] → gold.finance_summary.total_revenue_adjusted   │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════                 │
+│  PART 4: PASSIVE LINEAGE — SQL PARSING                                 │
+│  ═══════════════════════════════════════════════════════                 │
+│                                                                         │
+│  For Athena views and Redshift views:                                   │
+│  → Retrieve view DDL: SHOW CREATE VIEW view_name                        │
+│  → Parse SQL to extract: SELECT columns, FROM tables, JOIN conditions   │
+│  → Map output columns to input columns                                  │
+│  → Create lineage edges from parsed mappings                            │
+│                                                                         │
+│  Example Athena view:                                                   │
+│  CREATE VIEW silver.order_metrics AS                                    │
+│  SELECT                                                                 │
+│    o.order_date,                                                        │
+│    SUM(o.order_total) as sum_order_total,    ← maps to orders.total    │
+│    SUM(r.refund_amount) as sum_refund_amount ← maps to refunds.amount  │
+│  FROM silver.orders_cleaned o                                           │
+│  LEFT JOIN silver.refunds_processed r ON o.order_id = r.order_id        │
+│  GROUP BY o.order_date;                                                 │
+│                                                                         │
+│  Parser extracts:                                                       │
+│  → sum_order_total ← SUM(orders_cleaned.order_total)                   │
+│  → sum_refund_amount ← SUM(refunds_processed.refund_amount)            │
+│  → Creates 2 lineage edges automatically                                │
+│                                                                         │
+│  ═══════════════════════════════════════════════════════                 │
+│  PART 5: CROSS-ACCOUNT LINEAGE (from Project 71)                      │
+│  ═══════════════════════════════════════════════════════                 │
+│                                                                         │
+│  Account A (Ingestion) → Account B (Processing) → Account C (Serving)  │
+│                                                                         │
+│  → Each account's Glue jobs emit lineage to CENTRAL DynamoDB table      │
+│  → Central table lives in a GOVERNANCE account (Account D)              │
+│  → Cross-account write: AssumeRole to Account D (from Project 56)       │
+│  → node_id includes account_id prefix for disambiguation                │
+│  → Edge can span accounts:                                              │
+│    source: "111:glue:bronze.raw_orders.qty"                             │
+│    target: "222:glue:silver.orders_cleaned.quantity"                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Lineage graph has cycles"
+</span>→ Cause: table A feeds table B feeds view C which is read by job that writes A
+→ Symptom: traversal runs forever or OOMs
+→ Fix: track visited nodes during BFS/DFS, skip already-visited
+→ Also: cycles indicate design smell — investigate the pipeline
+
+PITFALL 2: "Lineage says column X comes from column Y, but values don't match"
+→ Cause: lineage tracks STRUCTURAL lineage (schema), not DATA lineage (values)
+→ A filter/WHERE clause drops rows — lineage won't show that
+→ Fix: include row-count metrics in events (rows_read vs rows_written)
+→ If rows_written &lt; rows_read, a filter exists — flag it
+
+PITFALL 3: "Glue job uses UDFs or complex PySpark — can't auto-extract lineage"
+→ Cause: custom Python functions are black boxes
+→ Fix: require developers to annotate UDFs with input→output column mappings
+→ Convention: @lineage_udf(inputs=["qty","price"], outputs=["total"])
+
+PITFALL 4: "DynamoDB adjacency list gets hot partition"
+→ Cause: one gold table has 500+ upstream edges — all on same PK
+→ Fix: use GSI with inverted key, or shard the PK
+→ At QuickCart scale (2000 nodes): unlikely to hit this
+
+PITFALL 5: "Lineage emission fails, takes down production ETL"
+→ Cause: DynamoDB throttling or network issue during lineage write
+→ Fix: ALWAYS use async/fire-and-forget with SQS buffer
+→ Lineage is OBSERVABILITY — never let it block data flow
+
+PITFALL 6: "Historical lineage shows wrong graph for past date"
+→ Cause: lineage was updated in-place instead of versioned
+→ Fix: every lineage event has timestamp + job_run_id
+→ Query "lineage as of date X" = filter edges by created_at &lt;= X
+
+PITFALL 7: "Cross-account lineage breaks when account IDs change"
+→ Cause: account migration or reorganization
+→ Fix: use logical names (alias) alongside account IDs
+→ Map: "ingestion-account" → "111111111111" in config</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT STATE (QuickCart):
+</span>→ ~2,000 lineage nodes (tables + columns)
+→ ~5,000 lineage edges
+→ ~380 job runs/day generating ~2,000 events/day
+→ DynamoDB: ~10 WCU sustained, ~50 RCU for queries
+→ Cost: &lt; $5/month DynamoDB, ~$1/month S3 for event archive
+
+AT 10X SCALE (QuickCart → Enterprise):
+→ ~20,000 nodes, ~50,000 edges
+→ ~3,800 job runs/day, ~20,000 events/day
+→ DynamoDB: ~100 WCU, ~500 RCU
+→ Traversal depth 5 hops: ~5 DynamoDB queries, ~200ms total
+→ Cost: ~$50/month — still trivial
+
+AT 100X SCALE (Data Mesh with 50 domains):
+→ ~200,000 nodes, ~500,000 edges
+→ Consider: migrate to Neptune for complex graph queries
+→ DynamoDB adjacency list: still works for point queries
+→ But: "find all paths between X and Y" becomes expensive
+→ Neptune: optimized for graph traversal algorithms
+→ Cost: Neptune ~$500/month, but saves engineering time
+
+LINEAGE EVENT ARCHIVAL:
+→ S3 → partitioned by date: s3://lineage-archive/year=2025/month=01/day=15/
+→ Query historical lineage via Athena (Project 24)
+→ Lifecycle: move to Glacier after 1 year (Project 4)
+→ Retain for 7 years (SOX compliance)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FOR THE DATA ENGINEER:
+</span>→ "Show me full upstream lineage of gold.finance_summary.total_revenue_adjusted"
+→ Returns: ordered chain of 5 hops with transform descriptions
+→ Immediately identifies WHERE the $1.6M discrepancy was introduced
+
+FOR THE ANALYST:
+→ "What tables feed this dashboard metric?"
+→ Returns: table-level lineage (simpler view)
+→ No need to see column-level transforms
+
+FOR THE AUDITOR:
+→ "Show lineage as it existed on March 15, 2025"
+→ Returns: historical snapshot of the graph
+→ Proves compliance at point-in-time
+
+FOR THE PLATFORM TEAM:
+→ "If I drop column X from source, what breaks downstream?"
+→ Returns: forward lineage (impact analysis)
+→ Lists all downstream tables, views, dashboards affected
+
+VISUALIZATION:
+→ Lineage graph rendered as DAG (Directed Acyclic Graph)
+→ Nodes = tables/columns, Edges = transformations
+→ Color-coded by account (Account A = blue, B = green, C = orange)
+→ Click any edge to see: transform logic, job name, last run time</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(77)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Module 1: Lineage Data Model &amp; DynamoDB Setup</h3>
+
+<h3>Module 2: Lineage Event Emitter (Core Library)</h3>
+
+<h3>Module 3: Lineage-Instrumented Glue ETL Job (Example)</h3>
+
+<hr>
+<h3>Module 4: Lineage Graph Traversal Engine</h3>
+
+<hr>
+<h3>Module 5: Passive Lineage Collector — SQL View Parser</h3>
+
+<hr>
+<h3>Module 6: Cross-Account Lineage Collector (CloudTrail-Based)</h3>
+
+<hr>
+<h3>Module 7: Lineage Query CLI — The Investigation Tool</h3>
+
+<hr>
+<h3>Module 8: Seed the Lineage Graph (Full 5-Hop Chain for Testing)</h3>
+
+<hr>
+<h3>Module 9: Execution Flow &amp; Investigation Demo</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP-BY-STEP EXECUTION FLOW</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 1: Create infrastructure (one-time) ---</span><span>
+</span>python lineage/01_setup_lineage_store.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ DynamoDB table 'DataLineage' created</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ Table is ACTIVE</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ S3 bucket 'quickcart-lineage-archive-prod' created</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ Lifecycle policy applied (IA→90d, Glacier→365d, Expire→7yr)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 🎯 Lineage storage infrastructure ready</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 2: Seed the full 5-hop lineage chain ---</span><span>
+</span>python lineage/08_seed_full_lineage.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ HOP 0 seeded: MariaDB → Bronze</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ HOP 1 seeded: Bronze → Silver (orders_cleaned)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ HOP 2 seeded: Bronze → Silver (refunds_processed)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ HOP 3 seeded: Silver → Silver (order_metrics view)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ✅ HOP 4 seeded: Silver → Gold (finance_summary)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 🎯 FULL 5-HOP LINEAGE CHAIN SEEDED SUCCESSFULLY</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 3: Investigate the CFO's $1.6M discrepancy ---</span><span>
+</span><span>python lineage/07_lineage_cli.py investigate </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --node </span><span class="token" style="color: rgb(163, 21, 21);">"333333333333:redshift:gold.finance_summary.total_revenue_adjusted"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 🔍 DISCREPANCY INVESTIGATION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Investigating: 333333333333:redshift:gold.finance_summary.total_revenue_adjusted</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 🚨 FOUND 3 SUSPECT TRANSFORMATION(S):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ----------------------------------------------------------------------</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   🔴 Suspect #1 [HIGH]</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      At: 222222222222:glue:silver.orders_cleaned.quantity (depth 2)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Issue: FILTER DETECTED</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Detail: status != 'cancelled' (ALL CANCELLED ORDERS DROPPED)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Job: job_clean_orders</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   🟡 Suspect #2 [MEDIUM]</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      At: 222222222222:athena:silver.order_metrics.sum_order_total (depth 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Issue: AGGREGATION (potential row loss via GROUP BY)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Detail: SUM(order_total) GROUP BY order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Job: athena_view_order_metrics</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   🟡 Suspect #3 [MEDIUM]</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      At: 222222222222:athena:silver.order_metrics.sum_refund_amount (depth 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Issue: AGGREGATION (potential row loss via GROUP BY)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Detail: SUM(refund_amount) GROUP BY order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Job: athena_view_order_metrics</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ⚡ RECOMMENDATION: Start investigation at:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → 222222222222:glue:silver.orders_cleaned.quantity — FILTER DETECTED</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#      Check job 'job_clean_orders' filter logic</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 4: Trace full upstream lineage ---</span><span>
+</span><span>python lineage/07_lineage_cli.py upstream </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --node </span><span class="token" style="color: rgb(163, 21, 21);">"333333333333:redshift:gold.finance_summary.total_revenue_adjusted"</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --depth </span><span class="token" style="color: rgb(54, 172, 170);">10</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   UPSTREAM LINEAGE: 333333333333:redshift:gold.finance_summary.total_revenue_adjusted</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 0] 333333333333:redshift:gold.finance_summary.total_revenue_adjusted</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Type: COLUMN | Service: redshift | DataType: decimal(12,2)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Tags: ['gold-tier', 'financial', 'derived', 'cfo-dashboard']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ← Fed by 2 upstream source(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     ├── 222222222222:athena:silver.order_metrics.sum_order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Transform: EXPRESSION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Expression: sum_order_total - COALESCE(sum_refund_amount, 0)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Job: job_build_finance_summary</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 222222222222:athena:silver.order_metrics.sum_refund_amount</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Transform: EXPRESSION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Expression: sum_order_total - COALESCE(sum_refund_amount, 0)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Job: job_build_finance_summary</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 1] 222222222222:athena:silver.order_metrics.sum_order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Type: COLUMN | Service: athena | DataType: decimal(12,2)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Tags: ['aggregated', 'financial']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ← Fed by 1 upstream source(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 222222222222:glue:silver.orders_cleaned.order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Transform: AGGREGATION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Expression: SUM(order_total) GROUP BY order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Job: athena_view_order_metrics</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 2] 222222222222:glue:silver.orders_cleaned.order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Type: COLUMN | Service: glue | DataType: decimal(10,2)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Tags: ['cleaned', 'financial', 'derived']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ← Fed by 2 upstream source(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     ├── 111111111111:glue:bronze.raw_orders.qty</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Transform: EXPRESSION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Expression: CAST(qty AS INT) * CAST(unit_price AS DECIMAL)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     │   Job: job_clean_orders</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 111111111111:glue:bronze.raw_orders.unit_price</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Transform: EXPRESSION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Expression: CAST(qty AS INT) * CAST(unit_price AS DECIMAL)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Job: job_clean_orders</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 3] 111111111111:glue:bronze.raw_orders.qty</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Type: COLUMN | Service: glue | DataType: string</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Tags: ['raw']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ← Fed by 1 upstream source(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 111111111111:mariadb:ecommerce.orders.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Transform: JDBC_EXTRACT</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#         Job: job_extract_orders</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 4] 111111111111:mariadb:ecommerce.orders.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Type: COLUMN | Service: mariadb | DataType: varchar(10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   Tags: ['source-of-truth', 'financial']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   🌱 ROOT SOURCE (no further upstream)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   🌱 ROOT SOURCES (original data origins):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → 111111111111:mariadb:ecommerce.orders.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Service: mariadb</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Type: varchar(10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Tags: ['source-of-truth', 'financial']</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → 111111111111:mariadb:ecommerce.orders.unit_price</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Service: mariadb</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Type: varchar(10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Tags: ['source-of-truth', 'financial']</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 5: Impact analysis (what breaks if we change source?) ---</span><span>
+</span><span>python lineage/07_lineage_cli.py downstream </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --node </span><span class="token" style="color: rgb(163, 21, 21);">"111111111111:mariadb:ecommerce.orders.quantity"</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --depth </span><span class="token" style="color: rgb(54, 172, 170);">10</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   DOWNSTREAM LINEAGE: 111111111111:mariadb:ecommerce.orders.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 0] 111111111111:mariadb:ecommerce.orders.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Feeds 1 downstream target(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 111111111111:glue:bronze.raw_orders.qty</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 1] 111111111111:glue:bronze.raw_orders.qty</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Feeds 2 downstream target(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     ├── 222222222222:glue:silver.orders_cleaned.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 222222222222:glue:silver.orders_cleaned.order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 2] 222222222222:glue:silver.orders_cleaned.order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Feeds 1 downstream target(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 222222222222:athena:silver.order_metrics.sum_order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 3] 222222222222:athena:silver.order_metrics.sum_order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Feeds 1 downstream target(s):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     └── 333333333333:redshift:gold.finance_summary.total_revenue_adjusted</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># [Depth 4] 333333333333:redshift:gold.finance_summary.total_revenue_adjusted</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Feeds 0 downstream target(s) (LEAF NODE — dashboard endpoint)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ⚠️  IMPACT: 5 downstream assets affected</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 6: Parse an Athena view for lineage ---</span><span>
+</span><span>python lineage/07_lineage_cli.py parse-view </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --database silver </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --view-name order_metrics </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --sql </span><span class="token" style="color: rgb(163, 21, 21);">"CREATE VIEW silver.order_metrics AS SELECT o.order_date, SUM(o.order_total) as sum_order_total, SUM(COALESCE(r.refund_amount, 0)) as sum_refund_amount FROM silver.orders_cleaned o LEFT JOIN silver.refunds_processed r ON o.order_id = r.order_id GROUP BY o.order_date"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 📋 PARSED LINEAGE FROM SQL VIEW</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   silver.orders_cleaned.order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → [PASSTHROUGH] → silver.order_metrics.order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Expression: o.order_date</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   silver.orders_cleaned.order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → [AGGREGATION] → silver.order_metrics.sum_order_total</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Expression: SUM(o.order_total)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   silver.refunds_processed.refund_amount</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → [AGGREGATION] → silver.order_metrics.sum_refund_amount</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Expression: SUM(COALESCE(r.refund_amount, 0))</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Total column mappings found: 3</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 7: Check lineage from a specific job run ---</span><span>
+</span><span>python lineage/07_lineage_cli.py job-run </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>    --run-id </span><span class="token" style="color: rgb(163, 21, 21);">"jr_clean_20250115_001"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Expected output:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 📋 LINEAGE FOR JOB RUN: jr_clean_20250115_001</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   111111111111:glue:bronze.raw_orders.qty</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → 222222222222:glue:silver.orders_cleaned.quantity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Transform: {"type":"RENAME_AND_CAST","rename":{"from":"qty","to":"quantity"},...}</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   111111111111:glue:bronze.raw_orders.unit_price</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → 222222222222:glue:silver.orders_cleaned.unit_price</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     Transform: {"type":"CAST","cast":{"from_type":"string","to_type":"decimal(10,2)"}}</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ... (all edges from that specific run)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Total edges: 6</span></code></pre></div>
+<hr>
+<h3>Module 10: Scheduled Lineage Refresh (Passive Collection Cron)</h3>
+
+<hr>
+<h3>Module 11: Lineage Visualization (ASCII Graph + JSON Export)</h3>
+
+<hr>
+<h3>Module File Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>lineage/
+</span>├── 01_setup_lineage_store.py          # DynamoDB + S3 infrastructure
+├── 02_lineage_emitter.py              # Core library: emit lineage events
+├── 03_glue_job_with_lineage.py        # Example: instrumented Glue ETL
+├── 04_lineage_traversal.py            # Graph traversal engine (BFS)
+├── 05_sql_lineage_parser.py           # Passive: parse SQL views
+├── 06_cloudtrail_lineage_collector.py # Passive: CloudTrail API logs
+├── 07_lineage_cli.py                  # Investigation CLI tool
+├── 08_seed_full_lineage.py            # Test data: 5-hop chain
+├── 10_scheduled_lineage_refresh.py    # Cron: periodic passive scan
+└── 11_lineage_visualizer.py           # ASCII + JSON + DOT rendering</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ AWS has NO native end-to-end lineage service — you must BUILD it
+→ Column-level lineage requires ACTIVE instrumentation (emit events during ETL)
+→ Table-level lineage can be inferred PASSIVELY (CloudTrail + Catalog)
+→ The hybrid approach covers 95% of lineage needs at reasonable cost
+→ DynamoDB adjacency list pattern handles graph traversal for medium-scale
+→ SQL views create invisible lineage edges — must parse SQL to discover them
+→ Cross-account lineage works by centralizing DynamoDB + using node_id prefixes
+→ Lineage emission must NEVER block production ETL (fire-and-forget)
+→ Historical lineage (S3 archive) enables point-in-time audit compliance
+→ The "investigate" command found the $1.6M discrepancy in seconds:
+   → job_clean_orders had a filter: status != 'cancelled'
+   → Cancelled orders with valid revenue were being DROPPED
+   → Fix: include cancelled orders in revenue but flag them separately
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 73 (Full Data Lake Platform):
+   → Lineage tracks data flow THROUGH the lake
+   → Bronze → Silver → Gold path is now auditable
+
+→ Project 74 (Lake Formation Column-Level Security):
+   → Lake Formation TAGS classify columns (PII, financial)
+   → Lineage TRACES those columns across transformations
+   → Together: "this PII column flows from MariaDB through 5 hops to dashboard"
+
+→ Project 71 (Data Mesh):
+   → Each domain publishes data products
+   → Lineage proves WHERE each product's data originates
+   → Cross-account lineage enables mesh-wide traceability
+
+→ Project 44 (Medallion Architecture):
+   → Bronze/Silver/Gold zones define the physical layers
+   → Lineage maps the LOGICAL flow across those layers
+   → Without lineage, medallion is just folder organization
+
+→ Project 68 (Data Quality):
+   → Quality checks say IF data is bad
+   → Lineage says WHERE the bad data came from
+   → Together: detect problem + trace to root cause
+
+→ Project 56-60 (Cross-Account patterns):
+   → Cross-account IAM (AssumeRole) enables lineage writes to central table
+   → node_id includes account_id for disambiguation
+   → Single DynamoDB table spans all accounts
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 78: "Production SLA: 99.9% Pipeline Uptime with Auto-Recovery"
+   → Lineage tells you WHAT is affected when something breaks
+   → SLA monitoring tells you WHEN something breaks
+   → Combined: "Pipeline X failed at 3AM, affecting these 12 downstream tables,
+     impacting the CFO dashboard — auto-recovering now, ETA 15 minutes"</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The lineage system is live
+</span>→ Any column can be traced to its root source in seconds
+→ The CFO's $1.6M discrepancy was resolved in 10 minutes
+→ Impact analysis prevents breaking downstream consumers
+
+BUT: The VP of Engineering asks a new question:
+
+"We promised the board 99.9% pipeline uptime
+ That means &lt; 8.76 hours of downtime per YEAR
+ Last month alone, we had 14 hours of failures
+
+ HOW do we:
+ → Detect failures within 2 minutes?
+ → Auto-recover without human intervention?
+ → Escalate to on-call only when auto-recovery fails?
+ → Prove to the board we're hitting 99.9%?"
+
+YOU: "We need composite alarms, Step Function retry/catch patterns,
+      SNS escalation chains, and a metrics dashboard.
+      Lineage tells us WHAT is affected.
+      SLA monitoring tells us WHEN and HOW FAST we recover."
+
+→ Project 78: "Production SLA: 99.9% Pipeline Uptime with Auto-Recovery"
+→ Introduces: CloudWatch Composite Alarms → Step Function Retry/Catch
+  → SNS Escalation → SLA Dashboard → Runbook Automation</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="11" ========== -->
+<div class="chat-message" data-index="11"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-76.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 77 of 80</span>
+    <span class="nav-project-title">TRACK DATA LINEAGE — WHERE DID THIS COLUMN COME FROM 5 HOPS AGO?</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-78.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-78.html") window.location = "project-78.html";
+  if (e.key === 'ArrowLeft' && "project-76.html") window.location = "project-76.html";
+});
+</script>
+</body>
+</html>

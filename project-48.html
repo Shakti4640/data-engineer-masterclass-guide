@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 48: QUERY A SPECIFIC COLUMN FROM A HUGE CSV WITHOUT FULL SCAN — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:60%"></div></div>
+<div id="progress-label">60%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 48 of 80</div>
+  <div class="project-title">QUERY A SPECIFIC COLUMN FROM A HUGE CSV WITHOUT FULL SCAN</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — data platform mature, team growing
+</span>Team: 5-person data team + 2 junior data engineers onboarding
+
+CURRENT STATE (built through Projects 1–47):
+→ Medallion data lake: Bronze (CSV) → Silver (Parquet) → Gold (Parquet)
+→ Bronze zone: raw CSVs from MariaDB CDC + full dumps
+→ Silver/Gold: Parquet with partition projection + Athena
+→ DR configured: us-east-2 → us-west-2 (Project 47)
+
+THE PRACTICAL PROBLEM:
+
+  Junior DE (Sarah) is investigating a data quality issue:
+  
+  "The Silver orders table has 47 rows where total_amount = 0.
+   I need to check if the Bronze CSV also has zeros,
+   or if our Bronze→Silver ETL introduced the problem."
+  
+  Bronze file: s3://quickcart-datalake-prod/bronze/mariadb/full_dump/orders/
+               year=2025/month=01/day=15/orders_20250115.csv
+  
+  File size: 487 MB (5.2 million rows)
+
+  Sarah's CURRENT approach:
+  → aws s3 cp s3://...orders_20250115.csv /tmp/
+  → Wait 45 seconds for 487 MB download
+  → grep "0.00" /tmp/orders_20250115.csv | head -50
+  → Or: python script to read CSV and filter
+
+  PROBLEMS:
+  → 487 MB download for checking ONE column = wasteful
+  → EC2 /tmp might not have 487 MB free
+  → If checking 30 days of files: 30 × 487 MB = 14.6 GB download
+  → Data transfer cost: $0.09/GB × 14.6 GB = $1.31 (small but wasteful)
+  → Time: 30 × 45 seconds = 22 minutes just downloading
+
+  WHAT SARAH ACTUALLY NEEDS:
+  → SELECT order_id, total_amount FROM orders_20250115.csv 
+    WHERE total_amount = 0
+  → Expected result: ~50 rows, ~2 KB of data
+  → Instead of downloading 487 MB, read only what's needed
+
+  Senior DE (you): "Use S3 Select. It runs SQL directly on the CSV
+  in S3 and returns only the matching rows. You'll get your answer
+  in 2 seconds without downloading anything."
+
+  Sarah: "S3 can run SQL?!"
+  You: "On individual objects, yes. For full table queries use Athena.
+        For single-file inspection, S3 Select is faster and cheaper."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand S3 Select vs Athena vs Download
+</span>
+  ┌────────────────────────┬──────────────────┬────────────────────┬──────────────────┐
+  │ Approach               │ Data Transferred │ Time (487 MB CSV)  │ Cost             │
+  ├────────────────────────┼──────────────────┼────────────────────┼──────────────────┤
+  │ Download entire file   │ 487 MB           │ ~45 seconds        │ $0.044 transfer  │
+  │ then grep locally      │                  │ + processing time  │                  │
+  ├────────────────────────┼──────────────────┼────────────────────┼──────────────────┤
+  │ Athena query           │ 487 MB scanned   │ ~8 seconds         │ $0.0024 scan     │
+  │ (needs Catalog table)  │ (full scan, CSV) │ (Athena overhead)  │ + Athena fees    │
+  ├────────────────────────┼──────────────────┼────────────────────┼──────────────────┤
+  │ S3 Select              │ ~2 KB returned   │ ~2 seconds         │ $0.0004 scan     │
+  │ (SQL on single object) │ (only matches)   │ (no Athena overhead│ + $0.0000007     │
+  │                        │                  │  no Catalog needed)│   per returned   │
+  └────────────────────────┴──────────────────┴────────────────────┴──────────────────┘
+
+  S3 Select is the CLEAR winner for single-file inspection.
+
+Step 2: Understand S3 Select capabilities
+
+  WHAT S3 Select CAN do:
+  → SELECT specific columns from CSV, JSON, or Parquet objects
+  → WHERE clause filtering (equality, comparison, LIKE, IS NULL)
+  → Aggregate functions: COUNT, SUM, AVG, MIN, MAX
+  → LIMIT clause
+  → CAST for type conversion
+  → String functions: LOWER, UPPER, TRIM, SUBSTRING, CHAR_LENGTH
+  → Date functions (limited)
+  → Logical: AND, OR, NOT, IN, BETWEEN
+
+  WHAT S3 Select CANNOT do:
+  → JOIN (single object only — no multi-file queries)
+  → GROUP BY (aggregates apply to entire result)
+  → ORDER BY (results not sorted)
+  → Subqueries
+  → Window functions
+  → User-defined functions
+  → Multiple objects in one query (use Athena for that)
+
+Step 3: Understand when to use each tool
+
+  ┌──────────────────────────────┬─────────────────────────────────────┐
+  │ Use Case                     │ Best Tool                           │
+  ├──────────────────────────────┼─────────────────────────────────────┤
+  │ Inspect ONE file quickly     │ S3 Select ✅                        │
+  │ Query across many files      │ Athena                              │
+  │ Complex joins + aggregations │ Athena or Redshift                  │
+  │ Download specific rows       │ S3 Select (returns only matches)    │
+  │ Check file structure/schema  │ S3 Select (LIMIT 5)                 │
+  │ Count rows matching condition│ S3 Select (COUNT)                   │
+  │ Full table analytics         │ Athena on Silver/Gold               │
+  │ Ad-hoc Bronze inspection     │ S3 Select (no Catalog needed) ✅    │
+  └──────────────────────────────┴─────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  Sarah's investigation workflow:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  Step 1: Quick peek at file structure                           │
+  │  → S3 Select: SELECT * FROM s3object LIMIT 5                   │
+  │  → Returns: 5 rows, header inspection                          │
+  │  → Time: &lt;1 second                                             │
+  │                                                                 │
+  │  Step 2: Find zero-amount orders                                │
+  │  → S3 Select: SELECT order_id, total_amount                    │
+  │               FROM s3object                                     │
+  │               WHERE CAST(total_amount AS DECIMAL) = 0           │
+  │  → Returns: 47 matching rows (~2 KB)                           │
+  │  → Time: ~2 seconds                                            │
+  │                                                                 │
+  │  Step 3: Count total rows and zero rows                         │
+  │  → S3 Select: SELECT COUNT(*) FROM s3object                    │
+  │  → S3 Select: SELECT COUNT(*) FROM s3object                    │
+  │               WHERE CAST(total_amount AS DECIMAL) = 0           │
+  │  → Returns: total=5,200,000 and zeros=47                       │
+  │  → Time: ~3 seconds each                                       │
+  │                                                                 │
+  │  Step 4: Check multiple days (loop)                             │
+  │  → For each day's CSV: run S3 Select count                     │
+  │  → Build trend: zeros per day over 30 days                     │
+  │  → Time: ~30 × 3 seconds = 90 seconds                         │
+  │  → vs download: 30 × 45 seconds = 22 minutes                  │
+  │                                                                 │
+  │  CONCLUSION: "Bronze CSV already has 47 zeros.                  │
+  │   The issue is in the SOURCE, not our ETL pipeline."           │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Download file + local processing
+</span>→ aws s3 cp + grep/python
+→ Problem: slow, wastes bandwidth, needs disk space
+→ VERDICT: Works but inefficient for simple inspections
+
+Option B: Athena query on Bronze
+→ Create Glue Catalog table for Bronze CSV
+→ Run Athena query
+→ Problem: need to create/maintain Catalog table for raw CSVs
+→ Problem: Athena scans entire 487 MB even for simple filter
+→ Problem: Athena startup overhead (~3-5 seconds)
+→ VERDICT: Good for repeated queries, overkill for one-time inspection
+
+Option C: S3 Select
+→ Run SQL directly on the S3 object via API
+→ No Catalog table needed
+→ No Athena overhead
+→ Returns only matching data (not entire file)
+→ Works on CSV, JSON, and Parquet
+→ VERDICT: ✅ Perfect for single-file ad-hoc inspection
+
+Option D: S3 Select with Scan Range (partial file read)
+→ Read only a PORTION of the file (e.g., first 10 MB)
+→ Even faster than full-file S3 Select
+→ Problem: may miss matching rows outside scan range
+→ VERDICT: Good for sampling, not for complete filtering
+
+DECISION: Option C (S3 Select) + Option D (Scan Range for sampling)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use S3 Select for single-file ad-hoc inspection
+</span>   → Quick data quality checks on Bronze CSVs
+   → Schema discovery (what columns does this file have?)
+   → Row counting without downloading
+   → Filtering specific conditions
+
+2. Specify InputSerialization correctly
+   → CSV: specify FileHeaderInfo (USE, IGNORE, NONE)
+   → USE = first row is header, use column names in SQL
+   → IGNORE = first row is header but skip it
+   → NONE = no header, use _1, _2, _3 as column names
+   → QuickCart CSVs have headers → use FileHeaderInfo="USE"
+
+3. Specify OutputSerialization
+   → CSV: get results as CSV (easy to parse)
+   → JSON: get results as JSON (structured)
+   → For programmatic use: JSON
+   → For human inspection: CSV
+
+4. Use CAST for type-aware filtering
+   → CSV columns are ALL strings by default
+   → WHERE total_amount = 0 → string comparison "0" (misses "0.00")
+   → WHERE CAST(total_amount AS DECIMAL) = 0 → numeric comparison ✅
+   → CAST works for: INT, FLOAT, DECIMAL, BOOL, TIMESTAMP
+
+5. Handle streaming response correctly
+   → S3 Select returns results as a STREAM of events
+   → Events: Records (data), Stats (bytes scanned/returned), End
+   → Must iterate through EventStream to collect all records
+   → boto3: response['Payload'] is an EventStream iterator
+
+6. Use Scan Range for SAMPLING large files
+   → ScanRange: {"Start": 0, "End": 10485760}  (first 10 MB)
+   → Reads only specified byte range
+   → Much faster for sampling (don't need ALL matches)
+   → WARNING: may split a row at boundary → S3 handles this gracefully
+     (reads partial row at start, complete row at end)
+
+7. Build a reusable utility for the team
+   → Wrap S3 Select in a Python function
+   → Accept: bucket, key, SQL expression
+   → Return: parsed results as list of dicts
+   → Team can use for any Bronze file inspection</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use S3 Select for multi-file queries
+</span>   → S3 Select works on ONE object at a time
+   → For querying across 30 files: use a loop (OK for scripts)
+   → For querying across 1000 files: use Athena (much more efficient)
+
+2. DO NOT use S3 Select for Parquet when Athena is available
+   → S3 Select on Parquet: limited SQL, no partition pruning
+   → Athena on Parquet: full SQL, partition pruning, columnar read
+   → S3 Select on Parquet is useful only when Athena is unavailable
+     (e.g., no Glue Catalog table exists)
+
+3. DO NOT forget to handle compressed files
+   → S3 Select supports: GZIP, BZIP2 compressed CSVs
+   → Must specify CompressionType in InputSerialization
+   → NONE for uncompressed (default)
+   → GZIP for .gz files
+   → Cannot use ScanRange with compressed files
+
+4. DO NOT use S3 Select as a replacement for Athena
+   → S3 Select: single file, simple SQL, no joins/GROUP BY
+   → Athena: multi-file, full SQL, joins, GROUP BY, window functions
+   → S3 Select = inspection tool
+   → Athena = query engine
+
+5. DO NOT assume S3 Select is free
+   → Charged per data SCANNED: $0.002 per GB scanned
+   → Charged per data RETURNED: $0.0007 per GB returned
+   → 487 MB file: $0.002 × 0.487 = $0.00097 per query
+   → Cheap but not zero — 1000 queries = $0.97
+
+6. DO NOT use S3 Select on objects &gt; 256 GB (CSV) or &gt; 1 TB (Parquet)
+   → Hard limits for S3 Select
+   → For larger files: use Athena
+
+7. DO NOT ignore the 5-column LIMIT for S3 Select on CSV
+   → S3 Select: no column limit per se, but performance degrades
+     with many columns selected
+   → SELECT * on 100-column CSV: returns all columns → slow
+   → SELECT col1, col2 on 100-column CSV: much faster
+   → Always select only the columns you need</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────┬──────────────────────┬────────────────────────────┐
+</span>│ Scenario                              │ Best Tool            │ Why                        │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "What's in this ONE CSV file?"        │ S3 Select ✅          │ No setup, instant results  │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "How many rows match X in ONE file?"  │ S3 Select ✅          │ COUNT(*) on single object  │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Show me 5 sample rows from a file"   │ S3 Select + LIMIT ✅  │ No download needed         │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Query across 100 Parquet files"      │ Athena               │ Multi-file, partition prune│
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Complex JOIN + GROUP BY + ORDER BY"  │ Athena or Redshift   │ Full SQL engine needed     │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Download entire file for processing" │ s3 cp / boto3        │ Need full file locally     │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Quick validation of Bronze CSV"      │ S3 Select ✅          │ No Catalog, no Athena setup│
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Check if column exists in file"      │ S3 Select (LIMIT 1) ✅│ Reads only first row       │
+├───────────────────────────────────────┼──────────────────────┼────────────────────────────┤
+│ "Read specific rows from Glacier"     │ Glacier Select       │ Don't restore entire object│
+│ (archived Bronze data)                │ (covered below)      │                            │
+└───────────────────────────────────────┴──────────────────────┴────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE S3 SELECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When querying across MULTIPLE files
+</span>   → S3 Select = one object at a time
+   → 100 files = 100 API calls = slow
+   → Use Athena for multi-file queries
+
+2. When you need GROUP BY, ORDER BY, or JOINs
+   → S3 Select doesn't support these
+   → Aggregate functions (COUNT, SUM) work but on entire result set
+   → For grouped aggregations: use Athena
+
+3. When the file is Parquet and Athena table already exists
+   → Athena on Parquet: columnar read, partition pruning → very efficient
+   → S3 Select on Parquet: works but less optimized
+   → Only use S3 Select on Parquet when Athena isn't set up
+
+4. When file is in Glacier Deep Archive
+   → S3 Select doesn't work on Deep Archive
+   → Standard Glacier: use Glacier Select (different API)
+   → Deep Archive: must restore first, then query
+
+5. When result set is expected to be the ENTIRE file
+   → SELECT * FROM s3object (no WHERE) on 487 MB file
+   → S3 Select reads 487 MB AND returns 487 MB
+   → Slower than just downloading the file
+   → S3 Select wins when WHERE clause filters significantly
+
+6. When you need EXACT row ordering
+   → S3 Select doesn't guarantee output order
+   → For ordered results: download + sort locally, or use Athena</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: S3 SELECT                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ Request Flow                                                                │
+│  ━━━━━━━━━━━━━━━                                                               │
+│                                                                                 │
+│  Client sends: POST /bucket/key?select&amp;select-type=2                           │
+│  Body: {                                                                        │
+│    "Expression": "SELECT order_id, total_amount FROM s3object                  │
+│                   WHERE CAST(total_amount AS DECIMAL) = 0",                    │
+│    "ExpressionType": "SQL",                                                    │
+│    "InputSerialization": {                                                      │
+│      "CSV": {"FileHeaderInfo": "USE", "FieldDelimiter": ","}                   │
+│    },                                                                           │
+│    "OutputSerialization": {"CSV": {}}                                           │
+│  }                                                                              │
+│                                                                                 │
+│  S3 internal processing:                                                        │
+│  1. S3 receives SelectObjectContent request                                     │
+│  2. S3 does NOT download the object to a compute node                          │
+│     → Processing happens INSIDE S3 storage infrastructure                      │
+│     → This is why it's so fast — no data movement                              │
+│  3. S3 reads the object in chunks (streaming)                                   │
+│  4. For each chunk:                                                             │
+│     a. Parse CSV rows                                                           │
+│     b. Evaluate WHERE clause per row                                            │
+│     c. If match: project selected columns                                       │
+│     d. Buffer matching rows                                                     │
+│  5. Stream results back to client as EventStream                               │
+│  6. After entire object processed: send Stats event + End event                │
+│                                                                                 │
+│                                                                                 │
+│  ❷ EventStream Response Format                                                 │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                              │
+│                                                                                 │
+│  S3 Select returns an EventStream (HTTP chunked transfer encoding):             │
+│                                                                                 │
+│  Event 1: {"Records": {"Payload": b"ORD-001,0.00\nORD-047,0.00\n..."}}        │
+│  Event 2: {"Records": {"Payload": b"ORD-123,0.00\n..."}}                       │
+│  ...                                                                            │
+│  Event N: {"Stats": {"Details": {                                               │
+│              "BytesScanned": 510656512,      ← 487 MB scanned                  │
+│              "BytesProcessed": 510656512,    ← 487 MB processed                │
+│              "BytesReturned": 2048           ← 2 KB returned                   │
+│            }}}                                                                  │
+│  Event N+1: {"End": {}}                                                        │
+│                                                                                 │
+│  KEY INSIGHT:                                                                   │
+│  → BytesScanned: 487 MB (must read entire file for WHERE evaluation)           │
+│  → BytesReturned: 2 KB (only matching rows sent back)                          │
+│  → Network transfer: 2 KB (not 487 MB!)                                        │
+│  → You pay for: BytesScanned + BytesReturned                                   │
+│                                                                                 │
+│                                                                                 │
+│  ❸ ScanRange (Partial File Read)                                               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                              │
+│                                                                                 │
+│  ScanRange: {"Start": 0, "End": 10485760}  (first 10 MB)                      │
+│                                                                                 │
+│  How it works:                                                                  │
+│  1. S3 reads ONLY bytes 0 to 10,485,760 of the object                          │
+│  2. If Start &gt; 0: S3 seeks to Start, finds next complete row                   │
+│     (skips partial row at beginning of range)                                   │
+│  3. If End &lt; file size: S3 reads past End to find row boundary                 │
+│     (completes the last row that spans the boundary)                            │
+│  4. Processes only rows within the range                                        │
+│                                                                                 │
+│  WHY use ScanRange:                                                             │
+│  → Sample first N bytes without scanning entire file                           │
+│  → Parallel processing: split file into ranges, query each in parallel         │
+│  → Cost: pay only for bytes scanned in range (not entire file)                 │
+│                                                                                 │
+│  LIMITATIONS:                                                                   │
+│  → Cannot use with compressed files (GZIP, BZIP2)                              │
+│     (compression prevents random byte-offset access)                           │
+│  → Cannot use with JSON objects                                                 │
+│  → Works with: CSV (uncompressed) and Parquet                                  │
+│                                                                                 │
+│                                                                                 │
+│  ❹ S3 Select on Parquet                                                        │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━                                                   │
+│                                                                                 │
+│  Parquet is columnar → S3 Select can skip unneeded columns:                    │
+│                                                                                 │
+│  Parquet file structure:                                                        │
+│  ┌────────────────────────────────────────────────┐                             │
+│  │ Row Group 1:                                    │                             │
+│  │   Column: order_id     [100 KB]                 │ ← read (selected)          │
+│  │   Column: customer_id  [80 KB]                  │ ← SKIP                     │
+│  │   Column: product_id   [80 KB]                  │ ← SKIP                     │
+│  │   Column: total_amount [40 KB]                  │ ← read (in WHERE + SELECT) │
+│  │   Column: status       [20 KB]                  │ ← SKIP                     │
+│  │   ... (10 more columns)                         │ ← SKIP                     │
+│  │ Row Group 2:                                    │                             │
+│  │   ... (same structure)                          │                             │
+│  └────────────────────────────────────────────────┘                             │
+│                                                                                 │
+│  For CSV: S3 must read ALL columns (row-based → can't skip columns)            │
+│  For Parquet: S3 reads ONLY columns in SELECT + WHERE → much less I/O          │
+│                                                                                 │
+│  SELECT order_id, total_amount FROM s3object WHERE total_amount = 0:           │
+│  → CSV (487 MB): scans 487 MB (all columns)                                    │
+│  → Parquet (same data, ~150 MB): scans ~30 MB (2 columns only)                │
+│  → Parquet is 16× less data scanned → 16× cheaper                             │
+│                                                                                 │
+│                                                                                 │
+│  ❺ Pricing                                                                     │
+│  ━━━━━━━━━                                                                     │
+│                                                                                 │
+│  S3 Select pricing:                                                             │
+│  → Data scanned: $0.002 per GB                                                 │
+│  → Data returned: $0.0007 per GB                                               │
+│                                                                                 │
+│  Example: 487 MB CSV, 2 KB returned                                             │
+│  → Scanned: 0.487 GB × $0.002 = $0.000974                                     │
+│  → Returned: 0.000002 GB × $0.0007 = $0.0000000014                            │
+│  → Total: ~$0.001 per query                                                    │
+│                                                                                 │
+│  Comparison with Athena:                                                        │
+│  → Athena: $5.00 per TB scanned = $0.005 per GB                               │
+│  → S3 Select: $0.002 per GB scanned                                            │
+│  → S3 Select is 2.5× cheaper per GB scanned                                   │
+│  → BUT Athena on Parquet can skip columns → may scan less                      │
+│                                                                                 │
+│                                                                                 │
+│  ❻ Glacier Select                                                              │
+│  ━━━━━━━━━━━━━━━━                                                              │
+│                                                                                 │
+│  For Bronze data that's been moved to Glacier (lifecycle rule, Project 44):    │
+│                                                                                 │
+│  Normal Glacier access:                                                         │
+│  → Restore entire object: 1-12 hours (Standard), 1-5 minutes (Expedited)      │
+│  → Then download: full 487 MB                                                   │
+│  → Cost: $0.01 per GB restored + retrieval fees                                │
+│                                                                                 │
+│  Glacier Select:                                                                │
+│  → Run SQL on Glacier object WITHOUT full restore                              │
+│  → Returns only matching rows                                                   │
+│  → Output written to S3 Standard (or returned directly)                        │
+│  → Time: minutes to hours (depending on tier)                                  │
+│  → Cost: $0.008 per GB scanned + $0.01 per GB returned                        │
+│                                                                                 │
+│  WHEN to use Glacier Select:                                                    │
+│  → Need a few rows from an archived Bronze CSV                                 │
+│  → Don't want to restore entire 487 MB from Glacier                            │
+│  → Willing to wait minutes for results (not instant like S3 Select)            │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "S3 Select returns empty results but I know data exists"
+</span>→ Cause #1: FileHeaderInfo wrong — column names don't match
+   - FileHeaderInfo="NONE" but SQL uses column names → no match
+   - Fix: use FileHeaderInfo="USE" when CSV has headers
+→ Cause #2: Type mismatch in WHERE clause
+   - WHERE total_amount = 0 compares STRING "0.00" to STRING "0" → no match
+   - Fix: WHERE CAST(total_amount AS DECIMAL) = 0
+→ Cause #3: Extra whitespace in CSV values
+   - Column value: " 0.00 " (with spaces) → doesn't match "0.00"
+   - Fix: WHERE TRIM(total_amount) = '0.00'
+
+PITFALL 2: "S3 Select is slow — takes 30 seconds for 487 MB"
+→ Cause: S3 must scan the ENTIRE file (no index, no column pruning for CSV)
+→ This is normal for CSV — row-based format must read all bytes
+→ Fix: if speed matters, convert to Parquet first
+→ S3 Select on Parquet: reads only needed columns → much faster
+
+PITFALL 3: "S3 Select fails with 'MalformedXML' error"
+→ Cause: SQL expression has unescaped characters
+→ Single quotes in SQL sent via XML body → XML parsing error
+→ Fix: use boto3 (handles escaping) instead of raw API calls
+
+PITFALL 4: "S3 Select truncates results"
+→ Cause: MaxBytesReturned limit (default: none, but may be set)
+→ Or: streaming response not fully consumed
+→ Fix: iterate through ENTIRE EventStream
+→ Check Stats event: BytesReturned should match received data
+
+PITFALL 5: "ScanRange returns unexpected number of rows"
+→ Cause: ScanRange splits rows at byte boundaries
+→ S3 adjusts to complete rows, but some rows may be partially
+  included or excluded at boundaries
+→ This is by design — ScanRange is for sampling, not exact counts
+→ Fix: for exact results, don't use ScanRange (scan entire file)
+
+PITFALL 6: "S3 Select fails on compressed CSV"
+→ Cause: CompressionType not specified
+→ Default: NONE — S3 tries to parse GZIP bytes as CSV → garbage
+→ Fix: specify CompressionType="GZIP" in InputSerialization
+→ Note: ScanRange not supported with compression
+
+PITFALL 7: "S3 Select on Parquet fails with 'unsupported type'"
+→ Cause: Parquet has complex types (MAP, ARRAY, STRUCT)
+→ S3 Select supports only primitive Parquet types
+→ Fix: flatten complex types during ETL (Bronze→Silver)
+→ Or: use Athena for Parquet with complex types</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SINGLE FILE PERFORMANCE:
+</span>→ 1 MB CSV: &lt; 0.5 seconds
+→ 100 MB CSV: ~1-3 seconds
+→ 487 MB CSV: ~2-5 seconds
+→ 1 GB CSV: ~5-10 seconds
+→ 10 GB CSV: ~30-60 seconds (consider Athena at this size)
+→ Max CSV size: 256 GB (S3 Select limit)
+
+MULTI-FILE SCANNING (loop):
+→ 30 files × 3 seconds each = 90 seconds (sequential)
+→ With concurrent requests: 30 files / 10 parallel = ~9 seconds
+→ At 100+ files: switch to Athena (single query, parallel scan)
+
+COST AT SCALE:
+→ 1 query on 487 MB CSV: $0.001
+→ 100 queries/day on 487 MB: $0.10/day = $3/month
+→ 1000 queries/day: $1/day = $30/month → consider building pipeline
+→ Rule of thumb: if cost &gt; $10/month for same query → build ETL
+
+PARQUET vs CSV PERFORMANCE:
+→ Same data, 15 columns, querying 2 columns:
+  - CSV 487 MB: scans 487 MB → $0.001
+  - Parquet 150 MB: scans ~20 MB (2/15 columns) → $0.00004
+  - Parquet is 25× cheaper for column-specific queries
+
+CONCURRENT S3 SELECT REQUESTS:
+→ No hard limit on concurrent S3 Select requests
+→ S3 handles parallel requests efficiently
+→ Practical limit: Lambda/EC2 concurrency + API throttling
+→ 100 concurrent requests: no problem
+→ 1000 concurrent: may see throttling → implement retry</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(48)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: S3 Select Utility Library</h3>
+
+<h3>Step 2: Sarah's Investigation Script</h3>
+
+<h3>Step 3: S3 Select vs Athena vs Download Benchmark</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># NO SETUP NEEDED — S3 Select works on any existing S3 object</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Sarah's investigation (primary use case)</span><span>
+</span>python 48_02_investigate_data_quality.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Performance benchmark</span><span>
+</span>python 48_03_benchmark_comparison.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Sarah's Investigation):
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║  🔍 DATA QUALITY INVESTIGATION: Zero-Amount Orders                    ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 Step 1: File structure peek (first 5 rows)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ⏱  Duration: 0.84s
+   📊 Scanned: 0.02 MB
+   📊 Returned: 0.45 KB
+   📊 Rows returned: 5
+   order_id           | customer_id        | product_id         | quantity           | unit_price
+   ────────────────────────────────────────────────────────────
+   ORD-20250115-00001 | CUST-004821        | PROD-00342         | 2                  | 44.99
+   ORD-20250115-00002 | CUST-012447        | PROD-00891         | 1                  | 249.50
+   ...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 Step 3: Orders with total_amount = 0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ⏱  Duration: 2.31s
+   📊 Scanned: 487.24 MB
+   📊 Returned: 1.87 KB
+   💰 Cost: $0.000975
+   📊 Reduction: 99.9% less data transferred
+   📊 Rows returned: 47
+   order_id           | customer_id        | total_amount       | status             | order_date
+   ────────────────────────────────────────────────────────────
+   ORD-20250115-01247 | CUST-031882        | 0.00               | completed          | 2025-01-15
+   ORD-20250115-02891 | CUST-008123        | 0.00               | completed          | 2025-01-15
+   ...
+
+╔════════════════════════════════════════════════════════════════════════╗
+║                    INVESTIGATION CONCLUSION                            ║
+╠════════════════════════════════════════════════════════════════════════╣
+║                                                                        ║
+║    Bronze CSV contains 47 zero-amount orders.                          ║
+║    Issue is in SOURCE DATA, not our ETL pipeline.                      ║
+║    These are likely gift card orders (no product).                      ║
+║                                                                        ║
+║    Action: Update Silver ETL to flag gift card orders                  ║
+║    instead of treating total_amount=0 as error.                        ║
+╚════════════════════════════════════════════════════════════════════════╝</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 Select: run SQL directly on individual S3 objects (CSV, JSON, Parquet)
+→ No Glue Catalog, no Athena setup, no infrastructure needed
+→ Returns ONLY matching rows — 487 MB file → 2 KB returned (99.9% reduction)
+→ CSV: S3 must scan entire file (row-based), but only returns matches
+→ Parquet: S3 reads only selected columns (columnar) → much less scanning
+→ ScanRange: read only a byte range of the file (sampling, not complete filter)
+→ ScanRange NOT supported with compressed files (GZIP, BZIP2)
+→ FileHeaderInfo="USE": reference columns by name in SQL
+→ CAST required for numeric comparisons on CSV (all values are strings)
+→ EventStream response: iterate through Records, Stats, End events
+→ Cost: $0.002/GB scanned + $0.0007/GB returned (cheaper than Athena per GB)
+→ Glacier Select: same concept but for archived objects (slower, different API)
+
+DECISION FRAMEWORK:
+━━━━━━━━━━━━━━━━━━
+  "Which tool should I use to read S3 data?"
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Need to inspect ONE file quickly?                               │
+  │ → S3 Select ✅                                                  │
+  │                                                                 │
+  │ Need to query MANY files with SQL?                              │
+  │ → Athena (Projects 16, 24, 26)                                 │
+  │                                                                 │
+  │ Need JOINs, GROUP BY, ORDER BY?                                │
+  │ → Athena or Redshift                                            │
+  │                                                                 │
+  │ Need to download entire file for local processing?              │
+  │ → boto3 download / aws s3 cp                                   │
+  │                                                                 │
+  │ File is in Glacier, need specific rows?                         │
+  │ → Glacier Select (slower but avoids full restore)               │
+  │                                                                 │
+  │ Querying Parquet with existing Catalog table?                   │
+  │ → Athena (better optimization than S3 Select on Parquet)        │
+  │                                                                 │
+  │ Querying Bronze CSV with no Catalog table?                      │
+  │ → S3 Select ✅ (no setup needed)                                │
+  └─────────────────────────────────────────────────────────────────┘
+
+PERFORMANCE COMPARISON (487 MB CSV, filtering 47 rows):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ┌───────────────────────┬──────────┬────────────┬────────────┐
+  │ Method                │ Duration │ Data Moved │ Cost       │
+  ├───────────────────────┼──────────┼────────────┼────────────┤
+  │ S3 Select (CSV)       │ 2.3s     │ 2 KB       │ $0.001     │
+  │ S3 Select (Parquet)   │ 0.8s     │ 2 KB       │ $0.00004   │
+  │ Athena (Parquet)      │ 5.2s     │ 20 MB scan │ $0.0001    │
+  │ Download + grep       │ 47s      │ 487 MB     │ $0.044     │
+  └───────────────────────┴──────────┴────────────┴────────────┘
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 object storage fundamentals (S3 Select operates on objects)
+→ Project 4: S3 storage classes (Glacier Select for archived data)
+→ Project 16: Athena basics (S3 Select is the single-file complement)
+→ Project 25: CSV → Parquet conversion (Parquet gives S3 Select column pruning)
+→ Project 44: Medallion architecture (S3 Select perfect for Bronze CSV inspection)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 49: Encapsulate Complex Redshift ETL Logic in Stored Procedures
+   (Now that we can inspect data at every layer — Bronze via S3 Select,
+    Silver/Gold via Athena — we need to improve the Redshift side.
+    Complex ETL logic inside Glue jobs is hard to test and debug.
+    Redshift stored procedures encapsulate SQL logic server-side,
+    making it transactional, testable, and reusable.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 Select is now the team's go-to tool for quick Bronze inspection.
+</span>Sarah resolved the zero-amount investigation in 3 minutes instead of 30.
+
+Meanwhile, the analytics engineer is struggling with Redshift:
+
+"Our Redshift MERGE logic (Project 42) is getting complex.
+ We now have 8 staging tables, 12 MERGE statements,
+ 3 deduplication steps, and 5 post-merge validation queries.
+ 
+ All of this is orchestrated from Glue or Step Functions,
+ sending one SQL statement at a time via psycopg2.
+ 
+ Problems:
+ → 20+ round trips between Glue and Redshift per pipeline run
+ → Each round trip: ~100ms network latency
+ → No transaction control across multiple statements
+ → If step 7 of 12 fails: steps 1-6 already committed → partial state
+ → Can't reuse logic: same MERGE pattern copy-pasted in 5 Glue jobs
+ → Testing: must run entire Glue job to test one SQL change
+ 
+ Can we encapsulate all this Redshift logic in a stored procedure?
+ One call: CALL load_daily_orders() → runs all 12 steps atomically?"
+
+→ Project 49: "Encapsulate Complex Redshift ETL Logic in Stored Procedures"
+→ Introduces: Redshift PL/pgSQL stored procedures, transaction control,
+  error handling, RAISE/EXCEPTION, cursor loops, reusable procedures</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="37" ========== -->
+<div class="chat-message" data-index="37"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-47.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 48 of 80</span>
+    <span class="nav-project-title">QUERY A SPECIFIC COLUMN FROM A HUGE CSV WITHOUT FULL SCAN</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-49.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-49.html") window.location = "project-49.html";
+  if (e.key === 'ArrowLeft' && "project-47.html") window.location = "project-47.html";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 22: EXPORT REDSHIFT QUERY RESULTS BACK TO S3 FOR SHARING — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:28%"></div></div>
+<div id="progress-label">28%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 22 of 80</div>
+  <div class="project-title">EXPORT REDSHIFT QUERY RESULTS BACK TO S3 FOR SHARING</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — 10M orders now loaded in Redshift (Project 21)
+</span>Situation:
+→ Finance team needs monthly revenue summary as CSV in S3
+   → Their Excel/Tableau tools pull from S3 directly
+   → They do NOT have Redshift access (nor should they)
+
+→ Partner company "ShipFast" needs order-level data for logistics
+   → They have read-only access to a specific S3 prefix
+   → Cross-account S3 sharing already set up (covered in Project 56)
+   → They need daily extracts in a predictable S3 location
+
+→ Data science team needs a Parquet snapshot of orders for SageMaker
+   → SageMaker reads from S3, not Redshift
+   → Parquet is 10x more efficient than CSV for analytics
+
+→ Junior engineer tried this approach:
+   1. Connected to Redshift via psycopg2
+   2. SELECT * FROM orders (10M rows)
+   3. fetchall() into Python memory
+   4. Wrote to CSV with csv.writer
+   5. Uploaded CSV to S3 via boto3
+   → Result: EC2 ran out of memory at 6M rows (8GB instance)
+   → Even if it worked: single-threaded, took 45 minutes for partial data
+
+CTO: "There must be a native way to push Redshift data to S3"
+YOU: "UNLOAD — it's the exact mirror of COPY.
+      COPY reads S3 → Redshift. UNLOAD writes Redshift → S3.
+      Parallel, compressed, and never touches your application server."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY client-side export fails
+</span>→ SELECT * returns ALL data to leader node → then to client
+→ Client (EC2/laptop) must hold entire result set in memory
+→ 10M rows × 8 columns × ~100 bytes/row = ~1 GB in memory
+→ With Python overhead: 3-5 GB RAM consumed
+→ fetchall() loads EVERYTHING at once (no streaming)
+→ Single-threaded write to S3 = slow
+
+Step 2: Understand UNLOAD's advantage
+→ Runs the query INSIDE Redshift
+→ Each compute node slice writes its portion DIRECTLY to S3
+→ Data NEVER flows through leader node or client
+→ 4 slices = 4 parallel S3 writers
+→ Supports GZIP compression on write
+→ 10M rows exported in 30-60 seconds (vs 45+ minutes client-side)
+
+Step 3: Map the three use cases to UNLOAD patterns
+→ Finance CSV: UNLOAD with HEADER, CSV, DELIMITER ','
+→ Partner extract: UNLOAD with PARTITION BY date
+→ Data science Parquet: UNLOAD with FORMAT AS PARQUET
+
+Step 4: Understand output file structure
+→ UNLOAD creates MULTIPLE output files (one per slice)
+→ This is BY DESIGN — parallel write = fast
+→ Can force single file with PARALLEL OFF (slower but simpler)
+→ Each file named: {prefix}000, {prefix}001, {prefix}002...</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────┐
+  │              REDSHIFT CLUSTER (2x dc2.large)        │
+  │                                                     │
+  │  Leader Node                                        │
+  │   ├── Parses UNLOAD command                         │
+  │   ├── Distributes query execution to slices         │
+  │   └── Coordinates S3 write completion               │
+  │                                                     │
+  │  Compute Node 1          Compute Node 2             │
+  │   ├── Slice 0 ────────→ S3: file_000.csv.gz        │
+  │   ├── Slice 1 ────────→ S3: file_001.csv.gz        │
+  │   ├── Slice 2 ────────→ S3: file_002.csv.gz        │
+  │   └── Slice 3 ────────→ S3: file_003.csv.gz        │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+                        │
+                        ▼
+  S3: quickcart-raw-data-prod/
+   └── exports/
+        ├── finance/
+        │    └── monthly_revenue/
+        │         └── 2025-01/
+        │              ├── 000.csv.gz    (aggregated summary)
+        │              └── (single file — PARALLEL OFF)
+        │
+        ├── partner_shipfast/
+        │    └── daily_orders/
+        │         ├── order_date=2025-01-01/
+        │         │    ├── 000.csv.gz
+        │         │    ├── 001.csv.gz
+        │         │    ├── 002.csv.gz
+        │         │    └── 003.csv.gz
+        │         └── order_date=2025-01-02/
+        │              ├── 000.csv.gz
+        │              └── ...
+        │
+        └── data_science/
+             └── orders_snapshot/
+                  ├── 000.parquet
+                  ├── 001.parquet
+                  ├── 002.parquet
+                  └── 003.parquet
+
+THREE USE CASES — THREE UNLOAD PATTERNS:
+  1. Finance:      Aggregated query → single CSV with header
+  2. Partner:      Row-level data → partitioned by date
+  3. Data Science: Full snapshot → Parquet format</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Client-side export (psycopg2 → CSV → boto3)
+</span>→ Already failed — memory overflow at 6M rows
+→ Single-threaded, slow, fragile
+→ REJECTED
+
+Option B: UNLOAD to S3 (native Redshift command)
+→ Parallel, distributed, server-side
+→ Compressed output, no client memory needed
+→ Supports CSV, Parquet, delimited text
+→ SELECTED ✅
+
+Option C: Redshift Data API → S3
+→ Async query execution via API
+→ Results stored in S3 automatically
+→ Good for serverless (Lambda) but limited output control
+→ Covered conceptually — not main pattern here
+
+Option D: Glue read from Redshift → write to S3
+→ Works but adds unnecessary complexity
+→ Glue spins up Spark cluster just to move data
+→ UNLOAD is faster and cheaper for pure export
+→ Use Glue only when TRANSFORMATION is needed (Project 32, 43)
+
+Option E: Redshift Spectrum external table (write)
+→ INSERT INTO external_schema.external_table SELECT ...
+→ Works for writing to S3 in Parquet/ORC
+→ More complex setup than UNLOAD
+→ Better for ongoing writes, not ad-hoc exports
+
+DECISION: Option B — UNLOAD for all three use cases
+→ Simplest, fastest, cheapest, most interview-relevant</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ALWAYS specify IAM_ROLE (same principle as COPY — Project 21)
+</span>   → Never use access keys in UNLOAD command
+   → Role needs: s3:PutObject + s3:GetBucketLocation + s3:ListBucket
+
+2. ALWAYS add HEADER for CSV exports consumed by humans/Excel
+   → Without HEADER: columns are unlabeled
+   → Finance team opens CSV and sees numbers without context
+   → HEADER adds column names as first row in EVERY output file
+
+3. ALWAYS use GZIP for large exports
+   → 10M rows CSV: ~1.5 GB uncompressed → ~300 MB compressed
+   → S3 storage cost reduced 80%
+   → Download time for consumers reduced 80%
+
+4. ALWAYS use ALLOWOVERWRITE or CLEANPATH for repeatable exports
+   → Without these: UNLOAD fails if S3 prefix already has files
+   → ALLOWOVERWRITE: replaces existing files with same name
+   → CLEANPATH: deletes ALL existing files at prefix first, then writes
+   → CLEANPATH is safer (no stale files from previous runs)
+
+5. USE PARTITION BY for date-based exports
+   → Creates Hive-style partitioned output: key=value/
+   → Downstream tools (Athena, Glue, Spark) auto-detect partitions
+   → Consumers can read just one day without scanning everything
+
+6. USE FORMAT AS PARQUET for analytics consumers
+   → Columnar format — read only needed columns
+   → 5-10x smaller than CSV for same data
+   → Schema embedded in file (self-describing)
+   → SageMaker, Athena, Glue, Spark all prefer Parquet
+
+7. USE PARALLEL OFF only when consumer REQUIRES single file
+   → Excel cannot merge 4 CSV fragments
+   → Finance team needs ONE file they can open
+   → Trade-off: slower export but simpler consumption
+
+8. INCLUDE date/timestamp in S3 prefix path
+   → exports/finance/monthly_revenue/2025-01/
+   → Enables consumers to find correct extract by date
+   → Prevents overwriting historical exports</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT UNLOAD without specifying S3 prefix ending with "/"
+</span>   → UNLOAD TO 's3://bucket/exports/orders'
+     → Creates: orders000, orders001, orders002
+     → All files at SAME level with ugly naming
+   → UNLOAD TO 's3://bucket/exports/orders/'
+     → Creates: orders/000, orders/001, orders/002
+     → Clean folder-like structure
+
+2. DO NOT forget ALLOWOVERWRITE or CLEANPATH for recurring exports
+   → First run: works fine
+   → Second run: "ERROR: S3 prefix already contains files"
+   → Pipeline breaks at 2 AM, nobody notices until morning
+
+3. DO NOT use UNLOAD for small result sets (&lt; 1000 rows)
+   → UNLOAD has overhead (S3 multipart initialization per slice)
+   → For small results: psycopg2 fetchall() → boto3 is simpler and faster
+   → Threshold: below ~10K rows, client-side export is acceptable
+
+4. DO NOT assume output file count equals slice count
+   → UNLOAD may produce MORE files than slices
+   → Large result sets: each slice may write multiple files
+   → Each output file capped at ~6.2 GB uncompressed
+   → Plan downstream consumers for VARIABLE file count
+
+5. DO NOT UNLOAD with PARALLEL OFF for large datasets
+   → 10M rows with PARALLEL OFF → single-threaded → 10-15 minutes
+   → Same with PARALLEL ON → 30-60 seconds
+   → PARALLEL OFF is for SMALL aggregated outputs only
+
+6. DO NOT include sensitive data in UNLOAD without encryption
+   → UNLOAD supports ENCRYPTED keyword with KMS key
+   → Customer PII exported to S3 without encryption = compliance violation
+   → At minimum: S3 bucket has default SSE-S3 encryption (Project 1)
+   → Better: UNLOAD ENCRYPTED with specific KMS key
+
+7. DO NOT UNLOAD to a prefix used by other processes
+   → CLEANPATH deletes EVERYTHING under the prefix
+   → If another process writes to same prefix: data loss
+   → Use dedicated, isolated prefixes per UNLOAD job
+
+8. DO NOT forget to VACUUM/ANALYZE before UNLOAD of large tables
+   → Deleted rows still on disk (ghost rows) can affect UNLOAD query
+   → Stale statistics → suboptimal query plan → slow UNLOAD
+   → Project 39 covers VACUUM/ANALYZE deeply</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use               │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Export Redshift → S3 (bulk)      │ UNLOAD            │ Parallel, native, fastest        │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Export Redshift → S3 with        │ Glue (Project 32) │ Glue can transform during write  │
+│ transformations                  │                   │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Export small result (&lt; 1K rows)  │ psycopg2 → boto3  │ Less overhead than UNLOAD        │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Export for Athena querying       │ UNLOAD PARQUET    │ Athena reads Parquet natively     │
+│                                  │ + PARTITION BY    │ Partition pruning saves cost      │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Export for Excel/human           │ UNLOAD CSV        │ CSV is universal, add HEADER      │
+│ consumption                      │ PARALLEL OFF      │ Single file for easy opening      │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Share with another AWS account   │ UNLOAD to shared  │ UNLOAD writes, cross-account     │
+│                                  │ S3 bucket         │ policy allows read (Project 56)  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Feed ML training pipeline        │ UNLOAD PARQUET    │ SageMaker reads Parquet from S3   │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Reverse data flow back to        │ UNLOAD → S3 →     │ UNLOAD exports, Glue or script   │
+│ MariaDB                          │ MariaDB load      │ loads into MariaDB (Project 43)  │
+│                                  │ (Project 43)     │                                  │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE UNLOAD</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need real-time data access from S3
+</span>   → UNLOAD is batch — run, wait, done
+   → For real-time: Redshift Streaming Ingestion or Kinesis Firehose
+   → UNLOAD creates point-in-time snapshot, not live stream
+
+2. When downstream only needs to query the data (not download files)
+   → Use Redshift Spectrum (Project 38) — query S3 FROM Redshift
+   → Use Redshift Data Sharing (Project 58) — share between clusters
+   → UNLOAD creates files; Spectrum/Sharing avoids file creation
+
+3. When transformation is the primary goal
+   → UNLOAD exports raw query results — no complex ETL
+   → Use Glue ETL for: joins across sources, schema evolution, CDC
+   → Glue reads from Redshift JDBC, transforms, writes to S3
+
+4. When target is another database (not S3)
+   → UNLOAD writes to S3 ONLY
+   → For Redshift → MariaDB: UNLOAD → S3 → load script (Project 43)
+   → For Redshift → Redshift: Data Sharing (Project 58)
+
+5. When result set is a single scalar value
+   → SELECT COUNT(*) FROM orders → returns one number
+   → UNLOAD creates a file with one line for one number
+   → Just use psycopg2 fetchone() for this</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                   REDSHIFT UNLOAD — INTERNAL EXECUTION FLOW                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHASE 1: QUERY PLANNING (Leader Node)                                      │
+│  ─────────────────────────────────────                                      │
+│  1. Leader parses the UNLOAD statement                                      │
+│  2. Extracts the inner SELECT query                                         │
+│  3. Generates execution plan for the SELECT (same as normal query)          │
+│  4. Distributes query plan to compute node slices                           │
+│  5. Validates IAM role can write to S3 destination                          │
+│                                                                             │
+│  PHASE 2: QUERY EXECUTION (Compute Nodes — same as any query)               │
+│  ────────────────────────────────────────────────────────────                │
+│  1. Each slice executes its portion of the query                            │
+│  2. Scans local columnar blocks                                             │
+│  3. Applies WHERE filters, GROUP BY, JOINs                                  │
+│  4. Each slice holds its portion of the RESULT SET in memory                │
+│                                                                             │
+│  PHASE 3: S3 WRITE (Compute Nodes — this is the UNLOAD-specific part)       │
+│  ─────────────────────────────────────────────────────────────────           │
+│  1. Each slice writes its result rows DIRECTLY to S3                        │
+│     → Data does NOT flow back through leader node                           │
+│     → Each slice opens its own S3 connection                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  PARALLEL WRITE (PARALLEL ON — default):                        │        │
+│  │                                                                 │        │
+│  │  Slice 0 ──────→ s3://bucket/prefix/0000_part_00.csv.gz        │        │
+│  │  Slice 1 ──────→ s3://bucket/prefix/0001_part_00.csv.gz        │        │
+│  │  Slice 2 ──────→ s3://bucket/prefix/0002_part_00.csv.gz        │        │
+│  │  Slice 3 ──────→ s3://bucket/prefix/0003_part_00.csv.gz        │        │
+│  │                                                                 │        │
+│  │  File naming pattern: {prefix}{slice_id}_part_{part_num}        │        │
+│  │  If a slice has &gt; 6.2 GB data: creates multiple parts           │        │
+│  │    Slice 0 → 0000_part_00, 0000_part_01, 0000_part_02          │        │
+│  │                                                                 │        │
+│  │  SINGLE FILE (PARALLEL OFF):                                    │        │
+│  │                                                                 │        │
+│  │  Slice 0 ──┐                                                   │        │
+│  │  Slice 1 ──┤                                                   │        │
+│  │  Slice 2 ──┼──→ Leader Node ──→ s3://bucket/prefix/000         │        │
+│  │  Slice 3 ──┘    (merges)                                       │        │
+│  │                                                                 │        │
+│  │  → All data routes through leader = BOTTLENECK                  │        │
+│  │  → 5-10x slower than parallel                                   │        │
+│  │  → Use ONLY for small aggregated results                        │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 4: S3 WRITE MECHANICS                                                │
+│  ───────────────────────────                                                │
+│  1. Each slice uses S3 multipart upload API                                 │
+│  2. Chunks data into 64 MB parts for multipart upload                       │
+│  3. If GZIP: compresses chunks before sending                               │
+│  4. If PARQUET: builds columnar row groups, writes Parquet footer           │
+│  5. After all parts uploaded: completes multipart upload                    │
+│  6. S3 assembles parts into final object                                    │
+│                                                                             │
+│  PHASE 5: COMPLETION                                                        │
+│  ───────────────────                                                        │
+│  1. All slices report completion to leader                                  │
+│  2. Leader verifies all S3 writes succeeded                                 │
+│  3. If CLEANPATH was used: old files were deleted BEFORE write              │
+│  4. Returns success with file count to client                               │
+│  5. UNLOAD is ATOMIC per slice (not across slices)                          │
+│     → If slice 2 fails mid-write: partial file may remain                   │
+│     → Other slices' files are complete                                      │
+│     → Always verify output after UNLOAD                                     │
+│                                                                             │
+│  PARTITION BY MECHANICS:                                                    │
+│  ──────────────────────                                                     │
+│  UNLOAD ('SELECT ... FROM orders')                                          │
+│  TO 's3://bucket/exports/'                                                  │
+│  PARTITION BY (order_date)                                                  │
+│                                                                             │
+│  1. Query executes normally (full result set)                               │
+│  2. Each slice groups its rows by partition column                          │
+│  3. Creates subdirectory per unique partition value                         │
+│  4. Writes files into corresponding subdirectory                           │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  Output structure:                                              │        │
+│  │                                                                 │        │
+│  │  s3://bucket/exports/                                           │        │
+│  │   ├── order_date=2025-01-01/                                    │        │
+│  │   │    ├── 0000_part_00.csv.gz                                  │        │
+│  │   │    ├── 0001_part_00.csv.gz                                  │        │
+│  │   │    ├── 0002_part_00.csv.gz                                  │        │
+│  │   │    └── 0003_part_00.csv.gz                                  │        │
+│  │   ├── order_date=2025-01-02/                                    │        │
+│  │   │    ├── 0000_part_00.csv.gz                                  │        │
+│  │   │    └── ...                                                  │        │
+│  │   └── order_date=2025-01-30/                                    │        │
+│  │        └── ...                                                  │        │
+│  │                                                                 │        │
+│  │  Athena can query this directly with partition pruning          │        │
+│  │  → WHERE order_date = '2025-01-15' scans only that folder      │        │
+│  │  → Connects to Project 26 (partition-based Athena cost saving)  │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  UNLOAD vs COPY — MIRROR OPERATIONS:                                        │
+│  ┌──────────────────────┬────────────────────┬─────────────────────┐        │
+│  │                      │ COPY (Project 21)  │ UNLOAD              │        │
+│  │ Direction            │ S3 → Redshift      │ Redshift → S3       │        │
+│  │ S3 Operation         │ GetObject (read)   │ PutObject (write)   │        │
+│  │ IAM Permission       │ s3:GetObject       │ s3:PutObject        │        │
+│  │ Parallelism          │ Slices read files  │ Slices write files  │        │
+│  │ Leader role          │ Orchestrate only   │ Orchestrate only    │        │
+│  │ Manifest support     │ Yes (input)        │ Yes (output)        │        │
+│  │ GZIP support         │ Decompress on read │ Compress on write   │        │
+│  │ Parquet support      │ Yes                │ Yes                 │        │
+│  │ Error table          │ STL_LOAD_ERRORS    │ STL_UNLOAD_LOG      │        │
+│  └──────────────────────┴────────────────────┴─────────────────────┘        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "UNLOAD created 4 files but Finance wants ONE file"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: PARALLEL ON is default — each slice writes its own file
+→ Fix: add PARALLEL OFF for small result sets
+→ Trade-off: 5-10x slower (all data routes through leader)
+→ Rule: PARALLEL OFF only for &lt; 1M rows or aggregated summaries
+
+PITFALL 2: "Second UNLOAD run fails with 'already exists' error"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: UNLOAD refuses to overwrite existing S3 files by default
+→ Fix A: ALLOWOVERWRITE — overwrites files with same names
+→ Fix B: CLEANPATH — deletes ALL files at prefix, then writes new
+→ Fix C: Include timestamp in prefix path (never collides)
+→ CLEANPATH is dangerous: deletes EVERYTHING under that prefix
+→ ALLOWOVERWRITE is safer: only replaces matching filenames
+
+PITFALL 3: "UNLOAD Parquet fails with unsupported data type"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: GEOMETRY, HLLSKETCH, SUPER types not supported in Parquet UNLOAD
+→ Fix: CAST unsupported columns to VARCHAR in SELECT query
+→ UNLOAD ('SELECT CAST(geo_col AS VARCHAR) FROM ...') FORMAT AS PARQUET
+
+PITFALL 4: "UNLOAD output has no column headers"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: HEADER is NOT default — must be explicitly specified
+→ Fix: add HEADER keyword
+→ Note: HEADER adds header row to EVERY output file (not just first)
+→ Note: Parquet doesn't need HEADER (schema embedded in file metadata)
+
+PITFALL 5: "UNLOAD is slow despite PARALLEL ON"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: inner SELECT query is slow (bad execution plan)
+→ Cause B: data skew — one slice has 90% of the data
+→ Cause C: S3 throttling (rare, for massive concurrent writes)
+→ Debug A: EXPLAIN the SELECT separately — optimize it first
+→ Debug B: check DISTSTYLE — Project 39
+→ Debug C: spread output across multiple prefixes
+
+PITFALL 6: "Athena can't read UNLOAD CSV output"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: UNLOAD default delimiter is '|' (pipe), Athena expects ','
+→ Fix: explicitly set DELIMITER ',' and CSV in UNLOAD
+→ Better fix: UNLOAD as PARQUET — Athena reads it natively
+
+PITFALL 7: "CLEANPATH deleted files from a shared prefix"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: another process writes to same S3 prefix
+→ CLEANPATH runs DELETE on ALL objects matching the prefix
+→ Other process's files are gone
+→ Fix: use dedicated, isolated S3 prefixes per UNLOAD job
+→ Naming: exports/{consumer}/{entity}/{date}/
+
+PITFALL 8: "UNLOAD IAM role fails with PutObject denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: COPY role has s3:GetObject but NOT s3:PutObject
+→ UNLOAD needs WRITE permissions — COPY needs READ
+→ Fix: either add s3:PutObject to existing role
+   or create separate role for UNLOAD
+→ Best practice: one role with both GET + PUT (simpler to manage)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME SCALING:
+</span>━━━━━━━━━━━━━━━━━━━
+→ 10K rows:    trivial, 1-2 seconds, use PARALLEL OFF
+→ 1M rows:     5-10 seconds parallel, single file ~100 MB
+→ 10M rows:    30-60 seconds parallel, ~1.5 GB total output
+→ 100M rows:   3-5 minutes parallel, ~15 GB total output
+→ 1B rows:     20-40 minutes parallel, ~150 GB total output
+→ Above 1B:    consider partitioned UNLOAD (by date/region)
+
+OUTPUT FILE SIZE:
+━━━━━━━━━━━━━━━━━
+→ UNLOAD auto-splits at ~6.2 GB per file (uncompressed)
+→ With GZIP: actual S3 file size ~1.2 GB for 6.2 GB data
+→ More slices = more files = faster write
+→ Downstream: consumers must handle multiple files
+→ Athena, Glue, Spark: handle multi-file natively ✅
+→ Excel: needs single file → PARALLEL OFF for small sets
+
+COST SCALING:
+━━━━━━━━━━━━━
+→ UNLOAD query cost: same as running the SELECT query
+→ S3 PUT cost: $0.005 per 1,000 PUT requests
+→ S3 storage: depends on output size and storage class
+→ GZIP reduces storage cost by 70-80%
+→ Parquet reduces storage cost by 60-90% vs CSV
+→ Example: 10M rows → CSV ~1.5 GB → Parquet ~200 MB → GZIP CSV ~300 MB
+
+CONCURRENT UNLOAD:
+━━━━━━━━━━━━━━━━━━
+→ Multiple UNLOAD jobs can run simultaneously
+→ Each competes for query execution resources (WLM — Project 40)
+→ Recommended: max 2-3 concurrent UNLOADs
+→ Schedule large UNLOADs during off-peak hours
+
+PARTITION SCALING:
+━━━━━━━━━━━━━━━━━━
+→ PARTITION BY with 30 unique dates → 30 subdirectories
+→ Each subdirectory gets parallel files (4 slices × 30 dates = 120 files)
+→ Athena benefits: partition pruning scans only needed dates
+→ Too many partitions (&gt;10,000): S3 LIST becomes slow
+→ Partition by date (daily): ~365 partitions/year — manageable
+→ Partition by hour: ~8,760/year — getting heavy, consider daily</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY UNLOAD WORKED CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check UNLOAD log:
+   → SELECT query, pid, path, line_count, transfer_size
+     FROM stl_unload_log
+     ORDER BY start_time DESC
+     LIMIT 20;
+   → Shows: which files written, rows per file, bytes transferred
+
+2. List output files in S3:
+   → aws s3 ls s3://bucket/exports/path/ --recursive
+   → Verify file count matches expected slice count
+   → Verify total size is reasonable
+
+3. Row count validation:
+   → Source: SELECT COUNT(*) FROM orders WHERE &lt;unload_filter&gt;;
+   → Target: download one file, count lines (subtract 1 for header)
+   → Or: sum line_count from stl_unload_log for that query
+
+4. Content spot-check:
+   → Download first file: aws s3 cp s3://bucket/exports/path/0000_part_00.csv.gz ./
+   → Decompress: gunzip 0000_part_00.csv.gz
+   → Inspect: head -5 0000_part_00.csv
+   → Verify columns match expected schema
+
+5. Parquet validation:
+   → Use PyArrow: import pyarrow.parquet as pq; pq.read_table('file.parquet')
+   → Check schema: table.schema
+   → Check row count: len(table)
+
+6. End-to-end validation:
+   → UNLOAD to S3 → Create Athena table on same path → SELECT COUNT(*)
+   → Compare Athena count with Redshift source count
+   → Mismatch = data integrity issue</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(22)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: IAM Role Update for UNLOAD (Write Permission)</h3>
+
+<h3>Step 2: Use Case 1 — Finance Monthly Revenue Summary (Single CSV)</h3>
+
+<h3>Step 3: Use Case 2 — Partner Daily Orders Export (Partitioned)</h3>
+
+<h3>Step 4: Use Case 3 — Data Science Parquet Snapshot</h3>
+
+<h3>Step 5: Automated Scheduled UNLOAD (Nightly Export Pipeline)</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+============================================================
+🌙 NIGHTLY EXPORT PIPELINE — 2025-01-29
+   Started: 2025-01-30 02:00:03
+============================================================
+
+────────────────────────────────────────────────────────
+📤 Finance Daily Summary (2025-01-29)
+   ✅ 1 rows → 1 files → 0.01 MB in 1.82s
+
+────────────────────────────────────────────────────────
+📤 Partner Daily Orders (2025-01-29)
+   ✅ 287,431 rows → 4 files → 4.82 MB in 8.47s
+
+────────────────────────────────────────────────────────
+📤 Data Science Parquet (2025-01-29)
+   ✅ 333,334 rows → 4 files → 3.21 MB in 6.93s
+
+============================================================
+📊 NIGHTLY EXPORT SUMMARY
+============================================================
+   ✅ Finance Daily Summary (2025-01-29)
+      1 rows → 1 files → 0.01 MB (1.82s)
+   ✅ Partner Daily Orders (2025-01-29)
+      287,431 rows → 4 files → 4.82 MB (8.47s)
+   ✅ Data Science Parquet (2025-01-29)
+      333,334 rows → 4 files → 3.21 MB (6.93s)
+
+   Total: 620,766 rows, 8.04 MB, 17.22s
+============================================================</code></pre></div>
+<h3>Step 6: UNLOAD Diagnostic Queries</h3>
+
+<h3>Step 7: UNLOAD Output Verification Script (Python)</h3>
+
+<h3>Step 8: UNLOAD Options Quick Reference</h3>
+
+<h3>Step 9: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES (from earlier projects):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift cluster running with orders table loaded (Project 21)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → IAM role attached to cluster (Project 21)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Update IAM role with write permissions</span><span>
+</span>python 01_update_role_for_unload.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Export finance monthly report (single CSV)</span><span>
+</span>python 02_unload_finance_report.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Export partner daily orders (partitioned CSV)</span><span>
+</span>python 03_unload_partner_extract.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Export data science snapshot (Parquet)</span><span>
+</span>python 04_unload_data_science_parquet.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run full nightly pipeline</span><span>
+</span>python 05_nightly_unload_pipeline.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Verify all outputs</span><span>
+</span>python 07_verify_unload_output.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Check diagnostics in Redshift</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Run 06_unload_diagnostics.sql in query editor</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ UNLOAD is the MIRROR of COPY: Redshift → S3 (Project 21 was S3 → Redshift)
+→ Compute node slices write DIRECTLY to S3 (bypasses leader node)
+→ PARALLEL ON: each slice writes its own file = maximum speed
+→ PARALLEL OFF: all data routes through leader = single file but slow
+→ PARTITION BY creates Hive-style directories (key=value/)
+→ Three output formats: CSV (human), GZIP CSV (sharing), Parquet (analytics)
+→ HEADER adds column names — essential for CSV consumers
+→ ALLOWOVERWRITE vs CLEANPATH: both solve "already exists" error differently
+→ CLEANPATH is dangerous — deletes EVERYTHING under prefix first
+→ MANIFEST output creates JSON listing all output files
+→ That manifest can be fed BACK to COPY for perfect round-trip
+→ Parquet is 5-10x smaller than CSV and self-describing
+→ UNLOAD inner query can include JOINs, aggregations, computed columns
+→ Verify output: stl_unload_log + S3 file listing + row count comparison
+
+COPY + UNLOAD = COMPLETE DATA MOVEMENT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ S3 → Redshift: COPY (Project 21)
+→ Redshift → S3: UNLOAD (this project)
+→ Together: bidirectional data flow between S3 and Redshift
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket where output files land
+→ Project 3:  IAM policies controlling write access to S3
+→ Project 12: SNS notifications when pipeline completes
+→ Project 21: COPY — the mirror command (S3 → Redshift)
+→ Project 20: MariaDB → S3 → now Redshift → S3 (full cycle)
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 23: Glue Crawler auto-discovers UNLOAD output schema
+→ Project 24: Athena queries UNLOAD Parquet output directly
+→ Project 26: Partition pruning on UNLOAD partitioned output
+→ Project 38: Redshift Spectrum queries S3 without UNLOAD
+→ Project 43: UNLOAD → S3 → Glue → MariaDB (reverse data flow)
+→ Project 56: Cross-account S3 sharing of UNLOAD output</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has bidirectional data flow:
+</span>→ S3 → Redshift (COPY — Project 21) ✅
+→ Redshift → S3 (UNLOAD — this project) ✅
+
+The UNLOAD Parquet files sit in S3 with a clean structure
+But when new files land in S3, nobody knows their schema automatically
+
+Data science team asks:
+"We have 30 Parquet files in S3 from UNLOAD.
+ We want Athena to query them.
+ But Athena needs a Glue Catalog table with schema definition.
+ We don't want to manually define 12 columns every time."
+
+CTO: "Can we auto-detect the schema from the files themselves?"
+YOU: "That's exactly what Glue Crawler does.
+      Point it at an S3 prefix → it reads the files →
+      auto-discovers columns, data types, partitions →
+      creates a Glue Catalog table →
+      Athena can query it immediately with zero manual schema work."
+
+→ Project 23: "Auto-Discover Schema of CSVs Sitting in S3"
+→ Introduces: Glue Crawler → Classifier → S3 Target → Catalog Table Output
+→ The output of UNLOAD becomes the input for Glue Crawler</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-21.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 22 of 80</span>
+    <span class="nav-project-title">EXPORT REDSHIFT QUERY RESULTS BACK TO S3 FOR SHARING</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-23.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-23.html") window.location = "project-23.html";
+  if (e.key === 'ArrowLeft' && "project-21.html") window.location = "project-21.html";
+});
+</script>
+</body>
+</html>

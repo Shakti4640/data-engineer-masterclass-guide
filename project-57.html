@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 57: ACCOUNT B&#x27;S GLUE MUST SEE ACCOUNT A&#x27;S DATA CATALOG — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:71%"></div></div>
+<div id="progress-label">71%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 57 of 80</div>
+  <div class="project-title">ACCOUNT B&#x27;S GLUE MUST SEE ACCOUNT A&#x27;S DATA CATALOG</div>
+  <div class="project-tags"><span class="project-tag">Glue</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multi-account AWS setup (from Project 56)
+</span>Team: 15 engineers, 5 data engineers, 4 analysts, 1 security lead
+
+CURRENT STATE (after Project 56):
+→ Account A (111111111111): Production Data
+  - S3 bucket with Bronze/Silver/Gold data ✅
+  - Glue Data Catalog with 25+ tables (from Project 23 crawlers) ✅
+  - Redshift cluster with production warehouse ✅
+
+→ Account B (222222222222): Analytics
+  - Cross-account S3 READ access to Account A ✅ (Project 56)
+  - Glue ETL jobs for transformation
+  - Athena for ad-hoc queries
+  - DataBrew for analyst cleaning
+
+THE NEW PROBLEM:
+Account B's data engineer writes a Glue ETL job:
+
+    # In Account B's Glue job
+    datasource = glueContext.create_dynamic_frame.from_catalog(
+        database="quickcart_db",
+        table_name="orders_gold"
+    )
+    # ERROR: Database 'quickcart_db' not found!
+
+WHY IT FAILS:
+→ "quickcart_db" and "orders_gold" exist in Account A's Glue Catalog
+→ Account B's Glue Catalog is SEPARATE — completely empty
+→ Glue Catalog is per-account — Account B can't see Account A's tables
+→ Even though S3 data is accessible (Project 56), METADATA is not
+
+WHAT THIS BLOCKS:
+┌──────────────────────────────────┬──────────────────────────────────────┐
+│ What Account B Wants to Do       │ Why It Fails                         │
+├──────────────────────────────────┼──────────────────────────────────────┤
+│ Glue ETL: from_catalog()         │ Can't find Account A's database/table│
+│ Athena: SELECT * FROM db.table   │ Database doesn't exist in Account B  │
+│ DataBrew: use Catalog as dataset │ No tables visible in Account B       │
+│ Glue Crawler: update partitions  │ Can't write to Account A's Catalog   │
+│ Redshift Spectrum: external schema│ Can't reference Account A's Catalog │
+└──────────────────────────────────┴──────────────────────────────────────┘
+
+THREE POSSIBLE APPROACHES:
+1. Copy Catalog metadata from A to B (duplication — bad)
+2. Re-run crawlers in Account B against Account A's S3 (redundant — bad)
+3. Share Account A's Catalog with Account B (correct — this project)
+
+SECURITY LEAD: "Account B should see Account A's Catalog tables
+  but NOT be able to create, modify, or delete them.
+  Read-only metadata access. Account A stays in control."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Glue Data Catalog architecture
+</span>→ Each AWS account has ONE Glue Data Catalog (per region)
+→ Catalog contains: Databases → Tables → Partitions → Columns
+→ Catalog ID = Account ID (e.g., "111111111111")
+→ By default: services only see their OWN account's Catalog
+→ Cross-account: must explicitly grant access via Resource Policy
+
+Step 2: Understand the access mechanism
+→ Glue Data Catalog supports RESOURCE-BASED policies (like S3 bucket policies)
+→ Account A puts a Resource Policy on its Catalog
+→ Policy says: "Allow Account B's roles to GetDatabase, GetTable, GetPartitions"
+→ Account B's services reference Account A's Catalog using CatalogId parameter
+
+Step 3: Understand how consumers reference cross-account Catalog
+→ Glue ETL: catalog_id="111111111111" in from_catalog()
+→ Athena: register Account A's Catalog as a data source
+→ Redshift Spectrum: CREATE EXTERNAL SCHEMA with catalog_id
+→ Each service has its own way of specifying the foreign Catalog
+
+Step 4: Understand the permission chain (same as Project 56)
+→ Account A's Catalog Resource Policy must ALLOW Account B
+→ Account B's identity policy must ALLOW Glue Catalog actions
+→ BOTH must allow — cross-account AND logic
+
+Step 5: Design the access scope
+→ Account B can: GetDatabase, GetTable, GetPartitions, GetTableVersions
+→ Account B CANNOT: CreateDatabase, CreateTable, UpdateTable, DeleteTable
+→ Account B sees: quickcart_db.* (all tables in the database)
+→ Account B CANNOT see: internal_db.* (sensitive internal metadata)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+Account [REDACTED:BANK_ACCOUNT_NUMBER]111)                Account [REDACTED:BANK_ACCOUNT_NUMBER]222)
+┌──────────────────────────────┐       ┌──────────────────────────────┐
+│                              │       │                              │
+│  Glue Data Catalog           │       │  Glue ETL Job                │
+│  ┌────────────────────────┐  │       │  from_catalog(               │
+│  │ quickcart_db           │  │       │    database="quickcart_db",  │
+│  │  ├─ orders_gold        │◄─┼───────│    table_name="orders_gold", │
+│  │  ├─ customers_silver   │  │       │    catalog_id="111111111111" │
+│  │  ├─ products_bronze    │  │       │  )                           │
+│  │  └─ orders_summary     │  │       │                              │
+│  └────────────────────────┘  │       │  Athena Query                │
+│  ┌────────────────────────┐  │       │  SELECT * FROM               │
+│  │ internal_db (HIDDEN)   │  │       │  "111111111111".quickcart_db │
+│  │  ├─ hr_salaries        │  │       │  .orders_gold               │
+│  │  └─ credentials_store  │  │       │                              │
+│  └────────────────────────┘  │       │  Redshift Spectrum           │
+│                              │       │  CREATE EXTERNAL SCHEMA      │
+│  Catalog Resource Policy:    │       │  FROM DATA CATALOG           │
+│  "Allow Account B to         │       │  catalog_id '111111111111'   │
+│   GetDatabase, GetTable      │       │  database 'quickcart_db'     │
+│   on quickcart_db ONLY"      │       │                              │
+│                              │       │                              │
+└──────────────────────────────┘       └──────────────────────────────┘
+
+FLOW:
+1. Account A admin sets Catalog Resource Policy (one-time)
+2. Account B's Glue/Athena/Spectrum references catalog_id="111111111111"
+3. Glue service checks Account A's Catalog Resource Policy → ALLOW
+4. Glue service checks Account B's identity policy → ALLOW
+5. Metadata returned → Account B's job can read schema
+6. Job uses schema to read S3 data (access via Project 56)</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Copy Catalog metadata from Account A to Account B
+</span>→ Export tables as JSON → import in Account B
+→ PROBLEMS: metadata gets stale, new partitions not synced
+→ Must re-copy every time schema changes
+→ Two sources of truth → inevitable drift
+
+Option B: Run Glue Crawlers in Account B against Account A's S3
+→ Account B's crawler reads Account A's S3 → creates tables in Account B's Catalog
+→ PROBLEMS: duplicate crawling cost, partition sync delay
+→ Account B's schema may differ from Account A's (different classifiers)
+→ Two catalogs for same data → confusion
+
+Option C: Glue Catalog Resource Policy (this project) ✅
+→ Account A shares its Catalog with Account B via resource policy
+→ Single source of truth — Account A's Catalog
+→ Real-time: Account B always sees latest schema/partitions
+→ No duplication, no sync, no drift
+→ Read-only: Account B can't modify Account A's metadata
+
+Option D: AWS Lake Formation cross-account grants (Project 74)
+→ More granular: column-level, row-level, tag-based permissions
+→ Requires Lake Formation setup in both accounts
+→ Better for enterprises with 10+ accounts and complex permissions
+→ Overkill for 2-3 account setups
+
+Option E: AWS RAM (Resource Access Manager)
+→ Share Glue Catalog resources via RAM
+→ Works within AWS Organizations
+→ Simpler than manual resource policies for Organization-wide sharing
+→ But: less granular than direct resource policies
+
+DECISION: Option C — Glue Catalog Resource Policy
+→ Reason: simplest, no duplication, real-time, fits our 2-account model
+→ Foundation for Lake Formation (Project 74) later</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Grant ONLY read actions on Catalog
+</span>   → Allow: glue:GetDatabase, glue:GetDatabases
+   → Allow: glue:GetTable, glue:GetTables, glue:GetTableVersions
+   → Allow: glue:GetPartition, glue:GetPartitions
+   → Deny: glue:CreateTable, glue:UpdateTable, glue:DeleteTable
+   → Deny: glue:CreateDatabase, glue:DeleteDatabase
+
+2. Scope access to SPECIFIC databases (not entire Catalog)
+   → Allow Account B to see: quickcart_db
+   → Deny Account B from seeing: internal_db, hr_db
+   → Use Condition or explicit Resource ARNs
+
+3. Use specific principal ARNs (not entire Account B)
+   → Bad: "Principal": {"AWS": "222222222222"} (any role in Account B)
+   → Good: "Principal": {"AWS": "arn:aws:iam::222222222222:role/GlueRole-B"}
+   → Least privilege — only authorized roles can see metadata
+
+4. Test with Athena first (fastest verification)
+   → Athena can reference cross-account Catalog directly
+   → No code needed — just SQL with catalog_id prefix
+   → If Athena works → Glue ETL will also work
+
+5. Ensure Account B's IAM policies ALSO allow Glue Catalog actions
+   → Cross-account = both sides must allow (from Project 56)
+   → Account A's resource policy + Account B's identity policy
+   → Missing identity policy = AccessDenied even with resource policy
+
+6. Document which databases are shared and with whom
+   → Maintain inventory: database → shared with → purpose → granted by
+   → Review quarterly — revoke unused access
+   → Tag shared databases: "SharedWithAccountB=true"</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT grant glue:* in the resource policy
+</span>   → Includes: CreateTable, DeleteTable, UpdatePartition
+   → Account B could modify Account A's production metadata
+   → Corrupted metadata → broken queries for everyone
+
+2. DO NOT share the entire Catalog without database-level filtering
+   → Account A may have: hr_db with salary tables, credentials_db
+   → Sharing entire Catalog exposes sensitive metadata
+   → Even table NAMES can be sensitive ("layoff_candidates")
+
+3. DO NOT create circular dependencies
+   → Account A shares Catalog with Account B
+   → Account B creates tables pointing to Account A's S3
+   → Account A starts using Account B's tables
+   → Now: breaking either account breaks both → fragile
+
+4. DO NOT forget about Catalog encryption
+   → If Account A's Catalog is encrypted with KMS
+   → Account B needs kms:Decrypt permission on Account A's KMS key
+   → Missing KMS access = AccessDenied on encrypted metadata
+   → This is a frequently missed step
+
+5. DO NOT mix Catalog IDs in Glue job code without abstraction
+   → Hardcoding: catalog_id="111111111111" everywhere
+   → If account ID changes (account migration) → update 50 scripts
+   → Use: environment variable, SSM Parameter Store, or job argument
+
+6. DO NOT assume partitions auto-sync
+   → Account A adds new partition → Account B sees it immediately? YES
+   → Catalog Resource Policy shares LIVE metadata (not a copy)
+   → But: Account B cannot ADD partitions to Account A's tables
+   → If Account B needs to add partitions: different pattern needed</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────┬─────────────────────────┬───────────────────────────────────────────┐
+</span>│ Scenario                          │ Use                     │ Why                                       │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Share Catalog between 2-3 accounts│ Glue Resource Policy    │ Simple, direct, no extra services         │
+│ (this project)                    │                         │                                           │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Share Catalog across 10+ accounts │ AWS RAM + Glue Resource │ Centralized sharing via Organizations     │
+│ in same Organization              │ Policy                  │                                           │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Column-level or row-level access  │ Lake Formation          │ Fine-grained: "Account B can see columns  │
+│ control on shared tables          │ (Project 74)            │ 1-5 but not column 6 (SSN)"              │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Account B needs its OWN tables    │ Separate Catalog +      │ Each account owns its own metadata        │
+│ plus Account A's tables           │ Cross-account reference │ Reference Account A's via catalog_id      │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Need to WRITE metadata cross-     │ AssumeRole into Account │ Account B assumes Account A's role        │
+│ account (add partitions)          │ A's Catalog role        │ that HAS write permissions on Catalog     │
+├───────────────────────────────────┼─────────────────────────┼───────────────────────────────────────────┤
+│ Redshift Spectrum external schema │ Catalog Resource Policy │ Spectrum references catalog_id directly   │
+│ from cross-account Catalog        │ + Redshift IAM role     │ in CREATE EXTERNAL SCHEMA                │
+└───────────────────────────────────┴─────────────────────────┴───────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE CROSS-ACCOUNT CATALOG SHARING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When Account B needs to MODIFY Account A's tables
+</span>   → Resource policy for read-only is safe
+   → Write access cross-account is risky (metadata corruption)
+   → Use: AssumeRole pattern with write permissions (controlled)
+   → Or: Account B requests Account A's pipeline to update
+
+2. When you need tag-based access control (TBAC)
+   → "Share all tables tagged 'public' but not 'confidential'"
+   → Glue Resource Policy doesn't support tag conditions
+   → Use: Lake Formation tag-based access (Project 74)
+
+3. When sharing between accounts in DIFFERENT AWS Organizations
+   → Glue Resource Policy works cross-Organization
+   → But: no centralized governance (no SCPs across orgs)
+   → Use: explicit trust with External ID (like Project 56 AssumeRole)
+
+4. When Catalog is encrypted with customer-managed KMS key
+   → AND you can't grant cross-account KMS access
+   → Decryption fails → metadata inaccessible
+   → Use: re-crawl in Account B (Option B from approach section)
+   → Or: change to AWS-managed KMS key (allows cross-account by default)
+
+5. When data governance requires physical metadata separation
+   → Regulation: "analytics team must not see production metadata structure"
+   → Cross-account Catalog sharing exposes table names, column names, types
+   → Even without data access: metadata IS information
+   → Use: curated views/tables in Account B's own Catalog</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│         CROSS-ACCOUNT GLUE DATA CATALOG — INTERNAL MECHANICS                 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  COMPONENT 1: GLUE CATALOG RESOURCE POLICY                                   │
+│  ═════════════════════════════════════════                                    │
+│  → Attached to the CATALOG itself (not to individual databases/tables)        │
+│  → JSON policy document — same syntax as IAM/S3 bucket policies              │
+│  → Max size: 10 KB                                                           │
+│  → Applied via: glue:PutResourcePolicy API                                   │
+│  → One policy per account per region                                         │
+│  → Scoping within the policy: use Resource ARNs for specific databases       │
+│                                                                              │
+│  RESOURCE ARN FORMAT:                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐        │
+│  │ Catalog:   arn:aws:glue:us-east-2:111111111111:catalog          │        │
+│  │ Database:  arn:aws:glue:us-east-2:111111111111:database/mydb    │        │
+│  │ Table:     arn:aws:glue:us-east-2:111111111111:table/mydb/mytbl │        │
+│  │ Partition: arn:aws:glue:us-east-2:111111111111:table/mydb/mytbl │        │
+│  │            (partitions use same ARN as parent table)             │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  COMPONENT 2: HOW CROSS-ACCOUNT CATALOG LOOKUP WORKS                         │
+│  ═══════════════════════════════════════════════════                          │
+│                                                                              │
+│  STEP 1: Account B's Glue job calls:                                         │
+│    glue.get_table(                                                           │
+│      CatalogId="111111111111",    ← KEY PARAMETER                            │
+│      DatabaseName="quickcart_db",                                            │
+│      Name="orders_gold"                                                      │
+│    )                                                                         │
+│                                                                              │
+│  STEP 2: Glue service sees CatalogId ≠ caller's account                     │
+│    → Routes request to Account A's Catalog (111111111111)                    │
+│    → This is a CROSS-ACCOUNT API call                                        │
+│                                                                              │
+│  STEP 3: Account A's Catalog evaluates access:                               │
+│    a) Check Resource Policy:                                                 │
+│       → Does policy allow Account B's role to glue:GetTable?                 │
+│       → On resource arn:aws:glue:...:table/quickcart_db/orders_gold?         │
+│       → If YES → proceed                                                     │
+│    b) Check for explicit DENY:                                               │
+│       → Any Deny statement matching this request?                            │
+│       → If DENY → access denied (game over)                                 │
+│                                                                              │
+│  STEP 4: Account B's IAM evaluates access:                                   │
+│    → Does Account B's role have glue:GetTable permission?                    │
+│    → On resource "arn:aws:glue:...:table/quickcart_db/*"?                    │
+│    → If YES → proceed                                                        │
+│                                                                              │
+│  STEP 5: Both sides allow → table metadata returned                          │
+│    → Account B's Glue job receives:                                          │
+│      - Table name, database name                                             │
+│      - Column names, types, comments                                         │
+│      - S3 location (StorageDescriptor.Location)                              │
+│      - SerDe information (how to parse files)                                │
+│      - Partition keys and values                                             │
+│                                                                              │
+│  STEP 6: Account B's Glue job reads S3 data                                 │
+│    → Uses S3 location from table metadata                                    │
+│    → S3 access via cross-account (Project 56)                                │
+│    → Schema from Catalog + Data from S3 = complete read                      │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 3: ATHENA CROSS-ACCOUNT CATALOG                                   │
+│  ═════════════════════════════════════════                                    │
+│                                                                              │
+│  Method 1: Catalog ID prefix in SQL (simple)                                 │
+│  ─────────────────────────────────────────                                   │
+│  SELECT * FROM "111111111111"."quickcart_db"."orders_gold"                   │
+│  WHERE order_date = '2025-01-15'                                             │
+│                                                                              │
+│  → Athena sees the 12-digit prefix → routes to Account A's Catalog           │
+│  → Same permission evaluation as Glue (resource policy + identity policy)    │
+│  → S3 data read via cross-account S3 access (Project 56)                     │
+│                                                                              │
+│  Method 2: Register as Data Source (advanced)                                │
+│  ────────────────────────────────────────────                                │
+│  → Athena console → Data Sources → Register → AWS Glue Data Catalog          │
+│  → Specify Catalog ID: 111111111111                                          │
+│  → Now appears as a named data source in Athena                              │
+│  → Queries reference: "datasource_name"."database"."table"                   │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 4: REDSHIFT SPECTRUM CROSS-ACCOUNT CATALOG                        │
+│  ════════════════════════════════════════════════════                         │
+│                                                                              │
+│  CREATE EXTERNAL SCHEMA spectrum_schema                                      │
+│  FROM DATA CATALOG                                                           │
+│  DATABASE 'quickcart_db'                                                     │
+│  CATALOG_ID '111111111111'                                                   │
+│  IAM_ROLE 'arn:aws:iam::222222222222:role/RedshiftSpectrumRole';            │
+│                                                                              │
+│  → Redshift uses the IAM role to call Glue APIs in Account A                 │
+│  → IAM role needs: glue:GetTable, glue:GetPartitions on Account A's Catalog  │
+│  → Plus: s3:GetObject on Account A's S3 (Project 56)                         │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 5: PERMISSION CHAIN SUMMARY                                       │
+│  ═════════════════════════════════════                                        │
+│                                                                              │
+│  For Account B's service to READ Account A's Catalog table:                  │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐             │
+│  │ ✅ Account A: Catalog Resource Policy allows Account B      │             │
+│  │ ✅ Account B: IAM identity policy allows glue:Get* actions  │             │
+│  │ ✅ Account A: S3 bucket/role allows data read (Project 56)  │             │
+│  │ ✅ Account A: KMS key allows decrypt (if Catalog encrypted) │             │
+│  │                                                              │             │
+│  │ ALL FOUR must be satisfied for successful cross-account read │             │
+│  └─────────────────────────────────────────────────────────────┘             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "AccessDeniedException: cross-account access not allowed"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Catalog Resource Policy missing or doesn't match caller
+→ Debug: aws glue get-resource-policy (in Account A)
+→ Verify: Principal ARN exactly matches Account B's role
+→ Verify: Actions include the specific API being called
+→ Common: forgot glue:GetPartitions (tables visible but partitions fail)
+
+PITFALL 2: "Database visible but tables return empty"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Resource policy allows GetDatabase but Resource ARN for tables wrong
+→ Policy grants: "arn:aws:glue:...:database/quickcart_db" ← only database
+→ Also needs: "arn:aws:glue:...:table/quickcart_db/*" ← tables within it
+→ And: "arn:aws:glue:...:catalog" ← catalog-level for GetDatabases
+
+PITFALL 3: "Works from Athena but fails from Glue ETL"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Athena role has permissions, Glue role doesn't
+→ Different services use different IAM roles
+→ Resource policy may allow Athena role but not Glue role
+→ Fix: add ALL Account B service roles to resource policy
+
+PITFALL 4: "Catalog encrypted with KMS — cross-account fails"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Account A's Catalog encrypted with customer-managed CMK
+→ Account B's role needs kms:Decrypt on that CMK
+→ CMK key policy must allow Account B's role
+→ Three policies to align: Catalog resource policy + IAM + KMS key policy
+→ Fix: add Account B's role to CMK key policy with kms:Decrypt
+
+PITFALL 5: "Glue ETL from_catalog() ignores catalog_id parameter"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: older Glue versions don't support catalog_id in from_catalog()
+→ Fix: use additional_options={"catalogId": "111111111111"}
+→ Or: use boto3 glue client directly to get table, then read S3 manually
+→ Or: use Glue job arguments: --catalog-id 111111111111
+
+PITFALL 6: "Resource policy exceeds 10 KB limit"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Sharing with 20+ accounts × 10+ databases = large policy
+→ Glue Resource Policy max: 10 KB
+→ Fix: use aws:PrincipalOrgID condition (one condition for entire Organization)
+→ Fix: use wildcard principals with Condition keys
+→ Fix: migrate to Lake Formation for scalable access management</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SHARING SCALE:
+</span>→ 2 accounts: simple resource policy (this project)
+→ 5 accounts: resource policy with multiple principals
+→ 20+ accounts: use aws:PrincipalOrgID condition
+→ 100+ accounts: Lake Formation (Project 74) or AWS RAM
+
+CATALOG SIZE:
+→ 100 tables: no performance impact on cross-account reads
+→ 1,000 tables: GetTables pagination needed (100 per page)
+→ 10,000+ tables: consider database-level filtering in policy
+→ No hard limit on cross-account Catalog reads
+
+POLICY LIMITS:
+→ Resource Policy max: 10 KB
+→ ~10-15 detailed statements per policy
+→ Workaround: use wildcards and Conditions to compress
+
+LATENCY:
+→ Cross-account Catalog API: ~50-100ms additional latency vs same-account
+→ Negligible for batch ETL (adds 0.1s to a 20-minute job)
+→ Noticeable for interactive Athena (adds 0.1s per query planning)
+→ Not a concern for data pipeline use cases
+
+COST:
+→ Glue Catalog API calls: first 1M/month free, then $1/100K
+→ Cross-account calls count the SAME as same-account calls
+→ No additional charge for cross-account Catalog access
+→ Typical pipeline: ~10K API calls/day = well within free tier</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CROSS-ACCOUNT CATALOG ACCESS:
+</span>
+1. AWS CLI verification (from Account B):
+   → aws glue get-database --catalog-id 111111111111 --name quickcart_db
+   → Should return database metadata
+   → If AccessDenied: check resource policy + identity policy
+
+2. AWS CLI table listing:
+   → aws glue get-tables --catalog-id 111111111111 --database-name quickcart_db
+   → Should return list of tables with columns
+   → Verify expected tables are visible
+
+3. Athena verification (fastest):
+   → SELECT * FROM "111111111111"."quickcart_db"."orders_gold" LIMIT 5
+   → Should return data rows
+   → If fails: check Catalog access + S3 access (both needed)
+
+4. Negative testing:
+   → Try to access internal_db (should fail)
+   → Try to create a table in Account A's Catalog (should fail)
+   → Try to delete a partition (should fail)
+   → aws glue create-table --catalog-id 111111111111 ... → AccessDenied ✅
+
+5. CloudTrail verification:
+   → Account A's CloudTrail: Glue API events from Account B's role
+   → Event: glue:GetTable, source: Account B's assumed role
+   → Confirms: who accessed what metadata, when</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(57)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Catalog Resource Policy in Account A</h3>
+
+<h3>Step 2: Account B Identity Policy for Catalog Access</h3>
+
+<h3>Step 3: Test Cross-Account Catalog Access</h3>
+
+<h3>Step 4: Cross-Account Athena Query Examples</h3>
+
+<h3>Step 5: Cross-Account Glue ETL Job Example</h3>
+
+<h3>Step 6: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITE: Project 56 completed (cross-account S3 access)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Set Catalog Resource Policy in Account A</span><span>
+</span>python 57_01_catalog_resource_policy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Add Catalog permissions to Account B's roles</span><span>
+</span>python 57_02_account_b_catalog_permissions.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Test cross-account Catalog access (comprehensive)</span><span>
+</span>python 57_03_test_catalog_access.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run Athena queries against Account A's Catalog</span><span>
+</span>python 57_04_athena_cross_account_query.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Generate Glue ETL + Redshift Spectrum examples</span><span>
+</span>python 57_05_glue_etl_cross_account.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Cleanup</span><span>
+</span>python 57_06_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED TEST OUTPUT:
+</span>
+======================================================================
+🧪 TESTING CROSS-ACCOUNT GLUE CATALOG ACCESS
+   From Account B → Account A's Catalog (111111111111)
+======================================================================
+
+📌 Test 1: GetDatabase (quickcart_db) — should SUCCEED...
+  ✅ PASS
+    Name: quickcart_db
+    Description: QuickCart production data lake
+    Location: s3://quickcart-data-prod/
+
+📌 Test 2: GetDatabases (list all) — should see ONLY shared...
+  ✅ PASS
+    Visible databases: ['quickcart_db', 'quickcart_staging_db']
+    ✅ Denied databases correctly hidden
+
+📌 Test 3: GetTables (quickcart_db) — should return tables...
+  ✅ PASS
+    Tables found: 4
+    → orders_gold
+      Columns: 8
+      Location: s3://quickcart-data-prod/gold/orders/...
+    → customers_silver
+      Columns: 7
+      Location: s3://quickcart-data-prod/cleaned/customers/...
+
+📌 Test 4: GetTable (orders_gold) — should return full schema...
+  ✅ PASS
+    Table: orders_gold
+    Columns:
+      → order_id: string
+      → customer_id: string
+      → total_amount: double
+      → order_date: string
+
+📌 Test 5: GetPartitions — should return partition list...
+  ✅ PASS
+    Partitions found: 30
+    → Values: ['2025', '01', '15']
+
+📌 Test 6: GetDatabase (internal_db) — should be DENIED...
+  ✅ PASS — correctly denied/hidden
+
+📌 Test 7: CreateTable in Account A — should be DENIED...
+  ✅ PASS — correctly denied
+
+📌 Test 8: DeleteTable in Account A — should be DENIED...
+  ✅ PASS — correctly denied
+
+======================================================================
+📊 CROSS-ACCOUNT CATALOG TEST REPORT
+======================================================================
+  Total tests:  8
+  ✅ Passed:    8
+  ❌ Failed:    0
+  ⚠️  Warnings: 0
+
+  🟢 ALL TESTS PASSED
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue Data Catalog is per-account — cross-account access requires Resource Policy
+→ Resource Policy on Catalog = same concept as S3 bucket policy (Project 56 Pattern 1)
+→ Cross-account Catalog access requires BOTH: resource policy (A) + identity policy (B)
+→ Scope access to specific databases using Resource ARNs (not entire Catalog)
+→ Explicit DENY on sensitive databases prevents metadata leakage
+→ Read-only: allow Get* actions, deny Create*/Update*/Delete* actions
+→ Athena syntax: "CATALOG_ID"."DATABASE"."TABLE" for cross-account queries
+→ Glue ETL: catalog_id parameter in from_catalog() or additional_options
+→ Redshift Spectrum: CATALOG_ID in CREATE EXTERNAL SCHEMA
+→ Four permissions needed: Catalog policy + IAM policy + S3 access + KMS (if encrypted)
+→ Single source of truth: Account A owns metadata, Account B reads it
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 15: Glue Data Catalog basics (single account)
+→ Project 23: Glue Crawlers populate Catalog (Account A)
+→ Project 24: Athena queries Catalog tables (same account)
+→ Project 38: Redshift Spectrum uses Catalog (same account)
+→ Project 56: Cross-account S3 access (data layer) → this project adds metadata layer
+
+COMBINED PICTURE (Projects 56 + 57):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 56: Account B can READ Account A's S3 data ✅
+→ Project 57: Account B can READ Account A's Catalog metadata ✅
+→ TOGETHER: Account B can query Account A's data lake completely
+→ Glue ETL: knows schema (Catalog) + reads data (S3)
+→ Athena: knows tables (Catalog) + scans files (S3)
+→ Spectrum: knows schema (Catalog) + reads data (S3)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 58: "Share Redshift Data Across Accounts Without COPY"
+  - S3 + Catalog shared ✅ (Projects 56-57)
+  - But: Redshift data is INSIDE the cluster, not in S3
+  - Can't use S3 cross-account for Redshift internal tables
+  - Need: Redshift Data Sharing — share live data between clusters
+  - Producer (Account A) publishes datashare
+  - Consumer (Account B) subscribes and queries in real-time
+  - Zero data copying, zero ETL, zero latency</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has cross-account access to:
+</span>→ S3 data (Project 56) ✅
+→ Glue Catalog metadata (Project 57) ✅
+
+Account B can run Glue ETL, Athena queries, and Spectrum on Account A's data lake.
+
+BUT: The BI team says:
+"We need to query Account A's REDSHIFT tables — not just S3 data.
+ Redshift has materialized views, aggregated tables, and curated
+ datasets that don't exist in S3. We need access to THOSE."
+
+The problem:
+→ Redshift data lives INSIDE the cluster (not in S3)
+→ Cross-account S3 access doesn't help
+→ Redshift UNLOAD → S3 → cross-account → COPY = expensive, slow, stale
+→ Need: real-time access to Redshift data across accounts
+
+YOU: "Redshift Data Sharing — Account A's Redshift PUBLISHES a datashare.
+      Account B's Redshift SUBSCRIBES and queries it in real-time.
+      Zero copying. Zero ETL. Live data."
+
+→ Project 58: "Share Redshift Data Across Accounts Without COPY"
+→ Introduces: Redshift Data Sharing, Producer/Consumer,
+   Datashare Objects, Namespace, Cross-Account Cluster Authorization</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="33" ========== -->
+<div class="chat-message" data-index="33"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-56.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 57 of 80</span>
+    <span class="nav-project-title">ACCOUNT B&#x27;S GLUE MUST SEE ACCOUNT A&#x27;S DATA CATALOG</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-58.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-58.html") window.location = "project-58.html";
+  if (e.key === 'ArrowLeft' && "project-56.html") window.location = "project-56.html";
+});
+</script>
+</body>
+</html>

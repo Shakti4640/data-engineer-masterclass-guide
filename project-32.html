@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 32: LOAD TRANSFORMED S3 PARQUET DIRECTLY INTO REDSHIFT VIA GLUE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:40%"></div></div>
+<div id="progress-label">40%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 32 of 80</div>
+  <div class="project-title">LOAD TRANSFORMED S3 PARQUET DIRECTLY INTO REDSHIFT VIA GLUE</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag">Glue</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Analytics team growing fast
+</span>Current State (after Project 31):
+→ MariaDB tables extracted nightly to S3 as Parquet via Glue JDBC
+→ S3 bronze layer: bronze/mariadb/orders/, customers/, products/
+→ Athena ad-hoc queries work (Projects 24, 26)
+→ Redshift cluster exists (Projects 10, 11) — but mostly empty
+→ BI dashboards (Tableau/Looker) point to Redshift
+
+THE PROBLEM:
+→ BI team says: "Athena is too slow for dashboards — 8-15 second query times"
+→ Dashboards need sub-second response on pre-aggregated data
+→ They tried Redshift COPY (Project 21) manually — works but:
+   - Manual process — someone runs COPY commands each morning
+   - No transformation between S3 and Redshift
+   - No deduplication — duplicate rows if COPY runs twice
+   - No pre/post cleanup of staging tables
+   - No monitoring or alerting on failures
+
+→ Data team asks: "Can Glue read the Parquet from S3 (Project 31 output)
+   and load it into Redshift AUTOMATICALLY with transforms?"
+
+→ CTO says: "One pipeline: MariaDB → S3 (done) → Redshift (need this)"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what "Glue writes to Redshift" actually means
+</span>→ Glue does NOT insert rows one-by-one via JDBC (that would be insanely slow)
+→ Internally, Glue does this:
+   a) Writes DynamicFrame data to a TEMP S3 location as CSV/Parquet
+   b) Issues Redshift COPY command pointing to that temp location
+   c) COPY bulk-loads into the target table
+   d) Cleans up temp files
+→ This is WHY Glue needs BOTH an S3 path AND a Redshift JDBC connection
+
+Step 2: Understand the NETWORK path
+→ Glue workers need access to:
+   a) S3 — to read source Parquet (VPC Endpoint — Project 31)
+   b) S3 — to write temp staging files (same endpoint)
+   c) Redshift — to issue COPY commands via JDBC (port 5439)
+→ Redshift is in a VPC → Security Group must allow Glue → Redshift
+
+Step 3: Understand the Redshift loading strategy
+→ Full Load: TRUNCATE target → COPY all rows (simple but slow for large tables)
+→ Upsert/Merge: Load into staging table → MERGE into target (production pattern)
+→ Append: INSERT without dedup (for event/log tables only)
+→ We'll implement UPSERT — the production-grade approach
+
+Step 4: Understand pre-actions and post-actions
+→ Glue supports SQL statements that run BEFORE and AFTER the load
+→ Pre-action: CREATE staging table, TRUNCATE staging table
+→ Post-action: MERGE from staging to target, DROP staging table
+→ This is how deduplication works
+
+Step 5: Map the dependencies
+→ S3 Parquet exists (Project 31 output)
+→ Redshift cluster exists (Projects 10, 11)
+→ Glue basics understood (Project 15, 25, 31)
+→ Redshift COPY understood (Project 21)
+→ VPC/SG/Endpoint understood (Project 31 — same VPC)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           AWS VPC (us-east-2)                           │
+│                                                                          │
+│  ┌──────────────────┐                           ┌──────────────────┐     │
+│  │ S3 (via Gateway  │    Read Parquet            │ Glue ETL Workers │     │
+│  │ Endpoint)        │◄──────────────────────────│ (Spark)          │     │
+│  │                  │                            │                  │     │
+│  │ bronze/mariadb/  │    Write Temp CSVs         │ SG: sg-glue      │     │
+│  │ orders/*.parquet │──────────────────────────►│ (from Project 31)│     │
+│  │                  │                            │                  │     │
+│  └──────────────────┘                           └────────┬─────────┘     │
+│                                                          │               │
+│                                                   JDBC (port 5439)       │
+│                                                   + COPY command         │
+│                                                          │               │
+│                                                          ▼               │
+│                                                ┌──────────────────┐      │
+│                                                │ Redshift Cluster │      │
+│                                                │ quickcart-dwh    │      │
+│                                                │                  │      │
+│                                                │ SG: sg-redshift  │      │
+│                                                │ Port: 5439       │      │
+│                                                │                  │      │
+│                                                │ Schema: analytics│      │
+│                                                │ ┌──────────────┐│      │
+│                                                │ │ dim_customers ││      │
+│                                                │ │ dim_products  ││      │
+│                                                │ │ fact_orders   ││      │
+│                                                │ │ stg_*         ││      │
+│                                                │ └──────────────┘│      │
+│                                                └──────────────────┘      │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+DATA FLOW:
+━━━━━━━━━━
+Step 1: Glue reads Parquet from S3 (bronze layer)
+Step 2: Glue transforms (rename cols, cast types, add surrogate keys)
+Step 3: Glue writes transformed data to TEMP S3 location (as CSV)
+Step 4: Glue issues Redshift PRE-ACTION: CREATE/TRUNCATE staging table
+Step 5: Redshift COPY loads from temp S3 into staging table
+Step 6: Glue issues Redshift POST-ACTION: MERGE staging → target
+Step 7: Glue issues Redshift POST-ACTION: DROP staging table
+Step 8: Temp S3 files cleaned up
+
+┌──────────┐     ┌───────────┐     ┌──────────┐     ┌──────────────┐
+│ S3       │────►│ Glue      │────►│ Temp S3  │────►│ Redshift     │
+│ (Parquet)│     │ Transform │     │ (CSV)    │     │ COPY→Staging │
+└──────────┘     └───────────┘     └──────────┘     │ MERGE→Target │
+                                                     └──────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue writes directly to Redshift JDBC (row-by-row)
+</span>→ connection_type="jdbc" with INSERT statements
+→ Painfully slow: ~1,000 rows/second
+→ 45M rows = 12.5 HOURS
+→ NEVER do this
+
+Option B: Glue writes to S3 → Manual COPY to Redshift
+→ Two separate steps: Glue job + SQL script
+→ No atomicity — if COPY fails, S3 data is orphaned
+→ Manual intervention required
+→ This is what Project 21 does — but we want automation
+
+Option C: Glue writes to Redshift using built-in connector (RECOMMENDED)
+→ Glue's Redshift connector does the S3-staging + COPY internally
+→ Supports pre/post actions for staging table pattern
+→ Single job: read → transform → stage → merge → cleanup
+→ Fully automated, retryable, monitorable
+
+Option D: Redshift Spectrum reads S3 directly (no loading)
+→ No data movement — queries S3 from Redshift
+→ Slower than local Redshift tables for hot queries
+→ Covered in Project 38 — different use case
+→ Good for ad-hoc; bad for dashboards needing &lt;1s response
+
+DECISION: Option C — Glue built-in Redshift connector
+→ Production-grade pattern used at scale
+→ Handles staging + merge + cleanup atomically
+→ Interview gold: demonstrates understanding of ETL internals</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create SEPARATE Redshift connection in Glue
+</span>   → Even if MariaDB connection exists (Project 31)
+   → Different JDBC URL, port (5439 vs 3306), credentials
+   → Same VPC, same Glue Security Group can be reused
+
+2. Use STAGING TABLE + MERGE pattern
+   → Load into stg_orders first
+   → MERGE into fact_orders using primary key
+   → Handles duplicates, updates, and inserts in one operation
+
+3. Create Redshift tables with proper DISTKEY and SORTKEY
+   → DISTKEY on join column (e.g., customer_id for fact_orders)
+   → SORTKEY on query filter column (e.g., order_date)
+   → Covered in Project 39 but needed here for table creation
+
+4. Grant Redshift cluster an IAM Role for S3 access
+   → Redshift COPY needs to read from temp S3 directory
+   → Role: allows s3:GetObject on temp path
+   → This is the SAME concept as Project 21
+
+5. Use redshiftTmpDir parameter
+   → Tells Glue WHERE to write temp staging files
+   → Must be an S3 path the Redshift IAM Role can read
+   → Clean up old temp dirs periodically
+
+6. Add pre-actions and post-actions as SQL strings
+   → Pre: CREATE TABLE IF NOT EXISTS + TRUNCATE staging
+   → Post: MERGE/INSERT-SELECT from staging → target + DROP staging
+
+7. Use a DEDICATED Redshift user for Glue
+   → Don't use admin/masteruser
+   → GRANT INSERT, SELECT, CREATE, DROP on analytics schema only
+
+8. Test with small table first (products — 50K rows)
+   → Verify full flow before running 45M row orders table</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT write to Redshift using connection_type="jdbc" with INSERT
+</span>   → As explained in Option A — rows trickle in one by one
+   → 1,000x slower than COPY-based approach
+   → The Glue Redshift connector handles COPY internally
+
+2. DO NOT skip the staging table
+   → Direct load into target table means:
+     - No deduplication
+     - No rollback if load fails halfway
+     - Table locked during load → dashboard queries fail
+   → Staging pattern isolates the load from live queries
+
+3. DO NOT use the same temp S3 directory for multiple concurrent jobs
+   → Job A writes temp files → Job B writes temp files → COPY picks up wrong files
+   → Use unique paths: s3://bucket/tmp/glue/{job_name}/{run_id}/
+
+4. DO NOT forget to grant Redshift's IAM Role access to temp S3 path
+   → Glue writes temp files using Glue's IAM Role
+   → Redshift reads temp files using Redshift's IAM Role
+   → BOTH roles need S3 access — different roles, same bucket
+
+5. DO NOT load all historical data every night
+   → First run: full load (all historical Parquet partitions)
+   → Subsequent runs: only today's partition (incremental)
+   → Without this: 45M rows × 365 days = 16 BILLION rows re-loaded yearly
+
+6. DO NOT create Redshift tables without DISTKEY/SORTKEY
+   → Default: EVEN distribution → terrible join performance
+   → Project 39 covers this deeply
+   → At minimum: set DISTKEY on fact table's most-joined column
+
+7. DO NOT ignore Redshift COPY errors
+   → COPY loads what it can, skips bad rows silently
+   → Check STL_LOAD_ERRORS after every load
+   → Post-action should include error check query
+
+8. DO NOT run Glue Redshift loads during peak dashboard hours
+   → COPY acquires table locks
+   → Dashboard queries queue behind locks
+   → Schedule loads at 2-4 AM</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use                │ Why                              │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ S3 Parquet → Redshift (batch,    │ Glue Redshift      │ Managed, COPY-based, staging     │
+│ nightly, with transforms)        │ Connector          │ pattern, pre/post actions        │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ S3 CSV → Redshift (simple,       │ Redshift COPY      │ Direct, no Glue overhead         │
+│ no transform needed)             │ (Project 21)       │ Manual but simpler for 1-off     │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ Query S3 data FROM Redshift      │ Redshift Spectrum  │ No data movement, pay per scan   │
+│ (ad-hoc, cold data)              │ (Project 38)       │ Not for hot dashboards           │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ Redshift → S3 (reverse ETL)      │ Redshift UNLOAD    │ Export aggregations back to S3   │
+│                                  │ (Project 22)       │                                  │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ Real-time streaming → Redshift   │ Kinesis → Redshift │ Sub-minute latency               │
+│                                  │ (Project 72)       │ Streaming ingestion              │
+├──────────────────────────────────┼────────────────────┼──────────────────────────────────┤
+│ Redshift aggregates → MariaDB    │ UNLOAD → Glue →    │ Reverse ETL for app consumption  │
+│ (for application serving)        │ MariaDB JDBC       │ (Project 43)                     │
+│                                  │ (Project 43)       │                                  │
+└──────────────────────────────────┴────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE → REDSHIFT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Data is already in S3 and queries are infrequent
+</span>   → Use Athena or Redshift Spectrum instead
+   → Loading into Redshift adds cost (storage + compute)
+   → Only load what dashboards actively query
+
+2. Table has &lt; 10,000 rows and no transforms needed
+   → Use Redshift COPY directly (Project 21)
+   → Glue overhead: $0.73 minimum (10 DPU-minutes)
+   → COPY command: free (Redshift already running)
+
+3. Need real-time/streaming ingestion
+   → Glue is batch-oriented (minimum ~30s cold start)
+   → Use Kinesis Data Firehose → Redshift (Project 72)
+   → Or Redshift Streaming Ingestion (native)
+
+4. Source and target schemas are identical — no transform needed
+   → Direct COPY from S3 → Redshift is simpler
+   → Glue adds value ONLY when transformation is needed
+
+5. Redshift Serverless with low RPU budget
+   → COPY from Glue consumes RPUs
+   → Large loads on tiny RPU = very slow
+   → Size RPUs appropriately or schedule loads</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│            GLUE → REDSHIFT CONNECTOR — INTERNAL MECHANICS                        │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  WHAT HAPPENS WHEN YOU CALL write_dynamic_frame TO REDSHIFT:                     │
+│  ════════════════════════════════════════════════════════════                     │
+│                                                                                  │
+│  Phase 1: PRE-ACTION EXECUTION                                                   │
+│  ─────────────────────────────                                                   │
+│  → Glue opens a JDBC connection to Redshift (port 5439)                          │
+│  → Executes your preactions SQL string                                           │
+│  → Example: CREATE TABLE stg_orders (LIKE analytics.fact_orders)                 │
+│  → Example: TRUNCATE TABLE stg_orders                                            │
+│  → Connection stays open for subsequent operations                               │
+│                                                                                  │
+│  Phase 2: TEMP S3 WRITE                                                          │
+│  ──────────────────────                                                          │
+│  → Glue serializes DynamicFrame data as CSV (NOT Parquet)                        │
+│  → WHY CSV? Redshift COPY is optimized for CSV/JSON input                        │
+│  → Files written to: {redshiftTmpDir}/temp-{uuid}/                               │
+│  → Each Spark partition writes one temp file                                     │
+│  → Uses Glue's IAM Role for S3 write                                             │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐                     │
+│  │ s3://bucket/tmp/glue-redshift/                          │                     │
+│  │   temp-a1b2c3d4/                                        │                     │
+│  │     part-00000.csv   (from Spark executor 1)            │                     │
+│  │     part-00001.csv   (from Spark executor 2)            │                     │
+│  │     ...                                                 │                     │
+│  │     part-00009.csv   (from Spark executor 10)           │                     │
+│  │     manifest.json    (lists all CSV files)              │                     │
+│  └─────────────────────────────────────────────────────────┘                     │
+│                                                                                  │
+│  Phase 3: REDSHIFT COPY COMMAND                                                  │
+│  ──────────────────────────────                                                  │
+│  → Glue issues a COPY command to Redshift via JDBC:                              │
+│                                                                                  │
+│    COPY stg_orders                                                               │
+│    FROM 's3://bucket/tmp/glue-redshift/temp-a1b2c3d4/manifest.json'              │
+│    IAM_ROLE 'arn:aws:iam::123456789:role/RedshiftS3ReadRole'                     │
+│    FORMAT AS CSV                                                                 │
+│    MANIFEST                                                                      │
+│    BLANKSASNULL                                                                  │
+│    EMPTYASNULL                                                                   │
+│    TRUNCATECOLUMNS;                                                              │
+│                                                                                  │
+│  → Redshift reads temp CSVs from S3 using ITS OWN IAM Role                      │
+│  → Redshift's MPP architecture: each slice loads in parallel                     │
+│  → 45M rows loads in 2-5 minutes via COPY                                        │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐                     │
+│  │              REDSHIFT COPY INTERNALS                     │                     │
+│  │                                                         │                     │
+│  │  Leader Node receives COPY command                      │                     │
+│  │       │                                                 │                     │
+│  │       ▼                                                 │                     │
+│  │  Reads manifest.json → identifies 10 CSV files          │                     │
+│  │       │                                                 │                     │
+│  │       ▼                                                 │                     │
+│  │  Distributes files across compute nodes                 │                     │
+│  │       │                                                 │                     │
+│  │  ┌────┴────┬────────┬────────┐                          │                     │
+│  │  ▼         ▼        ▼        ▼                          │                     │
+│  │ Node1    Node2    Node3    Node4                        │                     │
+│  │ Slice1   Slice3   Slice5   Slice7                       │                     │
+│  │ Slice2   Slice4   Slice6   Slice8                       │                     │
+│  │ (each slice reads assigned CSV files in parallel)       │                     │
+│  │ (rows distributed by DISTKEY to correct slices)         │                     │
+│  │                                                         │                     │
+│  │  Result: 45M rows loaded in 2-5 minutes                 │                     │
+│  └─────────────────────────────────────────────────────────┘                     │
+│                                                                                  │
+│  Phase 4: POST-ACTION EXECUTION                                                  │
+│  ──────────────────────────────                                                  │
+│  → Glue executes your postactions SQL string                                     │
+│  → Example:                                                                      │
+│                                                                                  │
+│    -- Delete existing rows that will be updated                                  │
+│    DELETE FROM analytics.fact_orders                                              │
+│    USING stg_orders                                                              │
+│    WHERE analytics.fact_orders.order_id = stg_orders.order_id;                   │
+│                                                                                  │
+│    -- Insert all rows from staging (new + updated)                               │
+│    INSERT INTO analytics.fact_orders                                             │
+│    SELECT * FROM stg_orders;                                                     │
+│                                                                                  │
+│    -- Cleanup staging table                                                      │
+│    DROP TABLE IF EXISTS stg_orders;                                              │
+│                                                                                  │
+│  WHY DELETE + INSERT instead of MERGE:                                           │
+│  → Redshift does NOT support standard SQL MERGE                                  │
+│  → Amazon's recommended pattern: DELETE matching + INSERT all                    │
+│  → This achieves the same result as UPSERT/MERGE                                │
+│  → Runs inside implicit transaction → atomic                                     │
+│                                                                                  │
+│  Phase 5: TEMP FILE CLEANUP                                                      │
+│  ──────────────────────────                                                      │
+│  → Glue deletes temp CSV files from S3                                           │
+│  → If cleanup fails: orphaned files accumulate                                   │
+│  → Set S3 lifecycle rule on tmp/ prefix: delete after 7 days                     │
+│                                                                                  │
+│  SECURITY MODEL — TWO IAM ROLES:                                                 │
+│  ═══════════════════════════════                                                 │
+│  ┌───────────────────────────────────────────────────────────┐                   │
+│  │                                                           │                   │
+│  │  GLUE IAM ROLE (GlueMariaDBExtractorRole)                │                   │
+│  │  → Reads Parquet from S3 (source)                         │                   │
+│  │  → Writes CSV to S3 (temp)                                │                   │
+│  │  → Opens JDBC to Redshift                                 │                   │
+│  │  → Issues COPY, pre/post SQL commands                     │                   │
+│  │                                                           │                   │
+│  │  REDSHIFT IAM ROLE (RedshiftS3ReadRole)                   │                   │
+│  │  → Reads CSV from S3 (temp) during COPY                   │                   │
+│  │  → ONLY needs s3:GetObject + s3:ListBucket                │                   │
+│  │  → Attached to Redshift cluster, NOT to Glue              │                   │
+│  │                                                           │                   │
+│  │  WHY TWO ROLES:                                           │                   │
+│  │  → Glue and Redshift are different services               │                   │
+│  │  → Glue writes temp files using its role                  │                   │
+│  │  → Redshift reads temp files using its own role           │                   │
+│  │  → The Redshift role ARN is passed to Glue as a parameter │                   │
+│  │  → Glue embeds it in the COPY command                     │                   │
+│  │                                                           │                   │
+│  └───────────────────────────────────────────────────────────┘                   │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "COPY fails: S3ServiceException: Access Denied"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Redshift's IAM Role cannot read from Glue's temp S3 path
+→ Remember: TWO roles involved
+→ Glue writes temp files → Redshift reads temp files
+→ Fix: Grant Redshift IAM Role s3:GetObject on temp S3 path
+→ AND: Ensure Redshift Role is attached to the cluster
+→ AND: Pass correct role ARN in aws_iam_role connection option
+
+PITFALL 2: "Job succeeds but Redshift table has 0 rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: Post-action DELETE deleted everything before INSERT ran
+→ Post-actions run as SEPARATE statements, not one transaction
+→ Fix: Wrap DELETE + INSERT in BEGIN...COMMIT
+→ Cause B: Source Parquet partition was empty for today
+→ Fix: Add row count check before write step
+
+PITFALL 3: "Redshift table has duplicate rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Job ran twice (retry) without TRUNCATE staging first
+→ Second run appends to staging → double rows merged into target
+→ Fix: Pre-action MUST include TRUNCATE or DROP+CREATE staging table
+
+PITFALL 4: "COPY loads but some columns have NULL — data looks wrong"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Column order mismatch between Glue output and Redshift table
+→ Glue writes CSV with columns in DynamicFrame order
+→ Redshift COPY maps columns positionally (column 1 → column 1)
+→ Fix: Ensure DynamicFrame column order matches Redshift DDL exactly
+→ OR: Use column mapping in COPY command
+
+PITFALL 5: "Job hangs on Redshift connection — timeout after 15 min"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Same as Project 31 Pitfall 1 — Security Group issue
+→ Glue SG needs self-referencing rule (already done in Project 31)
+→ Redshift SG needs inbound rule: port 5439 from Glue SG
+→ Fix: Add sg-redshift INBOUND: TCP 5439 from sg-glue
+
+PITFALL 6: "redshiftTmpDir has thousands of orphaned temp folders"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Glue cleanup step failed or was skipped
+→ Each job run creates a new temp-{uuid}/ folder
+→ 365 runs/year × 10 files each = 3,650 orphaned files
+→ Fix: S3 Lifecycle Rule on tmp/ prefix → delete after 3 days
+
+PITFALL 7: "Dashboard queries are slow during Glue load"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: DELETE + INSERT on large target table acquires locks
+→ Dashboard SELECT queries queue behind write lock
+→ Fix A: Schedule loads during off-peak hours (2-4 AM)
+→ Fix B: Use Redshift WLM (Project 40) to prioritize dashboard queries
+→ Fix C: Load into separate table → swap via ALTER TABLE RENAME
+
+PITFALL 8: "Column types don't match — COPY fails with data type error"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Parquet DOUBLE → Redshift DECIMAL(10,2) precision mismatch
+→ Cause: Parquet STRING → Redshift VARCHAR(50) — string too long
+→ Fix: Cast all columns explicitly in Glue transform step
+→ Fix: Use TRUNCATECOLUMNS in COPY to handle overflow gracefully</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>LOAD SIZE vs STRATEGY:
+</span>━━━━━━━━━━━━━━━━━━━━━
+┌─────────────────┬────────────────────────┬────────────────────────────────────┐
+│ Daily Load Size │ Strategy               │ Considerations                     │
+├─────────────────┼────────────────────────┼────────────────────────────────────┤
+│ &lt; 1M rows       │ Full replace (TRUNCATE │ Simple, fast enough               │
+│                 │ + COPY)                │ &lt; 2 minutes                        │
+├─────────────────┼────────────────────────┼────────────────────────────────────┤
+│ 1M - 50M rows   │ Staging + DELETE/INSERT│ Handles updates + inserts          │
+│                 │ (our approach)         │ 5-15 minutes                       │
+├─────────────────┼────────────────────────┼────────────────────────────────────┤
+│ 50M - 500M rows │ Staging + DELETE/INSERT│ Increase DPUs, more temp files     │
+│                 │ + Manifest COPY        │ Consider splitting into batches    │
+├─────────────────┼────────────────────────┼────────────────────────────────────┤
+│ 500M+ rows      │ Table swap pattern     │ Load into new table → RENAME      │
+│                 │                        │ Avoids long locks on target table  │
+└─────────────────┴────────────────────────┴────────────────────────────────────┘
+
+REDSHIFT CLUSTER SIZING FOR LOADS:
+→ 2 dc2.large nodes: handles up to ~100M rows/load comfortably
+→ 4 dc2.large nodes: handles up to ~500M rows/load
+→ For larger: consider ra3.xlplus with managed storage
+
+CONCURRENT LOADS:
+→ Redshift supports concurrent COPY commands
+→ BUT: each COPY acquires write lock on target table
+→ Rule: max 1 COPY per target table at a time
+→ Different tables can load concurrently (different locks)
+
+TEMP S3 STORAGE:
+→ 45M rows as CSV ≈ 2-4 GB temp files
+→ Deleted after each run
+→ Peak storage: depends on how many jobs run concurrently
+→ Budget: negligible ($0.10/day at most)
+
+COST BREAKDOWN:
+→ Glue: 10 DPUs × 10 min = $0.73/run
+→ Redshift: already running (sunk cost for dashboards)
+→ S3 temp: ~$0.001/run
+→ Total incremental cost: ~$0.73/run × 30 days = $21.90/month
+→ vs. manual process: 1 hour/day × $50/hour engineer = $1,500/month</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY THE LOAD WORKED:
+</span>
+1. ROW COUNT MATCH
+   → Before load (Athena on S3 source):
+     SELECT COUNT(*) FROM bronze_mariadb.orders 
+     WHERE year='2025' AND month='01' AND day='15'
+   → After load (Redshift target):
+     SELECT COUNT(*) FROM analytics.fact_orders
+     WHERE extraction_date = '2025-01-15'
+   → Must match
+
+2. REDSHIFT LOAD ERRORS
+   → SELECT * FROM stl_load_errors ORDER BY starttime DESC LIMIT 20;
+   → Shows: which file, which line, which column, what error
+   → CRITICAL to check after every load
+
+3. REDSHIFT LOAD COMMITS
+   → SELECT * FROM stl_load_commits ORDER BY updated DESC LIMIT 10;
+   → Shows: which COPY commands completed, how many rows loaded
+
+4. SAMPLE DATA COMPARISON
+   → Pick 5 random order_ids
+   → Query MariaDB → query S3 (Athena) → query Redshift
+   → All 3 must return identical data
+
+5. TEMP FILE INSPECTION
+   → aws s3 ls s3://bucket/tmp/glue-redshift/ --recursive
+   → After successful run: should be empty (cleaned up)
+   → If files remain: cleanup failed
+
+6. GLUE JOB METRICS
+   → CloudWatch → Glue Job Metrics
+   → Check: bytes written, records written
+   → Compare with source count</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(32)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Infrastructure Setup (Redshift Connection + Security)</h3>
+
+<h3>Part 2: Glue ETL Script — S3 Parquet → Redshift</h3>
+
+<h3>Part 3: Create and Run the Glue Job</h3>
+
+<h3>Part 4: End-to-End Pipeline Orchestrator (MariaDB → S3 → Redshift)</h3>
+
+<h3>Part 5: S3 Lifecycle Rule for Temp File Cleanup</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                      │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│ 1. Create Redshift tables (DDL from 32_01):                         │
+│    → Run SQL on Redshift Query Editor                               │
+│    → Creates: analytics.fact_orders, dim_customers, dim_products    │
+│                                                                     │
+│ 2. Setup infrastructure:                                            │
+│    $ python 32_01_setup_redshift_infrastructure.py                  │
+│    → Creates: Redshift SG rule, Redshift IAM Role,                  │
+│      Glue Connection, attaches role to cluster                      │
+│                                                                     │
+│ 3. Test Redshift connection via Console:                            │
+│    → Glue → Connections → quickcart-redshift-conn → Test            │
+│                                                                     │
+│ 4. Setup temp file cleanup:                                         │
+│    $ python 32_05_setup_temp_cleanup.py                             │
+│    → S3 Lifecycle rule: auto-delete tmp/ after 3 days               │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│ DAILY EXECUTION                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│ Option A — Run jobs separately:                                     │
+│    $ python 31_03_create_and_run_job.py   # MariaDB → S3            │
+│    $ python 32_03_create_and_run_job.py   # S3 → Redshift           │
+│                                                                     │
+│ Option B — Run full pipeline:                                       │
+│    $ python 32_04_full_pipeline.py        # Both steps orchestrated │
+│                                                                     │
+│ Option C (Production) — Step Functions:                              │
+│    → Project 55 will automate this with retry + error handling      │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│ EXPECTED TIMELINE                                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  0:00 - 0:01  → Job 1 cold start                                   │
+│  0:01 - 0:10  → Job 1: MariaDB → S3 Parquet (Project 31)           │
+│  0:10 - 0:11  → Job 2 cold start                                   │
+│  0:11 - 0:13  → Job 2: Read Parquet from S3                        │
+│  0:13 - 0:14  → Job 2: Write temp CSVs to S3                       │
+│  0:14 - 0:17  → Job 2: COPY into staging → MERGE into target       │
+│  0:17 - 0:18  → Job 2: ANALYZE + cleanup                           │
+│                                                                     │
+│  Total: ~18 minutes for full pipeline                               │
+│  Cost: $0.73 (Job 1) + $0.73 (Job 2) = $1.46/day                   │
+│  Monthly: $1.46 × 30 = $43.80                                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+DATA FLOW VISUALIZATION:
+━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────┐    Glue Job 1     ┌──────────┐    Glue Job 2     ┌──────────┐
+│          │    (Project 31)   │          │    (Project 32)    │          │
+│ MariaDB  │ ────────────────► │ S3       │ ────────────────►  │ Redshift │
+│          │                   │ (Bronze) │                    │          │
+│ orders   │  JDBC parallel    │ orders/  │  Read Parquet      │ fact_    │
+│ 45M rows │  hashfield        │ *.parquet│  Write temp CSV    │ orders   │
+│          │  → Parquet        │          │  COPY → staging    │          │
+│ customers│                   │customers/│  MERGE → target    │ dim_     │
+│ 2M rows  │                   │ *.parquet│  DROP staging      │customers │
+│          │                   │          │  ANALYZE           │          │
+│ products │                   │products/ │                    │ dim_     │
+│ 50K rows │                   │ *.parquet│                    │products  │
+└──────────┘                   └──────────┘                    └──────────┘
+   SOURCE                     LANDING ZONE                    SERVING LAYER
+  (OLTP)                     (Data Lake)                     (Data Warehouse)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue does NOT insert rows into Redshift one-by-one
+→ Internally: writes temp CSV to S3 → issues COPY → merges
+→ TWO IAM roles involved: Glue writes temp files, Redshift reads them
+→ Staging table pattern: zero-downtime, atomic, deduplication
+→ DELETE + INSERT is Amazon's recommended UPSERT for Redshift
+→ Pre-actions and post-actions wrap the load with setup + cleanup SQL
+→ redshiftTmpDir must be accessible by BOTH Glue AND Redshift roles
+→ Column ORDER must match between DynamicFrame and Redshift DDL
+→ S3 Lifecycle rules prevent orphaned temp file accumulation
+→ Full pipeline: MariaDB → S3 → Redshift in ~18 minutes for $1.46
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 bucket (source and temp storage)
+→ Project 10, 11: Redshift cluster and table design
+→ Project 21: Redshift COPY (Glue uses this internally)
+→ Project 25: Glue ETL basics (DynamicFrame, transforms)
+→ Project 31: MariaDB → S3 extraction (source for this project)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 33: Job Bookmarks — only process NEW Parquet partitions
+   (don't re-load yesterday's data into Redshift again)
+→ Project 34: Complex transforms between S3 and Redshift
+   (filter, join, aggregate before loading)
+→ Project 39: Optimize Redshift table design for query performance
+   (DISTKEY, SORTKEY, VACUUM, ANALYZE — we used basics here)
+→ Project 43: Reverse ETL — Redshift aggregates back to MariaDB
+→ Project 55: Step Functions — orchestrate this pipeline properly
+   (replace our simple Python orchestrator with production-grade)
+→ Project 65: Full CDC merge — only load changed rows, not full table</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a complete pipeline:
+</span>MariaDB → S3 Parquet → Redshift (nightly)
+
+BUT: Every night, the pipeline re-extracts ALL 45M orders from MariaDB
+     and re-loads ALL of them into Redshift
+
+Day 1: Extract 45M → Load 45M → ✅ (10 min extract, 7 min load)
+Day 2: Extract 45M → Load 45M → ✅ (same 45M + 200K new)
+Day 3: Extract 45M → Load 45M → ✅ (same 45M + 400K new)
+...
+Day 30: Extract 51M → Load 51M → ✅ (growing, wasting time on old data)
+
+Data engineer notices:
+"We're re-processing 45M unchanged rows every night.
+ Only ~200K new orders arrive per day.
+ If we could track WHAT WE ALREADY PROCESSED,
+ we'd only handle the 200K new rows."
+
+CTO: "That sounds like Job Bookmarks?"
+YOU: "Exactly. Glue Job Bookmarks remember the last processed state.
+      Next run picks up only where the last run left off."
+
+→ Project 33: "Only Process NEW Files — Don't Re-Process Old Ones"
+→ Introduces: Glue Job Bookmarks, Stateful Cursor, S3 Timestamp Tracking</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-31.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 32 of 80</span>
+    <span class="nav-project-title">LOAD TRANSFORMED S3 PARQUET DIRECTLY INTO REDSHIFT VIA GLUE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-33.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-33.html") window.location = "project-33.html";
+  if (e.key === 'ArrowLeft' && "project-31.html") window.location = "project-31.html";
+});
+</script>
+</body>
+</html>

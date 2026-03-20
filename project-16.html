@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 16: QUERY S3 FILES USING SQL WITHOUT LOADING ANYWHERE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:20%"></div></div>
+<div id="progress-label">20%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 16 of 80</div>
+  <div class="project-title">QUERY S3 FILES USING SQL WITHOUT LOADING ANYWHERE</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 6 months old (continuing from Project 1)
+</span>Situation:
+→ 180 days of CSV files sitting in S3 (from Project 1 upload pipeline)
+→ s3://quickcart-raw-data-prod/daily_exports/orders/orders_YYYYMMDD.csv
+→ s3://quickcart-raw-data-prod/daily_exports/customers/customers_YYYYMMDD.csv
+→ s3://quickcart-raw-data-prod/daily_exports/products/products_YYYYMMDD.csv
+→ ~180 files per entity → ~540 total files → ~11 GB total
+
+Marketing Manager asks:
+"How many orders had status='completed' last month?
+ What's the total revenue by product category?"
+
+Current options the team is considering:
+→ Option A: Download all CSVs, open in Excel → crashes at 1M+ rows
+→ Option B: Load into MariaDB on EC2 → takes hours, disk almost full (Project 8-9)
+→ Option C: Spin up Redshift cluster → $0.25/hr minimum, overkill for ad-hoc queries
+→ Option D: ??? Something that queries S3 directly with SQL
+
+CTO: "I don't want to maintain another database just for ad-hoc questions.
+      Can we just SQL these files WHERE THEY SIT?"
+
+YOU: "Yes. That's exactly what Amazon Athena does."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what Athena IS
+</span>→ Serverless SQL query engine
+→ Based on Presto (open-source distributed SQL engine by Facebook)
+→ Points at S3 → reads files → returns SQL results
+→ No infrastructure to manage — no servers, no clusters, no loading
+
+Step 2: Understand what Athena NEEDS to work
+→ It needs to know the SCHEMA of the files (columns, types)
+→ It needs to know the FORMAT of the files (CSV, JSON, Parquet, ORC)
+→ It needs to know the LOCATION in S3 (which prefix)
+→ All of this is stored in the AWS Glue Data Catalog (Project 15)
+
+Step 3: Understand the cost model
+→ $5.00 per TB of data SCANNED
+→ Not per query — per bytes read from S3
+→ 11 GB scanned = $0.055 (5.5 cents)
+→ Cancelled queries still charged for data already scanned
+→ Failed queries with zero scan = $0.00
+
+Step 4: Understand the flow
+→ User writes SQL in Athena console
+→ Athena reads table definition from Glue Data Catalog
+→ Athena scans files in S3 matching the table's location
+→ Athena processes, aggregates, filters
+→ Results stored in a separate S3 output location
+→ Results displayed in console or returned via API
+
+Step 5: Plan our approach
+→ Create a Glue Catalog Database (logical namespace)
+→ Create Glue Catalog Tables (schema definition pointing to S3)
+→ Configure Athena output location
+→ Run SQL queries
+→ No data movement — files stay in S3 untouched</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  S3 Bucket (from Project 1)
+  quickcart-raw-data-prod/
+   └── daily_exports/
+        ├── orders/*.csv          ← Athena scans these
+        ├── customers/*.csv       ← Athena scans these
+        └── products/*.csv        ← Athena scans these
+                │
+                │ Schema defined in
+                ▼
+  Glue Data Catalog
+   └── Database: quickcart_raw
+        ├── Table: orders      → LOCATION s3://.../orders/
+        ├── Table: customers   → LOCATION s3://.../customers/
+        └── Table: products    → LOCATION s3://.../products/
+                │
+                │ Athena reads catalog + scans S3
+                ▼
+  Amazon Athena
+   ├── SELECT COUNT(*) FROM orders WHERE status = 'completed'
+   ├── SELECT category, SUM(total) FROM orders JOIN products ...
+   └── Results → s3://quickcart-athena-results/
+                        │
+                        ▼
+                  CSV result files (auto-generated)</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Create tables manually via Athena DDL (CREATE TABLE)
+</span>→ You write the column names, types, SerDe, location
+→ Full control over schema definition
+→ Best when you KNOW the exact schema
+→ ✅ WE USE THIS — teaches fundamentals
+
+Option B: Use Glue Crawler to auto-discover schema (Project 23)
+→ Crawler reads sample files, infers schema automatically
+→ Great for unknown/changing schemas
+→ Sometimes infers wrong types (string vs int)
+→ Covered in Project 23
+
+Option C: Use Athena CTAS to create optimized copies (Project 36)
+→ CREATE TABLE AS SELECT — transforms data during creation
+→ Converts CSV to Parquet, adds partitions
+→ Covered in Project 36
+
+Option D: Use Athena Federated Query to query databases directly (Project 46)
+→ Query MariaDB, Redshift, DynamoDB via Lambda connectors
+→ Covered in Project 46
+
+DECISION: Option A — manual DDL
+→ Teaches exactly what Athena needs and why
+→ No magic — every column, type, and setting is explicit</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a SEPARATE S3 bucket (or prefix) for Athena query results
+</span>   → Athena writes result CSVs to S3 after every query
+   → Never mix results with source data
+   → Set lifecycle policy: delete results after 7 days (they pile up fast)
+
+2. Use a Workgroup to control costs
+   → Set per-query data scan limit (e.g., 1 GB)
+   → Prevents accidental full-table scan on 10 TB dataset
+   → Tracks query history per team/user
+
+3. Define column types precisely
+   → "quantity" should be INT, not STRING
+   → Wrong types = wrong aggregations (SUM of strings = error)
+   → Athena reads files lazily — bad types cause runtime failures, not DDL errors
+
+4. Use skip.header.line.count for CSVs with headers
+   → Without this: header row "order_id" becomes a data row
+   → Silent data corruption — Athena won't error, just wrong results
+
+5. Use backticks for reserved words as column names
+   → `status`, `date`, `order` are SQL reserved words
+   → CREATE TABLE with bare "status" → syntax error
+
+6. Match SerDe to file format exactly
+   → CSV → OpenCSVSerDe or LazySimpleSerDe
+   → JSON → org.openx.data.jsonserde.JsonSerDe
+   → Parquet → org.apache.hadoop.hive.ql.io.parquet (auto-detected)
+   → Wrong SerDe = garbled data or query failure
+
+7. Point LOCATION to the PREFIX, not individual files
+   → LOCATION 's3://bucket/daily_exports/orders/'
+   → Athena scans ALL files under that prefix
+   → Adding new files = instant availability (no re-registration)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT point Athena output to the same prefix as source data
+</span>   → Athena writes .csv and .csv.metadata files
+   → Next query scans its own results as if they were source data
+   → Creates infinite feedback loop of garbage results
+
+2. DO NOT forget skip.header.line.count for CSV
+   → Header row becomes data row silently
+   → "order_id" appears as a customer name
+   → Aggregations like SUM("unit_price") fail on string "unit_price"
+
+3. DO NOT use SELECT * on large datasets without LIMIT
+   → Scans ENTIRE dataset every time
+   → 1 TB scan = $5.00 per query
+   → 10 analysts running SELECT * = $50/day
+
+4. DO NOT assume Athena validates data on table creation
+   → CREATE TABLE succeeds even if S3 location is empty
+   → CREATE TABLE succeeds even if schema doesn't match files
+   → Errors appear only at QUERY TIME
+
+5. DO NOT ignore Athena query result accumulation
+   → Every query generates result files in output bucket
+   → 100 queries/day × 30 days = 3,000 result files
+   → Set S3 lifecycle to auto-delete after 7 days
+
+6. DO NOT use Athena for low-latency (&lt;1 second) queries
+   → Minimum query time: ~2-3 seconds (engine startup overhead)
+   → Not designed for application-facing queries
+   → Use Redshift, DynamoDB, or ElastiCache for low latency
+
+7. DO NOT create tables in the "default" database
+   → Messy — everything from every project piled together
+   → Always create a dedicated database per domain/project</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────┬─────────────────────────────────────┐
+</span>│ Scenario                         │ Use              │ Why                                 │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Ad-hoc SQL on S3 files           │ Athena           │ Serverless, pay-per-scan, no infra  │
+│ (infrequent, exploratory)        │                  │                                     │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Heavy daily aggregations on      │ Redshift         │ Pre-loaded data, optimized storage, │
+│ same data repeatedly             │ (Project 10)     │ materialized views, fast repeated   │
+│                                  │                  │ queries                             │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Application needs SQL results    │ RDS / MariaDB    │ Low latency, connection pooling,    │
+│ in &lt;100ms                        │ (Project 8)      │ indexed lookups                     │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Query S3 data lake + Redshift    │ Redshift         │ Combines local + S3 data without    │
+│ local tables in one query        │ Spectrum (P38)   │ loading into Redshift               │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Need schema discovery on         │ Glue Crawler     │ Auto-detects schema, populates      │
+│ unknown S3 files                 │ (Project 23)     │ same catalog Athena reads            │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Transform CSV to Parquet at      │ Athena CTAS      │ One SQL statement, no Glue job      │
+│ small scale                      │ (Project 36)     │ needed                              │
+├──────────────────────────────────┼──────────────────┼─────────────────────────────────────┤
+│ Complex multi-step ETL with      │ Glue ETL         │ Spark engine, bookmarks, JDBC       │
+│ joins, dedup, CDC                │ (Project 25)     │ connections, schema evolution        │
+└──────────────────────────────────┴──────────────────┴─────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ATHENA</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Repeated queries on same data (&gt;20 queries/day on same tables)
+</span>   → Every query re-scans S3 from scratch
+   → No persistent indexes, no caching of data (only results cached 
+     if enabled)
+   → Cost: $5/TB × 20 queries × 100 GB = $10/day = $300/month
+   → Cheaper: Load into Redshift, query unlimited times
+
+2. Sub-second query latency requirements
+   → Athena cold start: 2-5 seconds minimum
+   → Complex queries on large data: 30-300 seconds
+   → Use: Redshift, DynamoDB, ElastiCache
+
+3. UPDATE/DELETE operations
+   → Athena is read-only on source data (with Iceberg exception)
+   → Cannot: UPDATE orders SET status='shipped' WHERE id=123
+   → Use: MariaDB (Project 9), Redshift (Project 10)
+
+4. Streaming / real-time data
+   → Athena queries are batch — submit, wait, get results
+   → No continuous query or streaming window
+   → Use: Kinesis Analytics, Flink (Project 72)
+
+5. Data &lt; 1 MB
+   → Minimum charge: 10 MB per query regardless of actual scan
+   → Querying a 1 KB file costs same as 10 MB file
+   → At tiny scale: just download and use pandas
+
+6. Highly concurrent workload (&gt;20 simultaneous queries)
+   → Default: 20-30 concurrent DML queries per account per region
+   → Can increase via service quota request
+   → But Athena is not designed for 1000-user dashboard backend
+   → Use: Redshift with concurrency scaling</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                     ATHENA INTERNAL ARCHITECTURE                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  LAYER 1: QUERY SUBMISSION                                                  │
+│  ─────────────────────────                                                  │
+│  User submits SQL → Athena API (StartQueryExecution)                        │
+│  → Query gets a unique QueryExecutionId                                     │
+│  → Query enters queue in the Athena engine                                  │
+│                                                                             │
+│  LAYER 2: QUERY PLANNING                                                    │
+│  ─────────────────────────                                                  │
+│  Athena reads table metadata from Glue Data Catalog:                        │
+│  → Column names and types                                                   │
+│  → SerDe (serializer/deserializer) — how to parse the file format           │
+│  → S3 LOCATION — where to find the data files                               │
+│  → Partition info (if any) — which S3 prefixes to scan                      │
+│                                                                             │
+│  Query planner creates execution plan:                                      │
+│  → Which files to scan                                                      │
+│  → Which columns to read (column projection)                                │
+│  → Which filters to push down (predicate pushdown — Parquet/ORC only)       │
+│  → How to distribute work across worker nodes                               │
+│                                                                             │
+│  LAYER 3: EXECUTION ENGINE (Trino/Presto)                                   │
+│  ─────────────────────────────────────────                                   │
+│  Athena v2: Presto 0.217                                                    │
+│  Athena v3: Trino (Presto fork, current)                                    │
+│                                                                             │
+│  Execution flow:                                                            │
+│  ┌─────────────┐                                                            │
+│  │ Coordinator │ ← Parses SQL, builds plan, assigns splits                  │
+│  └──────┬──────┘                                                            │
+│         │ distributes work                                                  │
+│    ┌────┴─────┬──────────┬──────────┐                                       │
+│    ▼          ▼          ▼          ▼                                        │
+│  Worker 1   Worker 2   Worker 3   Worker N                                  │
+│  (reads     (reads     (reads     (reads                                    │
+│   files     files      files      files                                     │
+│   1-10)     11-20)     21-30)     31-N)                                     │
+│    │          │          │          │                                        │
+│    └────┬─────┴──────────┴──────────┘                                       │
+│         ▼                                                                   │
+│  Coordinator merges partial results                                         │
+│  → Final aggregation                                                        │
+│  → Sorting (if ORDER BY)                                                    │
+│  → Writes result to S3 output location                                      │
+│                                                                             │
+│  LAYER 4: SerDe — THE KEY TO FORMAT UNDERSTANDING                           │
+│  ─────────────────────────────────────────────────                           │
+│                                                                             │
+│  SerDe = Serializer / Deserializer                                          │
+│  → Tells Athena HOW to read each file format                                │
+│                                                                             │
+│  ┌─────────────────┬───────────────────────────────────────────┐            │
+│  │ File Format     │ SerDe Used                                │            │
+│  ├─────────────────┼───────────────────────────────────────────┤            │
+│  │ CSV (simple)    │ LazySimpleSerDe                           │            │
+│  │ CSV (quoted)    │ OpenCSVSerDe (handles quotes, escapes)    │            │
+│  │ JSON            │ org.openx.data.jsonserde.JsonSerDe        │            │
+│  │ Parquet         │ org.apache.hadoop.hive.ql.io.parquet      │            │
+│  │ ORC             │ org.apache.hadoop.hive.ql.io.orc          │            │
+│  │ TSV             │ LazySimpleSerDe with '\t' delimiter       │            │
+│  │ CloudTrail logs │ com.amazon.emr.hive.serde.CloudTrailSerde│            │
+│  └─────────────────┴───────────────────────────────────────────┘            │
+│                                                                             │
+│  OpenCSVSerDe specifics (used in our project):                              │
+│  → ALL columns treated as STRING internally                                 │
+│  → Athena casts to declared types at query time                             │
+│  → Handles: quoted fields, escaped commas, newlines in fields               │
+│  → Does NOT support: arrays, maps, structs (use LazySimpleSerDe)            │
+│                                                                             │
+│  LAYER 5: COLUMN PROJECTION &amp; PREDICATE PUSHDOWN                           │
+│  ─────────────────────────────────────────────────                           │
+│                                                                             │
+│  CSV files:                                                                 │
+│  → Athena must read ENTIRE row even for SELECT single_column                │
+│  → CSV is row-oriented — cannot skip columns physically                     │
+│  → Projection happens AFTER reading — saves nothing on scan cost            │
+│                                                                             │
+│  Parquet/ORC files (Project 25):                                            │
+│  → Columnar format — each column stored separately                          │
+│  → SELECT single_column reads ONLY that column's bytes                      │
+│  → 100 columns but need 2 → reads 2% of data → 98% cost savings            │
+│  → Predicate pushdown: WHERE filters applied at storage level               │
+│  → Parquet footer contains min/max stats per column per row group           │
+│  → Athena skips row groups where filter cannot match                        │
+│                                                                             │
+│  THIS IS WHY PARQUET &gt; CSV FOR ATHENA (Project 25)                          │
+│                                                                             │
+│  LAYER 6: QUERY RESULT OUTPUT                                               │
+│  ────────────────────────────                                                │
+│  → Results written as CSV to: s3://output-bucket/query-id.csv               │
+│  → Metadata file: s3://output-bucket/query-id.csv.metadata                  │
+│  → Max result size: 2 GB (per query)                                        │
+│  → If result &gt; 2 GB → query fails → use CTAS instead (Project 36)          │
+│                                                                             │
+│  LAYER 7: PRICING MECHANICS                                                 │
+│  ─────────────────────────                                                  │
+│  → Charged per BYTES SCANNED from S3                                        │
+│  → $5.00 per TB scanned                                                     │
+│  → Minimum charge: 10 MB per query                                          │
+│  → DDL (CREATE TABLE, SHOW TABLES): FREE                                    │
+│  → Failed queries: charged for data scanned before failure                  │
+│  → Cancelled queries: charged for data scanned before cancel                │
+│  → Compressed files: charged on COMPRESSED size (not decompressed)          │
+│  → Columnar (Parquet/ORC): charged ONLY for columns read                   │
+│                                                                             │
+│  COST FORMULA:                                                              │
+│  cost = (bytes_scanned / 1_099_511_627_776) × $5.00                        │
+│  cost = max(cost, $0.00000476)  ← 10 MB minimum                            │
+│                                                                             │
+│  EXAMPLE:                                                                   │
+│  → 11 GB CSV, SELECT * → scans 11 GB → $0.055                              │
+│  → 11 GB CSV, SELECT single_col → STILL scans 11 GB → $0.055 (CSV!)        │
+│  → 11 GB Parquet, SELECT single_col (of 10 cols) → scans ~1.1 GB → $0.0055│
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+HOW GLUE DATA CATALOG FITS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Glue Data Catalog is the METASTORE — it answers:
+  ┌────────────────────────────────────────────────────┐
+  │ Q: What databases exist?                           │
+  │ A: quickcart_raw, quickcart_curated, ...           │
+  │                                                    │
+  │ Q: What tables are in quickcart_raw?               │
+  │ A: orders, customers, products                     │
+  │                                                    │
+  │ Q: What columns does "orders" have?                │
+  │ A: order_id STRING, quantity INT, ...              │
+  │                                                    │
+  │ Q: Where is the data?                              │
+  │ A: s3://quickcart-raw-data-prod/daily_exports/     │
+  │    orders/                                         │
+  │                                                    │
+  │ Q: How to parse the files?                         │
+  │ A: OpenCSVSerDe, comma-delimited, skip 1 header    │
+  └────────────────────────────────────────────────────┘
+
+  Athena does NOT store any schema itself
+  → It reads Glue Data Catalog every time you run a query
+  → Change catalog → next query sees new schema instantly
+  → Same catalog is shared by: Athena, Glue ETL, Redshift Spectrum, EMR</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "All my numeric columns show NULL"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: OpenCSVSerDe treats everything as STRING internally
+→ If you declare INT but CSV has "12.99" → cast fails → NULL
+→ Fix: declare DOUBLE for decimals, or use STRING and CAST in queries
+→ Deeper fix: use LazySimpleSerDe which handles type casting better
+
+PITFALL 2: "First row of results is the CSV header"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: forgot 'skip.header.line.count' = '1'
+→ Fix: add to TBLPROPERTIES in CREATE TABLE
+→ Impact: header "order_id" becomes a row → COUNT is off by 1 per file
+→ 180 files = count inflated by 180
+
+PITFALL 3: "LOCATION points to wrong prefix — query returns 0 rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: typo in S3 path or missing trailing slash
+→ LOCATION must end with "/" → 's3://bucket/prefix/'
+→ Without trailing slash: Athena may not find files
+→ No error at CREATE TABLE time — only empty results at query time
+
+PITFALL 4: "Query scans way more data than expected"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV format → must read entire row regardless of columns selected
+→ Also: no partitioning → scans ALL files even if you need only 1 day
+→ Fix: convert to Parquet (Project 25) + add partitions (Project 26)
+
+PITFALL 5: "Athena result bucket fills up with thousands of files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Every query = 2 files (result.csv + result.csv.metadata)
+→ 50 queries/day × 30 days = 3,000 files
+→ Fix: S3 lifecycle policy → delete objects after 7 days (Project 4 concept)
+
+PITFALL 6: "Column order mismatch — wrong data in wrong columns"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ CSV is POSITIONAL — column 1 in DDL maps to column 1 in file
+→ If CREATE TABLE has (order_id, customer_id, product_id)
+→ But CSV has (customer_id, order_id, product_id)
+→ Data silently maps wrong → order_id contains customer_id values
+→ No error, just wrong answers
+→ Fix: always verify with SELECT * LIMIT 5 and visually check
+
+PITFALL 7: "HIVE_CURSOR_ERROR or HIVE_BAD_DATA"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: data doesn't match declared schema
+→ Example: column declared INT but file contains "N/A" in that column
+→ Fix: declare as STRING, clean in query with TRY_CAST()
+→ Or: clean data upstream before landing in S3
+
+PITFALL 8: "Query works on one file but fails on 180 files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: one file has different column count or encoding
+→ File 87 has 7 columns, rest have 8 → breaks parsing
+→ Fix: validate file structure before upload (Project 1 concept)
+→ Debug: use $path pseudo-column to find which file has the issue
+   SELECT "$path", COUNT(*) FROM orders GROUP BY 1</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA SIZE SCALING:
+</span>━━━━━━━━━━━━━━━━━
+→ 10 GB: Athena handles in 3-10 seconds (CSV)
+→ 100 GB: 15-60 seconds (CSV), 3-10 seconds (Parquet)
+→ 1 TB: 1-5 minutes (CSV), 15-60 seconds (Parquet partitioned)
+→ 10 TB: Athena still works but COST matters → $50 per full scan
+→ 100 TB: Must have partitioning + Parquet + column pruning
+
+COST SCALING:
+━━━━━━━━━━━━━
+→ 1 analyst, 5 queries/day on 11 GB CSV:
+  11 GB × 5 × $5/TB = $0.275/day = $8.25/month ✅ Cheap
+
+→ 10 analysts, 20 queries/day on 500 GB CSV:
+  500 GB × 20 × $5/TB = $50/day = $1,500/month ⚠️ Expensive
+
+→ Same 500 GB converted to Parquet (5:1 compression):
+  100 GB × 20 × $5/TB = $10/day = $300/month ✅ 80% savings
+
+→ Same + partitioning (only scan 1 day of 365):
+  (100 GB / 365) × 20 × $5/TB = $0.027/day = $0.82/month ✅ 99.9% savings
+
+CONCURRENCY SCALING:
+━━━━━━━━━━━━━━━━━━━━
+→ Default: 20-30 concurrent DML queries per account per region
+→ DDL queries (CREATE, DROP): separate limit, ~20 concurrent
+→ Can request increase to 100+ via AWS support
+→ Beyond that: use Redshift for dashboard workloads
+
+PERFORMANCE OPTIMIZATION PATH:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CSV (slowest, most expensive)
+    ↓ convert to Parquet (Project 25)
+  Parquet (columnar, compressed, predicate pushdown)
+    ↓ add partitioning (Project 26)
+  Partitioned Parquet (scan only relevant partitions)
+    ↓ add bucketing
+  Bucketed Partitioned Parquet (fastest, cheapest)
+    ↓ if still not enough
+  Redshift / Redshift Spectrum (Project 38)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY ATHENA IS WORKING CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check data scanned per query
+   → Every query shows "Data scanned: X.XX MB" in console
+   → Compare with expected file sizes
+   → If scanned = 0 bytes → table location is wrong or empty
+
+2. Use $path pseudo-column
+   → SELECT "$path", * FROM orders LIMIT 5
+   → Shows WHICH S3 file each row came from
+   → Essential for debugging multi-file issues
+
+3. Use SHOW CREATE TABLE
+   → SHOW CREATE TABLE quickcart_raw.orders
+   → Displays the full DDL including LOCATION, SerDe, properties
+   → Verify everything matches what you intended
+
+4. Preview before aggregation
+   → Always run SELECT * FROM table LIMIT 10 first
+   → Visually verify columns align with headers
+   → Check for NULLs that shouldn't be there (type mismatch)
+
+5. Check query execution details
+   → Athena console → "Query stats" tab
+   → Shows: planning time, execution time, data scanned
+   → Stage-by-stage breakdown of processing
+
+6. CloudTrail logging
+   → Every Athena API call logged
+   → StartQueryExecution, GetQueryResults, GetQueryExecution
+   → Who ran what query when — audit trail</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(16)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Athena Output Bucket</h3>
+
+<h3>Step 2: Create Glue Catalog Database + Tables via Athena DDL</h3>
+
+<h3>Step 3: Run Analytical Queries</h3>
+
+<h3>Step 4: Athena Workgroup for Cost Control</h3>
+
+<h3>Step 5: Cleanup Utility</h3>
+
+<h3>Step 6: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITE: Project 1 files must exist in S3</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Verify: aws s3 ls s3://quickcart-raw-data-prod/daily_exports/</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create Athena output bucket (one-time)</span><span>
+</span>python 16_01_create_athena_output_bucket.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create Glue Catalog database + tables</span><span>
+</span>python 16_02_create_catalog_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Run analytical queries</span><span>
+</span>python 16_03_run_queries.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Create cost-controlled workgroup (optional but recommended)</span><span>
+</span>python 16_04_create_workgroup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Cleanup (when done)</span><span>
+</span>python 16_05_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT FLOW (Step 3 — Queries):
+</span>
+======================================================================
+QUERY 1: Preview orders data (sanity check)
+======================================================================
+   SQL: SELECT * FROM orders LIMIT 5
+   Query ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+   📊 Scanned: 83,942 bytes | Time: 2847ms | Cost: $0.000000
+
+   order_id          | customer_id | product_id | quantity | unit_price | total_amount | status    | order_date
+   ------------------+-------------+------------+----------+------------+--------------+-----------+-----------
+   ORD-20250115-0001 | CUST-023841 | PROD-00342 | 3        | 49.99      | 149.97       | completed | 2025-01-15
+   ORD-20250115-0002 | CUST-011203 | PROD-04891 | 1        | 299.99     | 299.99       | shipped   | 2025-01-15
+   ORD-20250115-0003 | CUST-048102 | PROD-00087 | 7        | 12.50      | 87.50        | pending   | 2025-01-15
+   ORD-20250115-0004 | CUST-005920 | PROD-02341 | 2        | 89.99      | 179.98       | completed | 2025-01-15
+   ORD-20250115-0005 | CUST-031045 | PROD-01298 | 5        | 24.99      | 124.95       | cancelled | 2025-01-15
+
+======================================================================
+QUERY 3: Completed orders count by status
+======================================================================
+   📊 Scanned: 83,942 bytes | Time: 3124ms | Cost: $0.000000
+
+   status    | order_count | total_revenue
+   ----------+-------------+--------------
+   completed | 198         | 52847.23
+   shipped   | 205         | 48291.10
+   pending   | 196         | 51023.87
+   cancelled | 201         | 47892.45
+   refunded  | 200         | 49103.62
+
+======================================================================
+QUERY 4: Revenue by product category (JOIN orders + products)
+======================================================================
+   📊 Scanned: 94,789 bytes | Time: 4521ms | Cost: $0.000000
+
+   category        | order_count | total_revenue | avg_order_value
+   ----------------+-------------+---------------+----------------
+   Electronics     | 142         | 68421.30      | 481.84
+   Home &amp; Kitchen  | 128         | 42103.55      | 328.93
+   Sports          | 119         | 38920.10      | 327.06
+   Clothing        | 135         | 35102.88      | 260.02
+   Beauty          | 112         | 28451.22      | 254.03
+   Books           | 126         | 22310.45      | 177.07
+   Toys            | 118         | 19823.77      | 168.00
+   Automotive      | 120         | 18025.00      | 150.21
+
+======================================================================
+QUERY 7: Identify source S3 file per row ($path)
+======================================================================
+   📊 Scanned: 83,942 bytes | Time: 2103ms | Cost: $0.000000
+
+   source_file                                                              | order_id          | status
+   -------------------------------------------------------------------------+-------------------+---------
+   s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv   | ORD-20250115-0001 | completed
+   s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv   | ORD-20250115-0002 | shipped
+   s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv   | ORD-20250115-0003 | pending</code></pre></div>
+<hr>
+<h3>Step 7: IAM Policy Required for Athena</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>IAM POLICY BREAKDOWN — WHY EACH PERMISSION:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+athena:StartQueryExecution    → Submit SQL queries
+athena:GetQueryExecution      → Poll query status (RUNNING/SUCCEEDED/FAILED)
+athena:GetQueryResults        → Fetch result rows
+athena:GetWorkGroup           → Read workgroup configuration
+
+glue:GetTable                 → Athena reads table schema before every query
+glue:GetDatabase              → Athena lists available databases
+glue:CreateTable              → CREATE EXTERNAL TABLE DDL
+glue:CreateDatabase           → CREATE DATABASE DDL
+
+s3:GetObject on source        → Athena reads CSV files during query scan
+s3:ListBucket on source       → Athena lists files under LOCATION prefix
+
+s3:PutObject on results       → Athena writes query result CSV files
+s3:GetObject on results       → GetQueryResults reads from result CSV
+
+COMMON MISTAKE:
+→ Forgetting Glue permissions → "Access Denied" on every query
+→ Athena ALWAYS reads Glue Catalog — even for simple SELECT
+→ No Glue access = Athena is completely broken</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Athena = serverless SQL engine that queries S3 files in-place
+→ No servers, no loading, no infrastructure — just SQL
+→ Built on Trino (Presto fork) — distributed query engine
+→ Schema stored in Glue Data Catalog — Athena has NO metastore of its own
+→ Cost = $5 per TB scanned — pay only for what you read
+→ EXTERNAL TABLE = metadata only — DROP TABLE never deletes S3 data
+→ CSV is row-oriented → Athena scans ENTIRE file regardless of columns selected
+→ OpenCSVSerDe reads everything as STRING internally → casts at query time
+→ skip.header.line.count is CRITICAL for CSVs with headers
+→ Workgroups control costs with per-query scan limits
+→ $path pseudo-column reveals which S3 file each row came from
+→ DDL operations (CREATE/DROP) are FREE — only DML (SELECT) costs money
+
+WHAT THIS CONNECTS BACKWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 bucket + organized prefixes = Athena's data source
+→ Project 15 (Glue Catalog): Database + Table definitions Athena reads
+→ Project 3 (S3 Policies): IAM must allow s3:GetObject for Athena to scan
+→ Project 7 (IAM): Athena needs Glue + S3 + Athena permissions combined
+
+WHAT THIS CONNECTS FORWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 23 (Glue Crawler): Auto-discover schema instead of manual DDL
+→ Project 24 (Athena + Crawler): Query auto-discovered tables
+→ Project 25 (Glue ETL → Parquet): Convert CSV to Parquet → 90% cost reduction
+→ Project 26 (Athena Partitioning): Scan only relevant date range → 99% savings
+→ Project 36 (Athena CTAS): Materialize query results as optimized tables
+→ Project 37 (Athena Views): Create reusable named queries for business teams
+→ Project 38 (Redshift Spectrum): Same Glue Catalog queried from Redshift
+
+THE CRITICAL OPTIMIZATION PATH (previewed):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Current (Project 16):
+  CSV on S3 → Athena scans 11 GB → $0.055/query
+
+  After Project 25 (Parquet):
+  Parquet on S3 → Athena scans 2.2 GB → $0.011/query (5x cheaper)
+
+  After Project 26 (Partitioning):
+  Partitioned Parquet → Athena scans 6 MB → $0.00003/query (1800x cheaper)
+
+  SAME DATA. SAME QUERIES. 1800x COST DIFFERENCE.
+  This is why format + partitioning is the #1 Athena interview topic.</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's marketing team is now running Athena queries daily
+</span>Everything works — but two problems emerge:
+
+PROBLEM 1 (leads to Project 23 — Glue Crawler):
+→ A new data source appears: JSON logs from the website
+→ 50 columns, nested structures, changing schema weekly
+→ Writing CREATE TABLE DDL manually for this = nightmare
+→ Marketing: "Can't something just FIGURE OUT the schema automatically?"
+→ YOU: "Yes — that's what a Glue Crawler does."
+
+PROBLEM 2 (leads to Project 24 — Athena + Crawler):
+→ Once Crawler discovers schema → Athena queries it immediately
+→ No manual DDL, no guessing column types
+→ Crawler + Athena = self-service data exploration
+
+PROBLEM 3 (leads to Project 25 — Parquet conversion):
+→ Athena bills are creeping up as team runs more queries
+→ Every SELECT scans ALL 11 GB of CSV (even for 1 column)
+→ CTO: "Why is our Athena bill $150 this month?"
+→ YOU: "CSV forces full scan. Convert to Parquet = 80% savings."
+
+PROBLEM 4 (leads to Project 26 — Partitioning):
+→ Even with Parquet, querying "yesterday's orders" scans ALL days
+→ 365 days of data but you only need 1 day
+→ Partitioning by date → Athena scans 1/365th of the data
+
+→ Next Project 17: "Trigger an Alert the Instant a File Lands in S3"
+→ Introduces: S3 Event Notifications → SNS integration
+→ The beginning of EVENT-DRIVEN architecture</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-15.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 16 of 80</span>
+    <span class="nav-project-title">QUERY S3 FILES USING SQL WITHOUT LOADING ANYWHERE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-17.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-17.html") window.location = "project-17.html";
+  if (e.key === 'ArrowLeft' && "project-15.html") window.location = "project-15.html";
+});
+</script>
+</body>
+</html>

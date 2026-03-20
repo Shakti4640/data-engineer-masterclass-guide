@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 64: ATHENA MUST QUERY DATA LIVING IN 3 DIFFERENT AWS ACCOUNTS — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:80%"></div></div>
+<div id="progress-label">80%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 64 of 80</div>
+  <div class="project-title">ATHENA MUST QUERY DATA LIVING IN 3 DIFFERENT AWS ACCOUNTS</div>
+  <div class="project-tags"><span class="project-tag">Athena</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now a multi-account enterprise
+</span>
+ACCOUNT A [REDACTED:BANK_ACCOUNT_NUMBER]1) — "QuickCart-Operations"
+→ EC2 + MariaDB (10.1.3.50:3306)
+→ Database: quickcart
+→ Tables: orders (12M rows), customers (850K), products (45K)
+→ OLTP source of truth — Project 8, 9, 61
+
+ACCOUNT B [REDACTED:BANK_ACCOUNT_NUMBER]2) — "QuickCart-Analytics"
+→ S3 Data Lake: s3://quickcart-analytics-datalake/
+   - silver/orders/ (Parquet, partitioned by order_date)
+   - silver/customers/ (Parquet)
+   - gold/daily_revenue/ (Parquet, aggregated)
+→ Glue Catalog: database=analytics_lake, tables crawled (Project 23)
+→ Redshift cluster with MVs (Project 63)
+→ This is the "analytics hub"
+
+ACCOUNT C [REDACTED:BANK_ACCOUNT_NUMBER]3) — "QuickCart-Marketing"
+→ DynamoDB table: campaign_events
+   - PK: campaign_id, SK: event_timestamp
+   - 25M items: impressions, clicks, conversions
+   - Attributes: campaign_name, channel, cost, user_id
+→ S3 bucket: s3://quickcart-marketing-logs/
+   - click_logs/ (JSON, partitioned by date)
+   - 500 GB of raw clickstream data
+→ Glue Catalog: database=marketing_data
+→ Completely separate team, separate AWS account
+
+THE ASK:
+Marketing VP: "Show me campaign ROI — for each campaign:
+  1. How much did we SPEND (campaign_events in Account C)
+  2. How many ORDERS resulted (orders in Account A or B)
+  3. What REVENUE was generated (orders in Account A or B)
+  4. What's the RETURN ON AD SPEND (ROAS = revenue / spend)
+
+I need this as a single query I can run in Athena.
+I don't want to copy data around. I don't want to wait for ETL.
+I want to query all three accounts from one place."
+
+CONSTRAINTS:
+→ No data replication between accounts
+→ Each account maintains ownership of their data
+→ No public endpoints
+→ Audit trail required: who queried what, when
+→ Marketing team should NOT have direct access to Account A's MariaDB
+→ Operations team should NOT see marketing spend data
+→ Must work from Athena in Account B (analytics hub)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what Athena Federated Query IS
+</span>
+  NORMAL ATHENA (Project 16, 24, 26):
+  → Queries data in S3 via Glue Catalog
+  → Only reads: S3 files (CSV, Parquet, JSON, ORC)
+  → Only sees: tables defined in Glue Catalog of SAME account
+
+  FEDERATED ATHENA:
+  → Queries data ANYWHERE — not just S3
+  → Uses LAMBDA CONNECTORS to reach external data sources
+  → Each connector: translates Athena SQL → source-specific query
+  → Sources: DynamoDB, RDS/MySQL, Redshift, PostgreSQL, other accounts' S3
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                    ATHENA QUERY ENGINE                          │
+  │                                                                 │
+  │  SELECT * FROM s3_table       → reads S3 directly (normal)     │
+  │  SELECT * FROM dynamo_table   → invokes Lambda connector       │
+  │  SELECT * FROM mysql_table    → invokes Lambda connector       │
+  │  SELECT * FROM remote_catalog → invokes Lambda connector       │
+  │                                                                 │
+  │  JOIN across ALL of these     → Athena handles join logic      │
+  │                               → Lambda fetches data per source │
+  └─────────────────────────────────────────────────────────────────┘
+
+Step 2: Map each account's data to a connector type
+
+  ┌────────────┬───────────────────────┬──────────────────────────────────┐
+  │ Account    │ Data Source           │ Connector Needed                 │
+  ├────────────┼───────────────────────┼──────────────────────────────────┤
+  │ A (Ops)    │ MariaDB on EC2        │ MySQL connector Lambda           │
+  │            │                       │ (via VPC Peering — Project 61)   │
+  ├────────────┼───────────────────────┼──────────────────────────────────┤
+  │ B (Anltx)  │ S3 Data Lake          │ No connector — native Athena     │
+  │            │ (Glue Catalog)        │ (already works — Project 24)     │
+  ├────────────┼───────────────────────┼──────────────────────────────────┤
+  │ B (Anltx)  │ Redshift              │ Redshift connector Lambda        │
+  │            │                       │ (optional — can use Spectrum)    │
+  ├────────────┼───────────────────────┼──────────────────────────────────┤
+  │ C (Mktg)   │ DynamoDB              │ DynamoDB connector Lambda        │
+  │            │                       │ (cross-account via IAM role)     │
+  ├────────────┼───────────────────────┼──────────────────────────────────┤
+  │ C (Mktg)   │ S3 click logs         │ Cross-account Glue Catalog       │
+  │            │ (Glue Catalog)        │ (Project 57 pattern)             │
+  └────────────┴───────────────────────┴──────────────────────────────────┘
+
+Step 3: Design the connector deployment
+
+  ALL CONNECTORS DEPLOYED IN ACCOUNT B (analytics hub):
+  → Account B is the "query account" — Athena runs here
+  → Lambda connectors run in Account B's VPC
+  → Connectors reach external sources via:
+    - VPC Peering (Account A's MariaDB) — already exists from Project 61
+    - Cross-account IAM roles (Account C's DynamoDB)
+    - Cross-account Glue Catalog (Account C's S3 tables)
+
+Step 4: Understand the query flow
+
+  QUERY:
+  SELECT c.campaign_name, c.cost, COUNT(o.order_id), SUM(o.total_amount)
+  FROM marketing_catalog.campaign_spend c
+  JOIN analytics_lake.silver_orders o
+    ON c.user_id = o.customer_id
+  WHERE c.event_date &gt;= '2025-01-01'
+  GROUP BY c.campaign_name, c.cost
+
+  EXECUTION:
+  1. Athena parses SQL → identifies two catalogs
+  2. marketing_catalog → invokes DynamoDB connector Lambda
+  3. analytics_lake → reads S3 Parquet directly (native)
+  4. Lambda returns campaign data to Athena
+  5. Athena JOINs campaign data with S3 order data
+  6. Returns result to user</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+  ACCOUNT A (Ops)          ACCOUNT B (Analytics)           ACCOUNT C (Marketing)
+  ┌──────────────┐         ┌───────────────────────────┐   ┌──────────────────┐
+  │              │         │ ATHENA (Query Engine)      │   │                  │
+  │ MariaDB      │         │    │                       │   │ DynamoDB         │
+  │ 10.1.3.50    │         │    ├─► Native S3 read      │   │ campaign_events  │
+  │              │         │    │   (analytics_lake)     │   │                  │
+  │              │         │    │                       │   │ S3 Click Logs    │
+  │              │◄─VPC────│    ├─► MySQL Connector     │   │ marketing-logs/  │
+  │              │ Peering  │    │   Lambda (→ Acct A)   │   │                  │
+  │              │         │    │                       │   │ Glue Catalog     │
+  │              │         │    ├─► DynamoDB Connector  │───│► marketing_data  │
+  │              │         │    │   Lambda (→ Acct C)   │   │                  │
+  │              │         │    │                       │   │ IAM Role for     │
+  │              │         │    └─► Glue Catalog        │───│► cross-account   │
+  │              │         │        (→ Acct C catalog)  │   │  read access     │
+  │              │         │                           │   │                  │
+  │              │         │ DATA SOURCES REGISTERED:   │   │                  │
+  │              │         │ ┌─────────────────────────┐│   │                  │
+  │              │         │ │ 1. AwsDataCatalog       ││   │                  │
+  │              │         │ │    (native — Account B) ││   │                  │
+  │              │         │ │ 2. mysql_acct_a         ││   │                  │
+  │              │         │ │    (Lambda connector)   ││   │                  │
+  │              │         │ │ 3. dynamodb_acct_c      ││   │                  │
+  │              │         │ │    (Lambda connector)   ││   │                  │
+  │              │         │ │ 4. glue_catalog_acct_c  ││   │                  │
+  │              │         │ │    (cross-account cat.) ││   │                  │
+  │              │         │ └─────────────────────────┘│   │                  │
+  └──────────────┘         └───────────────────────────┘   └──────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Deploy ALL connectors as Lambda in Account B ✅ (CHOSEN)
+</span>→ Account B is single query hub
+→ All Lambdas deployed and managed in Account B
+→ Cross-account access via IAM AssumeRole
+→ Simplest management — one account owns all connectors
+
+Option B: Deploy connectors in each source account
+→ Account A runs MySQL connector Lambda
+→ Account C runs DynamoDB connector Lambda
+→ Account B invokes cross-account Lambdas
+→ More complex: Lambda permissions span 3 accounts
+
+Option C: Copy all data to Account B first, then query
+→ ETL from all accounts → Account B S3
+→ Query only Account B's S3 via normal Athena
+→ Simpler queries but: data duplication, latency, storage cost
+→ Already doing this partially (Project 61)
+
+Option D: Redshift Spectrum + Data Sharing for everything
+→ Use Redshift as universal query engine
+→ Spectrum for S3 data, Data Sharing for cross-account Redshift
+→ But: can't reach DynamoDB or MariaDB directly
+→ Limited to Redshift ecosystem
+
+DECISION: Option A — Lambda connectors in Account B
+→ Most flexible — any source reachable
+→ Athena handles JOIN logic across sources
+→ Each source exposes data without moving it
+→ True federated architecture</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. USE pre-built Athena connector Lambdas (AWS Serverless Application Repository)
+</span>   → AWS provides official connectors for:
+     MySQL, PostgreSQL, DynamoDB, Redshift, HBase, Redis, etc.
+   → Battle-tested, maintained by AWS
+   → Deploy via SAR (Serverless Application Repository) or CloudFormation
+   → DO NOT write custom connectors unless absolutely necessary
+
+2. DEPLOY connectors with MINIMAL permissions
+   → DynamoDB connector: only dynamodb:Query, dynamodb:Scan on specific table
+   → MySQL connector: read-only user (glue_reader from Project 61)
+   → Cross-catalog: only glue:GetDatabase, glue:GetTable, s3:GetObject
+
+3. USE Spill Bucket for large result sets
+   → Connector Lambda has 10 GB /tmp and 15 min timeout
+   → For large scans: Lambda "spills" intermediate data to S3
+   → Must configure spill bucket in connector config
+   → Spill bucket = Account B's S3 (encrypted, lifecycle to delete after 1 day)
+
+4. PUSH DOWN predicates to source
+   → Athena sends WHERE clauses to connector Lambda
+   → Connector pushes to source: WHERE campaign_id = 'X'
+   → Source returns only matching rows (not full table)
+   → CRITICAL for DynamoDB: full scan = expensive + slow
+
+5. REGISTER each connector as a DATA SOURCE in Athena
+   → Each data source = one Lambda connector
+   → Each data source gets a CATALOG NAME
+   → Query: SELECT * FROM catalog_name.database.table
+
+6. CREATE dedicated Athena workgroup for federated queries
+   → Separate from standard S3-only queries
+   → Track costs separately
+   → Set query timeout (federated queries can be slow)
+   → Configure result location
+
+7. TEST each connector independently before JOIN queries
+   → First: SELECT COUNT(*) FROM mysql_acct_a.quickcart.orders
+   → Then: SELECT COUNT(*) FROM dynamodb_acct_c.default.campaign_events
+   → Then: JOIN them
+   → Isolates connector issues from query logic issues
+
+8. CACHE frequently-joined results with CTAS
+   → First federated query: slow (crosses network, Lambda invocations)
+   → If same query runs daily: use CTAS to materialize in S3
+   → Subsequent reads: fast native S3 scan
+   → Already covered in Project 36</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT scan entire DynamoDB table without filters
+</span>   → DynamoDB connector supports Query and Scan
+   → Full Scan on 25M items: ~$6.25 per scan (read capacity)
+   → Plus: Lambda timeout if table is too large
+   → ALWAYS push down filters to reduce scan scope
+   → Use partition key (campaign_id) in WHERE clause
+
+2. DO NOT deploy connectors in public subnets
+   → Lambda connector may have VPC config (for MySQL)
+   → Public subnet = unnecessary internet exposure
+   → Use private subnet with VPC endpoints (same as Glue — Project 61)
+
+3. DO NOT give connectors broad cross-account permissions
+   → BAD: "arn:aws:dynamodb:*:333333333333:table/*" → all tables
+   → GOOD: "arn:aws:dynamodb:us-east-2:333333333333:table/campaign_events"
+   → Principle of least privilege per connector
+
+4. DO NOT expect federated queries to be as fast as native S3
+   → Native S3 Athena: data locality, optimized scan
+   → Federated: network hop → Lambda → source → Lambda → Athena
+   → Expect 2-10x slower for same data volume
+   → Use for flexibility, not performance
+
+5. DO NOT JOIN large tables across connectors
+   → JOIN orders (12M rows, Account A) WITH campaign_events (25M, Account C)
+   → Athena must pull ALL rows from both Lambdas → massive data transfer
+   → Fix: pre-filter both sides, or materialize one side first
+
+6. DO NOT forget Lambda concurrency limits
+   → Default: 1000 concurrent Lambda invocations per account
+   → Athena may invoke connector Lambda many times in parallel
+   → Heavy federated query + other Lambdas = throttling
+   → Reserve concurrency for connector Lambdas
+
+7. DO NOT skip the spill bucket configuration
+   → Without spill bucket: Lambda /tmp fills up → query fails
+   → For any table &gt; ~1M rows: spill is likely
+   → Always configure spill bucket with encryption + lifecycle
+
+8. DO NOT use federated query as replacement for ETL
+   → "Why ETL if we can query live?"
+   → Federated = slow, expensive, puts load on source systems
+   → ETL = pre-processed, fast, no source impact
+   → Federated for: ad-hoc exploration, prototyping, low-volume joins
+   → ETL for: dashboards, reports, repeated queries (Projects 61, 63)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬─────────────────────────┬──────────────────────────────┐
+</span>│ Scenario                             │ Use                     │ Why                          │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Query S3 data in same account        │ Native Athena           │ Fastest, cheapest, no Lambda │
+│                                      │ (Project 24)            │                              │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Query S3 data in different account   │ Cross-account Glue      │ Catalog sharing, no Lambda   │
+│ (both have Glue Catalog)             │ Catalog (Project 57)    │ needed for S3-to-S3          │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Query DynamoDB from Athena           │ DynamoDB Connector      │ Only way to SQL-query DDB    │
+│                                      │ Lambda                  │                              │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Query MySQL/MariaDB from Athena      │ MySQL Connector Lambda  │ SQL-over-SQL translation     │
+│                                      │ (Project 46 pattern)    │                              │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Query Redshift from Athena           │ Redshift Connector OR   │ Spectrum for S3 external     │
+│                                      │ Spectrum (Project 38)   │ Connector for Redshift local │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ JOIN data across 3+ heterogeneous    │ Athena Federated Query  │ Single SQL, multiple sources │
+│ sources (DDB + MySQL + S3)           │ (THIS project)          │ Athena handles join logic    │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Repeated cross-source query (daily)  │ ETL → materialize →     │ Federated = slow per query   │
+│                                      │ native Athena           │ Materialize once, query fast │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────┤
+│ Real-time cross-account dashboard    │ Redshift Data Sharing   │ Sub-second, no Lambda        │
+│                                      │ (Project 58)            │ But limited to Redshift data │
+└──────────────────────────────────────┴─────────────────────────┴──────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE FEDERATED QUERY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When query runs 100+ times/day on same data
+</span>   → Lambda invocation cost: $0.20 per 1M requests
+   → 100 queries × 50 Lambda invocations each = 5000/day
+   → Materialize with CTAS or ETL instead
+
+2. When source system can't handle the read load
+   → DynamoDB: Scan consumes read capacity → costs money → throttles app
+   → MariaDB: Athena opens parallel connections → overwhelms OLTP DB
+   → Solution: query replicas, not primaries
+
+3. When JOINing two large tables across connectors
+   → Both tables must be fully scanned → transferred to Athena
+   → 12M orders + 25M events = massive Lambda data transfer
+   → Solution: pre-filter or pre-aggregate one side
+
+4. When sub-second latency is required
+   → Federated query minimum: 3-10 seconds (Lambda cold start + network)
+   → Dashboard needs &lt; 2 seconds → use MVs (Project 63)
+
+5. When data sensitivity prevents cross-account access
+   → Even with IAM roles: data leaves source account temporarily
+   → Athena processes data in Account B
+   → If compliance requires data stays in Account C → can't federate
+   → Use: Account C's own Athena with their own Glue Catalog</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│              ATHENA FEDERATED QUERY — INTERNAL MECHANICS                      │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ARCHITECTURE LAYERS:                                                         │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐      │
+│  │ LAYER 1: Athena Query Engine (Presto/Trino-based)                  │      │
+│  │ → Parses SQL                                                        │      │
+│  │ → Builds execution plan                                             │      │
+│  │ → Identifies which CATALOG each table belongs to                    │      │
+│  │ → For native catalog: reads S3 directly                             │      │
+│  │ → For federated catalog: invokes Lambda connector                   │      │
+│  └─────────────┬───────────────────────────────────────────────────────┘      │
+│                │                                                              │
+│  ┌─────────────▼───────────────────────────────────────────────────────┐      │
+│  │ LAYER 2: Athena Federation SDK (runs inside Lambda)                 │      │
+│  │ → Implements standard interface:                                    │      │
+│  │   - GetSplits: how to parallelize reading                           │      │
+│  │   - GetTableLayout: what tables/schemas exist                       │      │
+│  │   - ReadRecords: fetch actual data                                  │      │
+│  │ → Translates Athena requests → source-specific API calls            │      │
+│  │ → Returns data in Apache Arrow format                               │      │
+│  └─────────────┬───────────────────────────────────────────────────────┘      │
+│                │                                                              │
+│  ┌─────────────▼───────────────────────────────────────────────────────┐      │
+│  │ LAYER 3: Data Source (DynamoDB, MySQL, another S3, etc.)            │      │
+│  │ → Receives native query (DDB Scan, SQL SELECT, S3 GET)              │      │
+│  │ → Returns data to Lambda                                            │      │
+│  │ → Lambda converts to Arrow → returns to Athena                      │      │
+│  └─────────────────────────────────────────────────────────────────────┘      │
+│                                                                               │
+│  DETAILED QUERY EXECUTION FLOW:                                               │
+│                                                                               │
+│  User submits:                                                                │
+│  SELECT c.campaign_name, SUM(o.total_amount) AS revenue                       │
+│  FROM dynamodb_acct_c.default.campaign_events c                               │
+│  JOIN analytics_lake.silver_orders o                                          │
+│    ON c.user_id = o.customer_id                                               │
+│  WHERE c.event_type = 'conversion'                                            │
+│    AND o.order_date &gt;= '2025-01-01'                                           │
+│  GROUP BY c.campaign_name                                                     │
+│                                                                               │
+│  Step 1: PARSE                                                                │
+│  → Athena identifies two catalogs:                                            │
+│    - dynamodb_acct_c → federated (Lambda connector)                           │
+│    - analytics_lake → could be native S3 or cross-account Glue               │
+│                                                                               │
+│  Step 2: PLAN                                                                 │
+│  → Athena builds execution plan:                                              │
+│    ┌──────────────────────────────────────────┐                               │
+│    │ HashAggregate (GROUP BY campaign_name)    │                               │
+│    │   └── HashJoin (ON user_id = customer_id)│                               │
+│    │        ├── FederatedScan (DynamoDB)       │ ← Lambda invocation           │
+│    │        │   filter: event_type='conversion'│ ← PUSHDOWN                   │
+│    │        └── NativeScan (S3 Parquet)        │ ← Direct S3 read             │
+│    │            filter: order_date&gt;='2025-01-01│ ← Partition pruning           │
+│    └──────────────────────────────────────────┘                               │
+│                                                                               │
+│  Step 3: EXECUTE — Federated Scan (DynamoDB)                                  │
+│                                                                               │
+│  3a. Athena invokes Lambda: GetTableLayout                                    │
+│      → Lambda calls DynamoDB DescribeTable                                    │
+│      → Returns: schema (column names, types)                                  │
+│                                                                               │
+│  3b. Athena invokes Lambda: GetSplits                                         │
+│      → Lambda determines how to parallelize:                                  │
+│        - DynamoDB: Scan with Segment/TotalSegments                            │
+│        - MySQL: ranges on primary key                                         │
+│      → Returns: list of "splits" (parallel work units)                        │
+│      → Example: 10 splits for DynamoDB parallel scan                          │
+│                                                                               │
+│  3c. Athena invokes Lambda: ReadRecords (once per split)                      │
+│      → 10 splits = 10 Lambda invocations (PARALLEL)                           │
+│      → Each Lambda:                                                           │
+│        a. Receives: split info + pushed-down predicate                        │
+│        b. Calls DynamoDB Scan with:                                           │
+│           - Segment=N, TotalSegments=10                                       │
+│           - FilterExpression: event_type = 'conversion'  ← PUSHDOWN          │
+│        c. Converts DynamoDB items → Apache Arrow record batch                 │
+│        d. If data &gt; Lambda memory: spills to S3 spill bucket                  │
+│        e. Returns Arrow data to Athena                                        │
+│                                                                               │
+│  Step 4: EXECUTE — Native Scan (S3)                                           │
+│  → Athena reads S3 Parquet directly (no Lambda)                               │
+│  → Partition pruning: only reads order_date &gt;= '2025-01-01' partitions        │
+│  → Column pruning: only reads customer_id, total_amount columns               │
+│  → Much faster than federated scan                                            │
+│                                                                               │
+│  Step 5: JOIN                                                                 │
+│  → Athena receives:                                                           │
+│    - DynamoDB data (from Lambda) in Arrow format                              │
+│    - S3 data (from direct read) in Arrow format                               │
+│  → Performs HashJoin on user_id = customer_id                                 │
+│  → Both datasets must fit in Athena's memory                                  │
+│  → If too large: Athena spills to its own temp storage                        │
+│                                                                               │
+│  Step 6: AGGREGATE + RETURN                                                   │
+│  → GROUP BY campaign_name, SUM(total_amount)                                  │
+│  → Result written to S3 output location                                       │
+│  → Result returned to user                                                    │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │           PREDICATE PUSHDOWN — WHY IT MATTERS               │              │
+│  │                                                              │              │
+│  │  WITHOUT pushdown:                                           │              │
+│  │  → Lambda scans ALL 25M DynamoDB items                       │              │
+│  │  → Transfers ALL to Athena                                   │              │
+│  │  → Athena filters: event_type = 'conversion'                │              │
+│  │  → Wasted: 24M items transferred for nothing                │              │
+│  │  → DynamoDB cost: 25M items × 4KB = ~$6.25 per query        │              │
+│  │                                                              │              │
+│  │  WITH pushdown:                                              │              │
+│  │  → Lambda sends FilterExpression to DynamoDB                 │              │
+│  │  → DynamoDB returns only conversions (~1M items)             │              │
+│  │  → Lambda transfers 1M items to Athena                       │              │
+│  │  → DynamoDB cost: still scans all (Scan reads all)           │              │
+│  │  → BUT: less data transferred → less Lambda memory/time      │              │
+│  │                                                              │              │
+│  │  WITH DynamoDB Query (not Scan):                             │              │
+│  │  → If campaign_id in WHERE clause                            │              │
+│  │  → Lambda uses DynamoDB Query instead of Scan                │              │
+│  │  → Only reads items for that campaign_id                     │              │
+│  │  → Massively cheaper and faster                              │              │
+│  │  → THIS is why partition key in WHERE clause matters         │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  CROSS-ACCOUNT IAM FLOW (Account B Lambda → Account C DynamoDB):             │
+│                                                                               │
+│  ┌──────────────┐    AssumeRole    ┌──────────────────┐                       │
+│  │ Account B    │ ───────────────► │ Account C        │                       │
+│  │ Lambda       │                  │ IAM Role         │                       │
+│  │ (connector)  │ ◄─────────────── │ cross-acct-read  │                       │
+│  │              │  Temp credentials │                  │                       │
+│  │              │                  │ Trust: Account B  │                       │
+│  │              │                  │ Policy: DDB read  │                       │
+│  └──────┬───────┘                  └──────────────────┘                       │
+│         │                                                                     │
+│         │ Uses temp credentials to call                                       │
+│         │ DynamoDB in Account C                                               │
+│         ▼                                                                     │
+│  ┌──────────────┐                                                             │
+│  │ Account C    │                                                             │
+│  │ DynamoDB     │                                                             │
+│  │ campaign_tbl │                                                             │
+│  └──────────────┘                                                             │
+│                                                                               │
+│  SPILL MECHANISM:                                                             │
+│  → Lambda has limited memory (3-10 GB configurable)                           │
+│  → If source data &gt; Lambda memory:                                            │
+│    1. Lambda writes intermediate blocks to S3 "spill bucket"                  │
+│    2. Returns pointers to Athena                                              │
+│    3. Athena reads spilled data from S3                                       │
+│    4. Spilled data encrypted with Athena-managed key                          │
+│  → Spill bucket: s3://quickcart-analytics-athena-spill/                       │
+│  → Lifecycle: auto-delete after 1 day                                         │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Federated query returns 0 rows but source has data"
+</span>→ Cause: Lambda connector can't reach source
+→ DynamoDB: Lambda role lacks dynamodb:Scan permission on Account C table
+→ MySQL: VPC Peering route missing or SG blocking
+→ Debug: invoke connector Lambda directly with test event
+→ Check Lambda CloudWatch logs for error details
+
+PITFALL 2: "Query takes 10 minutes and then times out"
+→ Cause: DynamoDB full table scan on 25M items
+→ No WHERE clause on partition key → Lambda does full Scan
+→ Lambda 15-min timeout hit before scan completes
+→ Fix: add WHERE campaign_id = 'X' to use DynamoDB Query
+→ Or: pre-aggregate DynamoDB data to S3 via ETL
+
+PITFALL 3: "Lambda invocation throttled"
+→ Cause: Athena invokes connector Lambda for each split in parallel
+→ 50 splits × 10 concurrent queries = 500 concurrent Lambda invocations
+→ Account B default Lambda concurrency: 1000
+→ Other Lambdas in Account B competing for concurrency
+→ Fix: reserve concurrency for connector Lambda (e.g., 200)
+→ Or: reduce split count in connector configuration
+
+PITFALL 4: "Cross-account AssumeRole fails with AccessDenied"
+→ Cause: Trust policy in Account C doesn't trust Account B
+→ Or: Account B Lambda role doesn't have sts:AssumeRole permission
+→ Or: ExternalId mismatch (if configured — Project 56)
+→ Debug: test AssumeRole manually from Account B CLI first
+
+PITFALL 5: "Column type mismatch between DynamoDB and S3"
+→ Cause: DynamoDB is schema-less — items may have varying types
+→ Connector infers types from first batch of items
+→ Later items have different type → cast error
+→ Fix: explicitly define schema in connector's environment variable
+→ Or: use CAST() in Athena query to handle type variations
+
+PITFALL 6: "Spill bucket access denied"
+→ Cause: Lambda role lacks s3:PutObject on spill bucket
+→ Connector tries to spill → fails → query fails
+→ Fix: ensure Lambda role has full S3 access to spill bucket
+→ Check: bucket policy doesn't DENY the Lambda role
+
+PITFALL 7: "Athena says 'Data source not found: dynamodb_acct_c'"
+→ Cause: data source catalog name misspelled in query
+→ Or: data source not registered in Athena
+→ Verify: Athena console → Data sources → list all registered
+→ Catalog names are case-sensitive in some contexts
+
+PITFALL 8: "JOIN produces cartesian product — 300M rows"
+→ Cause: JOIN key mismatch between DynamoDB and S3 tables
+→ DynamoDB user_id = "USR-001" vs S3 customer_id = "CUST-000001"
+→ No matches → cartesian product or empty result
+→ Fix: verify JOIN key format matches across sources
+→ Pre-process: ensure consistent ID format across systems
+
+PITFALL 9: "Works for small query, fails for large query"
+→ Cause: large federated scan exceeds Athena memory
+→ Athena has per-query memory limits
+→ Fix: break into smaller queries
+→ Or: materialize federated data with CTAS first
+→ Or: increase Lambda memory for connector
+
+PITFALL 10: "Cost shock — $50 for one federated query"
+→ Cause: DynamoDB Scan consumed 25M RCU
+→ DynamoDB on-demand: $0.25 per million RCU
+→ 25M items × 4KB each = 25M RCU = $6.25
+→ Ran query 8 times during debugging = $50
+→ Fix: ALWAYS test with LIMIT first
+→ Use DynamoDB provisioned capacity with auto-scaling for predictable cost</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOURCE SIZE SCALING:
+</span>
+┌──────────────────────────┬───────────────────┬─────────────────────────────────────┐
+│ Source Size               │ Federated Query   │ Recommendation                      │
+├──────────────────────────┼───────────────────┼─────────────────────────────────────┤
+│ &lt; 100K rows              │ Fast (&lt; 10s)      │ Federated query works well          │
+│ 100K - 1M rows           │ Moderate (10-60s) │ Federated OK for ad-hoc             │
+│ 1M - 10M rows            │ Slow (1-5 min)    │ Consider CTAS to materialize        │
+│ 10M - 100M rows          │ Very slow (5+ min)│ ETL to S3 first, then native Athena │
+│ &gt; 100M rows              │ Impractical       │ Must ETL — federated won't scale    │
+└──────────────────────────┴───────────────────┴─────────────────────────────────────┘
+
+LAMBDA CONNECTOR SCALING:
+→ Memory: 128 MB - 10 GB (more memory = faster processing)
+→ Timeout: max 15 minutes
+→ Concurrency: up to 1000 (default) per account
+→ Payload: 6 MB synchronous response limit
+→ Spill: unlimited (writes to S3)
+
+COST SCALING (per federated query):
+┌────────────────────────┬──────────────────────────────────────────┐
+│ Component              │ Cost per query                           │
+├────────────────────────┼──────────────────────────────────────────┤
+│ Athena scan (S3 part)  │ $5/TB scanned — same as normal Athena   │
+│ Lambda invocations     │ $0.20/1M + $0.0000166/GB-sec duration   │
+│ DynamoDB reads         │ $0.25/1M RCU (on-demand)                │
+│ MySQL reads            │ Free (just EC2 CPU on MariaDB)          │
+│ S3 spill I/O           │ $0.005/1K PUT + $0.0004/1K GET          │
+│ Cross-region transfer  │ $0.02/GB (if applicable)                │
+└────────────────────────┴──────────────────────────────────────────┘
+
+EXAMPLE: Campaign ROI query (moderate scale)
+→ DynamoDB: 1M items scanned = $0.25
+→ S3: 200 MB Parquet scanned = $0.001
+→ Lambda: 50 invocations × 10s × 1 GB = $0.008
+→ Total: ~$0.26 per query
+→ 10 queries/day: $2.60/day = $78/month
+→ vs. ETL + native query: ~$15/month (but requires pipeline setup)
+
+ACCOUNT SCALING:
+→ 3 accounts (current): 2-3 connector Lambdas — manageable
+→ 10 accounts: 8-10 connectors — still OK with SAR deployment
+→ 50 accounts: connector management becomes complex
+→ → Consider: data mesh pattern (Project 71) — each account publishes to shared catalog</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY FEDERATED QUERIES WORK:
+</span>
+CHECK 1: Data source registration
+→ Athena Console → Data sources
+→ Should see: AwsDataCatalog (native), mysql_acct_a, dynamodb_acct_c
+→ Each shows: Lambda ARN, status, catalog name
+
+CHECK 2: Connector Lambda health
+→ CloudWatch → Lambda → connector function
+→ Metrics: invocations, errors, duration, throttles
+→ Logs: /aws/lambda/athena-mysql-connector (detailed per-request)
+
+CHECK 3: Simple federated query
+→ SELECT COUNT(*) FROM dynamodb_acct_c.default.campaign_events LIMIT 10;
+→ If returns count: connector works
+→ If errors: check Lambda logs
+
+CHECK 4: Cross-account IAM
+→ From Account B CLI:
+  aws sts assume-role --role-arn arn:aws:iam::333333333333:role/cross-acct-read
+→ If returns credentials: IAM chain works
+→ If AccessDenied: check trust policy in Account C
+
+CHECK 5: Query execution plan
+→ EXPLAIN SELECT ... FROM dynamodb_acct_c...
+→ Should show: FederatedNode pointing to Lambda connector
+→ Should show: pushed-down predicates in scan description
+
+CHECK 6: Spill bucket activity
+→ aws s3 ls s3://quickcart-analytics-athena-spill/ --recursive
+→ During query: files appear (spilled data)
+→ After query: files should be cleaned up (or lifecycle deletes)
+
+MONITORING DASHBOARD:
+→ Panel 1: Federated query count (daily)
+→ Panel 2: Avg federated query duration vs native
+→ Panel 3: Lambda connector errors (per connector)
+→ Panel 4: DynamoDB consumed RCU (from federated queries)
+→ Panel 5: Cross-account AssumeRole success/failure rate</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(64)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: Cross-Account IAM Setup (Account C — Marketing)</h3>
+
+<h3>PART 2: Deploy Athena Connectors (Account B — Analytics)</h3>
+
+<hr>
+<h3>PART 3: Test Each Data Source Independently</h3>
+
+<hr>
+<h3>PART 4: Production-Ready Named Queries for Marketing Team</h3>
+
+<hr>
+<h3>PART 5: Monitoring and Cost Control</h3>
+
+<hr>
+<h3>PART 6: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER — COMPLETE FEDERATION SETUP</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ACCOUNT C (Marketing) — One-time setup ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create cross-account IAM role</span><span>
+</span>python 64_01_account_c_iam_setup.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Share role ARN with Account B team</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ACCOUNT B (Analytics) — One-time setup ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Deploy connector infrastructure</span><span>
+</span>python 64_02_deploy_connectors.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Creates: spill bucket, IAM role, registers data sources</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → MANUAL STEP: Deploy Lambda connectors via Athena Console</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Data sources → Connect data source → select type → configure</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Test all data sources</span><span>
+</span>python 64_03_test_federated_queries.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Tests: native S3, MySQL, DynamoDB, cross-source JOINs</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Create named queries for Marketing team</span><span>
+</span>python 64_04_create_named_queries.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Set up monitoring</span><span>
+</span>python 64_05_federation_monitoring.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- DAILY OPERATIONS ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Marketing team runs saved queries from Athena Console</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Workgroup: federated-queries</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Saved queries: "Campaign ROI — Last 30 Days" etc.</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Daily materialization (optional — for repeated queries)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run "Materialized Campaign ROI Refresh" named query</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Subsequent queries: SELECT * FROM campaign_roi_daily (fast S3 scan)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Daily health check</span><span>
+</span>python 64_05_federation_monitoring.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED FINAL STATE:
+</span>
+  ACCOUNT A (Ops)           ACCOUNT B (Analytics)           ACCOUNT C (Mktg)
+  ┌──────────────┐          ┌────────────────────────┐      ┌──────────────┐
+  │ MariaDB      │◄──VPC───►│ ATHENA QUERY ENGINE    │      │ DynamoDB     │
+  │ orders       │  Peering  │                        │      │ campaigns    │
+  │ customers    │          │ Data Sources:           │      │              │
+  │ products     │          │ ┌────────────────────┐  │      │ S3 Logs      │
+  │              │          │ │AwsDataCatalog      │  │      │ click_logs/  │
+  │ Accessed via:│          │ │(native S3 — Acct B)│  │      │              │
+  │ mysql_acct_a │          │ ├────────────────────┤  │      │ Glue Catalog │
+  │ connector    │          │ │mysql_acct_a        │  │      │ marketing_db │
+  │              │          │ │(Lambda → MariaDB)  │  │      │              │
+  │              │          │ ├────────────────────┤  │      │ Accessed via:│
+  │              │          │ │dynamodb_acct_c     │──IAM──►│ dynamodb_    │
+  │              │          │ │(Lambda → DynamoDB) │  │      │ acct_c       │
+  │              │          │ └────────────────────┘  │      │ connector    │
+  │              │          │                        │      │              │
+  │              │          │ Query Example:          │      │              │
+  │              │          │ SELECT camp.*, ord.*    │      │              │
+  │              │          │ FROM dynamodb_acct_c    │      │              │
+  │              │          │   .default.campaigns c  │      │              │
+  │              │          │ JOIN AwsDataCatalog     │      │              │
+  │              │          │   .analytics.orders o   │      │              │
+  │              │          │ JOIN mysql_acct_a       │      │              │
+  │              │          │   .quickcart.customers  │      │              │
+  └──────────────┘          └────────────────────────┘      └──────────────┘
+
+QUERY PERFORMANCE:
+┌──────────────────────────────────┬───────────┬────────────────────┐
+│ Query Type                       │ Duration  │ Cost per Query     │
+├──────────────────────────────────┼───────────┼────────────────────┤
+│ Native S3 only (baseline)        │ 1-3s      │ $0.001             │
+│ MySQL federated (Account A)      │ 3-8s      │ $0.001 + Lambda    │
+│ DynamoDB federated (Account C)   │ 5-15s     │ $0.25 DDB + Lambda │
+│ Cross-source JOIN (B + C)        │ 10-30s    │ $0.26              │
+│ Three-source JOIN (A + B + C)    │ 15-45s    │ $0.27              │
+│ Materialized table (after CTAS)  │ 1-3s      │ $0.001             │
+└──────────────────────────────────┴───────────┴────────────────────┘
+
+RECOMMENDATION MATRIX:
+→ Ad-hoc exploration: Federated query (flexibility)
+→ Daily reports: CTAS materialization (performance)
+→ Real-time dashboards: Redshift MVs (Project 63) (speed)
+→ Campaign ROI: Federated → CTAS → native Athena (best of both)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Athena Federated Query extends Athena to ANY data source via Lambda connectors
+→ Each connector = Lambda function implementing Federation SDK (GetSplits, ReadRecords)
+→ AWS provides pre-built connectors via SAR: MySQL, DynamoDB, PostgreSQL, Redshift, etc.
+→ Cross-account access: connector Lambda in Account B assumes role in Account C
+→ Predicate pushdown: Athena sends WHERE clauses to connector → source filters first
+→ Spill bucket: Lambda writes large intermediate results to S3 when memory exhausted
+→ Federated queries are 2-10x SLOWER than native S3 queries — trade-off for flexibility
+→ CTAS materializes federated results to S3 Parquet → subsequent queries at native speed
+→ Each data source = registered catalog → referenced in SQL as catalog_name.database.table
+→ Monitoring: Lambda metrics + Athena query stats + cross-account IAM health checks
+→ Use federated for exploration/prototyping, materialize for repeated production queries
+→ DynamoDB queries: ALWAYS include partition key in WHERE → Query not Scan → 100x cheaper
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 24: Native Athena queries — baseline we're extending
+  → Project 36: CTAS — materializes federated results for repeated use
+  → Project 46: Athena federated to single source — now extended to 3 accounts
+  → Project 56: Cross-account S3 access — IAM pattern reused here
+  → Project 57: Cross-account Glue Catalog — alternative for S3-to-S3 federation
+  → Project 61: VPC Peering — network path for MySQL connector
+  → Project 63: Redshift MVs — complementary approach for dashboard speed
+
+→ FORWARD:
+  → Project 65: CDC Merge — federated query can detect deltas across accounts
+  → Project 71: Data Mesh — federation is the query layer of data mesh
+  → Project 74: Lake Formation cross-account — fine-grained security for federated access
+  → Project 79: Full migration — federated queries bridge on-prem and AWS during migration</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Cross-account federation is working. Marketing team runs campaign ROI queries.
+</span>
+THEN: The data engineering team reviews the nightly ETL pipeline:
+
+→ Project 61 does FULL LOAD every night: TRUNCATE + INSERT all rows
+→ orders table: 12M rows loaded every night
+→ But: only 200K new orders per day (1.7% change rate)
+→ ETL processes 12M rows to capture 200K changes = 98.3% WASTE
+→ Glue job takes 25 minutes and 10 DPUs
+→ Redshift TRUNCATE + COPY causes 30-second dashboard downtime
+
+→ As data grows: 12M → 50M → 200M rows
+→ Full load time: 25 min → 100 min → 400 min
+→ Window between ETL end and analyst start: shrinking fast
+→ At 200M rows: ETL won't finish before 8 AM
+
+DATA LEAD: "We need incremental loading. Only process what CHANGED
+            since last run. And we need MERGE logic — handle inserts,
+            updates, AND deletes without downtime."
+
+→ Project 65: "Full Incremental CDC: MariaDB → S3 → Glue → Redshift (Daily Merge)"
+→ Introduces: CDC Merge Pattern → Staging Table → MERGE/DELETE+INSERT
+             → Audit Columns → Watermark Tracking</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-63.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 64 of 80</span>
+    <span class="nav-project-title">ATHENA MUST QUERY DATA LIVING IN 3 DIFFERENT AWS ACCOUNTS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-65.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-65.html") window.location = "project-65.html";
+  if (e.key === 'ArrowLeft' && "project-63.html") window.location = "project-63.html";
+});
+</script>
+</body>
+</html>

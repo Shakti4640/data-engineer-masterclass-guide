@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 74: FINE-GRAINED COLUMN-LEVEL SECURITY ACROSS 3 ACCOUNTS VIA LAK — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:92%"></div></div>
+<div id="progress-label">92%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 74 of 80</div>
+  <div class="project-title">FINE-GRAINED COLUMN-LEVEL SECURITY ACROSS 3 ACCOUNTS VIA LAKE FORMATION</div>
+  <div class="project-tags"><span class="project-tag">Lake Formation</span><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: QuickCart — Full data lake platform running (Project 73)
+</span>         Data Mesh across 3 accounts (Project 71)
+         Lake Formation basic grants in place (Project 73 Part 2)
+
+COMPLIANCE TRIGGER:
+→ SOC 2 Type II audit in 3 months
+→ GDPR compliance required (EU customers)
+→ CCPA compliance required (California customers)
+
+CISO REQUIREMENTS:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  REQ 1: PII columns must be INVISIBLE to unauthorized roles             │
+│  → customer_email, customer_phone, ip_address, session_id               │
+│  → Not masked — completely absent from query results AND schema         │
+│                                                                         │
+│  REQ 2: Sensitivity classification on EVERY column                      │
+│  → public: anyone can see (order_total, product_name)                   │
+│  → internal: employees only (order_count, revenue)                      │
+│  → confidential: specific roles only (customer_email, payment_method)   │
+│  → restricted: security team only (ip_address, raw logs)                │
+│                                                                         │
+│  REQ 3: Cross-account enforcement                                       │
+│  → Account C (Analytics) reads Account A (Orders) Gold data             │
+│  → Account C analysts must NOT see PII columns                          │
+│  → Account A data scientists CAN see PII (for ML models)               │
+│  → Same table, different column visibility per role per account         │
+│                                                                         │
+│  REQ 4: New tables auto-inherit security                                │
+│  → When Orders domain creates new Gold table                            │
+│  → PII columns automatically restricted based on tags                   │
+│  → No manual grant needed per table                                     │
+│                                                                         │
+│  REQ 5: Complete audit trail                                            │
+│  → Who queried which table                                               │
+│  → Which columns were accessed                                           │
+│  → From which account                                                    │
+│  → Exportable report for auditors                                        │
+│                                                                         │
+│  REQ 6: Must work with ALL consumption tools                            │
+│  → Athena, Redshift Spectrum, Glue ETL                                  │
+│  → Column filtering enforced regardless of query tool                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CURRENT GAPS:
+→ Project 73 has basic column exclusion grants (ExcludedColumnNames)
+→ These are PER-TABLE — 200+ tables means 200+ grants to maintain
+→ No automatic inheritance for new tables
+→ No tag-based classification
+→ No cross-account column-level enforcement
+→ No audit trail at column granularity
+
+WHAT WE NEED: LF-Tags (Lake Formation Tag-Based Access Control)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the Two Lake Formation Permission Models
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MODEL A: Named Resource (what we used in Project 73)
+→ GRANT SELECT ON TABLE orders_gold.daily_orders TO role/AnalystRole
+→ Explicit: per-table, per-role, per-column
+→ Problem: N tables × M roles = N×M grants to maintain
+→ Problem: new table → must add grants manually
+
+MODEL B: LF-Tag-Based (what we need now) ✅
+→ Tag columns: sensitivity=confidential
+→ Tag roles: clearance=internal
+→ GRANT: IF tag(sensitivity) IN (public, internal) → allow SELECT
+→ Automatic: new table with tagged columns → instantly governed
+→ Scales: 1 tag expression covers ALL tables, ALL accounts
+
+Step 2: Design the Tag Taxonomy
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Tag 1: sensitivity
+→ Values: public, internal, confidential, restricted
+→ Applied to: columns
+
+Tag 2: domain
+→ Values: orders, customers, products, analytics
+→ Applied to: databases, tables
+
+Tag 3: layer
+→ Values: bronze, silver, gold, derived
+→ Applied to: databases
+
+Tag 4: pii
+→ Values: true, false
+→ Applied to: columns
+→ Shortcut tag for GDPR/CCPA compliance
+
+Step 3: Design the Access Matrix
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌─────────────────────┬──────────┬──────────┬──────────────┬────────────┐
+│ Role                │ public   │ internal │ confidential │ restricted │
+├─────────────────────┼──────────┼──────────┼──────────────┼────────────┤
+│ BI Analyst          │ ✅ read  │ ✅ read  │ ❌           │ ❌         │
+│ Data Scientist      │ ✅ read  │ ✅ read  │ ✅ read      │ ❌         │
+│ ETL Role            │ ✅ all   │ ✅ all   │ ✅ all       │ ✅ all     │
+│ Cross-Acct Analyst  │ ✅ read  │ ✅ read  │ ❌           │ ❌         │
+│ Cross-Acct DS       │ ✅ read  │ ✅ read  │ ✅ read      │ ❌         │
+│ Security Team       │ ✅ read  │ ✅ read  │ ✅ read      │ ✅ read    │
+└─────────────────────┴──────────┴──────────┴──────────────┴────────────┘
+
+Step 4: Map to AWS Implementation
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Create LF-Tags in producer account (Account A)
+→ Assign tags to databases, tables, columns
+→ Create tag-based permission grants
+→ Share LF-Tags cross-account via Lake Formation
+→ Consumer account (Account C) receives tag-governed access
+→ CloudTrail logs every access with column detail</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE LF-TAG SECURITY ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                  │
+│  ACCOUNT A: ORDERS DOMAIN (PRODUCER) — Tag Owner                                │
+│                                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │                         LF-TAG DEFINITIONS                                 │  │
+│  │                                                                            │  │
+│  │  sensitivity: [public, internal, confidential, restricted]                 │  │
+│  │  domain:      [orders, customers, products, analytics]                     │  │
+│  │  pii:         [true, false]                                                │  │
+│  └──────────────────────────────────┬─────────────────────────────────────────┘  │
+│                                     │ Tags assigned to                           │
+│                                     ▼                                            │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │  orders_gold.daily_orders                                                  │  │
+│  │  ┌────────────────────┬──────────────┬───────────────────┐                │  │
+│  │  │ Column             │ sensitivity  │ pii               │                │  │
+│  │  ├────────────────────┼──────────────┼───────────────────┤                │  │
+│  │  │ order_id           │ public       │ false             │                │  │
+│  │  │ order_total        │ internal     │ false             │                │  │
+│  │  │ status             │ public       │ false             │                │  │
+│  │  │ customer_id        │ confidential │ true              │                │  │
+│  │  │ payment_method     │ confidential │ false             │                │  │
+│  │  │ shipping_city      │ internal     │ false             │                │  │
+│  │  │ customer_email     │ restricted   │ true              │                │  │
+│  │  │ ip_address         │ restricted   │ true              │                │  │
+│  │  └────────────────────┴──────────────┴───────────────────┘                │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│                                     │                                            │
+│                                     │ Tag-based grants                           │
+│                                     ▼                                            │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │  LF-TAG PERMISSION GRANTS                                                  │  │
+│  │                                                                            │  │
+│  │  AnalystRole:                                                              │  │
+│  │    GRANT SELECT WHERE sensitivity IN (public, internal)                    │  │
+│  │    → Can see: order_id, order_total, status, shipping_city                │  │
+│  │    → CANNOT see: customer_id, payment_method, customer_email, ip_address  │  │
+│  │                                                                            │  │
+│  │  DataScientistRole:                                                        │  │
+│  │    GRANT SELECT WHERE sensitivity IN (public, internal, confidential)      │  │
+│  │    → Can see: all above + customer_id, payment_method                     │  │
+│  │    → CANNOT see: customer_email, ip_address (restricted)                  │  │
+│  │                                                                            │  │
+│  │  SecurityRole:                                                             │  │
+│  │    GRANT SELECT WHERE sensitivity IN (public, internal, confidential,      │  │
+│  │                                       restricted)                          │  │
+│  │    → Can see: ALL columns                                                  │  │
+│  │                                                                            │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│                                     │                                            │
+│                                     │ Cross-account tag sharing                  │
+│                                     ▼                                            │
+└─────────────────────────────────────┬────────────────────────────────────────────┘
+                                      │
+                                      │ Lake Formation cross-account grant
+                                      ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                  │
+│  ACCOUNT C: ANALYTICS DOMAIN (CONSUMER) — Tag Consumer                          │
+│                                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │  RESOURCE LINK: orders_domain → Account A orders_gold                      │  │
+│  │                                                                            │  │
+│  │  Consumer AnalystRole:                                                     │  │
+│  │    Inherits tag grant: sensitivity IN (public, internal)                   │  │
+│  │    → Queries daily_orders                                                  │  │
+│  │    → Sees: order_id, order_total, status, shipping_city                   │  │
+│  │    → customer_id column is INVISIBLE (not masked — ABSENT)                │  │
+│  │    → DESCRIBE TABLE shows only 4 columns, not 8                           │  │
+│  │                                                                            │  │
+│  │  Consumer DataScientistRole:                                               │  │
+│  │    Inherits tag grant: sensitivity IN (public, internal, confidential)     │  │
+│  │    → Same table, sees 6 columns                                            │  │
+│  │                                                                            │  │
+│  └────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>OPTION A: Named Resource Grants with Column Exclusion (Project 73)
+</span>→ Per-table ExcludedColumnNames grants
+→ 200 tables × 6 roles = 1,200 grants
+→ New table → must manually add 6 grants
+→ ❌ REJECTED — doesn't scale, error-prone
+
+OPTION B: LF-Tags (Tag-Based Access Control) ✅
+→ Define tags once, assign to columns
+→ Define tag expressions per role once
+→ New table → tag columns → auto-governed
+→ Cross-account → share tags → auto-enforced
+→ ✅ SELECTED — scales to any number of tables
+
+OPTION C: Column-Level Encryption (Client-Side)
+→ Encrypt PII columns with per-role KMS keys
+→ Only authorized roles can decrypt
+→ Problem: requires application-level changes
+→ Problem: Athena/Spectrum can't decrypt inline
+→ ❌ REJECTED — too complex, breaks query tools
+
+OPTION D: Row-Level Security (Redshift RLS)
+→ Redshift native row-level security
+→ Only works for Redshift internal tables
+→ Doesn't cover Athena or S3
+→ ❌ REJECTED — doesn't cover the full platform
+
+DECISION: Option B (LF-Tags) as primary + Option D as supplementary for Redshift</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DEFINE TAGS IN PRODUCER ACCOUNT
+</span>   → Tags belong to the account that creates them
+   → Other accounts receive tags via cross-account sharing
+   → Central governance account could own tags instead (alternative)
+
+2. TAG EVERY COLUMN IN GOLD TABLES
+   → sensitivity tag: public/internal/confidential/restricted
+   → pii tag: true/false
+   → Every column MUST have both tags — no untagged columns
+   → Untagged columns default to MOST restrictive (blocked)
+
+3. USE TAG EXPRESSIONS FOR GRANTS (not individual tags)
+   → Expression: sensitivity IN (public, internal)
+   → This covers ALL tables, ALL databases, ALL columns with matching tags
+   → One expression per role — not per table
+
+4. SHARE TAGS CROSS-ACCOUNT BEFORE SHARING DATA
+   → Lake Formation cross-account requires:
+     a) Share LF-Tags to consumer account
+     b) Share table/database to consumer account
+     c) Consumer creates resource link
+     d) Consumer grants to local roles using shared tags
+
+5. AUTOMATE TAG ASSIGNMENT
+   → Use Glue Catalog table parameters as source of truth
+   → Script reads column metadata → applies tags
+   → Runs after every new table creation
+   → Prevents human error in tag assignment
+
+6. AUDIT QUARTERLY
+   → Export all LF grants to CSV
+   → Cross-reference with HR role list
+   → Flag: grants for departed employees
+   → Flag: untagged columns in Gold tables</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use LF-Tags AND Named Resource grants on same table
+</span>   → They can coexist but create confusion
+   → If both exist: UNION of permissions (most permissive wins)
+   → Pick ONE model per table — preferably LF-Tags for all
+
+2. DO NOT create too many tag values
+   → 4 sensitivity levels is optimal
+   → 10+ levels creates unmanageable grant matrix
+   → Keep it simple: public, internal, confidential, restricted
+
+3. DO NOT leave columns untagged
+   → Untagged columns are governed by table-level grant
+   → If table has LF-Tag grant, untagged columns may be VISIBLE
+   → Always explicitly tag every column
+
+4. DO NOT forget to share tags BEFORE sharing tables cross-account
+   → If consumer doesn't have the tag definition
+   → Tag-based grants fail silently
+   → Consumer sees Access Denied with no useful error
+
+5. DO NOT grant tag permissions to IAMAllowedPrincipals
+   → Defeats the entire purpose
+   → Verify IAMAllowedPrincipals is removed (Project 73 Step 2)
+
+6. DO NOT assume Spectrum honors LF-Tags automatically
+   → Spectrum uses IAM role → role must be granted via LF-Tags
+   → Spectrum role must have lakeformation:GetDataAccess
+   → Test column visibility from Spectrum separately</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬──────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                           │ Use                  │ Why                              │
+├────────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ &lt; 20 tables, simple permissions    │ Named Resource       │ Simpler, explicit, easy to       │
+│                                    │ Grants               │ understand (Project 73)          │
+├────────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ 50+ tables, column-level security  │ LF-Tags              │ Scales automatically, tag once   │
+│ compliance requirements            │                      │ → governs everywhere             │
+├────────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Cross-account with column filter   │ LF-Tags +            │ Tags shared cross-account,       │
+│                                    │ Cross-Account Grants │ consumer inherits tag policy     │
+├────────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Row-level filtering (user A sees   │ Lake Formation       │ Cell-level security with data    │
+│ only their department's rows)      │ Data Filters         │ filters on SELECT grants         │
+├────────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Redshift internal tables           │ Redshift RLS         │ Native Redshift row-level        │
+│ row-level security                 │ (Row Level Security) │ security policies                │
+└────────────────────────────────────┴──────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE LF-TAGS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. SIMPLE USE CASE — 5 tables, 2 roles
+</span>   → LF-Tags overhead not justified
+   → Named Resource grants are clearer
+   → Don't over-engineer for small catalogs
+
+2. NEED ROW-LEVEL FILTERING
+   → LF-Tags control COLUMN visibility
+   → For ROW filtering: use Lake Formation Data Filters
+   → Or: create views that filter rows per role
+
+3. NON-GLUE-CATALOG TABLES
+   → LF-Tags only work with Glue Data Catalog tables
+   → Redshift internal tables: use Redshift native GRANT/RLS
+   → DynamoDB: use IAM fine-grained access control
+
+4. REAL-TIME PERMISSION CHANGES
+   → LF-Tag changes can take 1-5 minutes to propagate
+   → For instant revocation: use IAM deny policy (immediate)
+   → LF-Tags are eventually consistent for new grants</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+</span>LF-TAG PERMISSION EVALUATION — STEP BY STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCENARIO: Analyst runs Athena query:
+  SELECT * FROM orders_gold.daily_orders WHERE status = 'shipped'
+
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  STEP 1: Athena calls Glue GetTable                              │
+│  → Athena: "Give me schema for orders_gold.daily_orders"         │
+│  → Glue: "Let me check with Lake Formation first"                │
+│                                                                  │
+│  STEP 2: Lake Formation intercepts GetTable                      │
+│  → LF checks: Who is calling? → AnalystRole                     │
+│  → LF checks: What tags does AnalystRole have grants for?        │
+│                                                                  │
+│  STEP 3: LF evaluates tag-based grants                           │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │  Grant for AnalystRole:                                 │     │
+│  │  GRANT SELECT                                           │     │
+│  │  ON TAG (sensitivity = ['public', 'internal'])          │     │
+│  │                                                         │     │
+│  │  Table columns and their tags:                          │     │
+│  │  ┌──────────────┬──────────────┬──────────┐            │     │
+│  │  │ Column       │ sensitivity  │ Visible? │            │     │
+│  │  ├──────────────┼──────────────┼──────────┤            │     │
+│  │  │ order_id     │ public       │ ✅ YES   │            │     │
+│  │  │ order_total  │ internal     │ ✅ YES   │            │     │
+│  │  │ status       │ public       │ ✅ YES   │            │     │
+│  │  │ customer_id  │ confidential │ ❌ NO    │            │     │
+│  │  │ payment_meth │ confidential │ ❌ NO    │            │     │
+│  │  │ shipping_city│ internal     │ ✅ YES   │            │     │
+│  │  │ customer_eml │ restricted   │ ❌ NO    │            │     │
+│  │  │ ip_address   │ restricted   │ ❌ NO    │            │     │
+│  │  └──────────────┴──────────────┴──────────┘            │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                  │
+│  STEP 4: LF returns FILTERED schema to Glue                     │
+│  → Schema returned to Athena has ONLY 4 columns:                │
+│    order_id, order_total, status, shipping_city                  │
+│  → The other 4 columns are ABSENT — not masked, INVISIBLE       │
+│                                                                  │
+│  STEP 5: Athena processes query with filtered schema             │
+│  → SELECT * returns only 4 columns                               │
+│  → Even "SELECT customer_id" would fail: column not found        │
+│  → DESCRIBE TABLE shows only 4 columns                           │
+│  → The analyst doesn't even KNOW the hidden columns exist        │
+│                                                                  │
+│  STEP 6: LF vends temporary S3 credentials                      │
+│  → LF creates scoped STS credentials                             │
+│  → These creds can ONLY read S3 paths for granted tables         │
+│  → Athena uses these creds (not its own IAM role) for S3 reads  │
+│                                                                  │
+│  STEP 7: CloudTrail logs the access                              │
+│  → Event: GetTable (filtered)                                    │
+│  → Event: GetDataAccess (S3 credential vend)                     │
+│  → Both logged with: principal, table, timestamp                 │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CROSS-ACCOUNT TAG SHARING — INTERNAL FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  Account A (Producer):                                           │
+│  1. Creates LF-Tag: sensitivity = [public, internal, ...]        │
+│  2. Assigns tags to columns in orders_gold.daily_orders          │
+│  3. Grants cross-account:                                        │
+│     GRANT TAG ASSOCIATION on sensitivity TO Account C            │
+│     GRANT SELECT on TAG(sensitivity=['public','internal'])       │
+│       TO Account C                                               │
+│                                                                  │
+│  Lake Formation internally:                                      │
+│  → Creates AWS RAM (Resource Access Manager) share               │
+│  → Share includes: tag definitions + table references             │
+│  → RAM share sent to Account C                                   │
+│                                                                  │
+│  Account C (Consumer):                                           │
+│  4. LF Admin accepts RAM share (or auto-accept if same Org)     │
+│  5. Creates RESOURCE LINK database:                              │
+│     CREATE DATABASE orders_domain_link                            │
+│     AS RESOURCE LINK TO orders_gold IN Account A                 │
+│  6. Grants local roles using shared tags:                        │
+│     GRANT SELECT ON TAG(sensitivity=['public','internal'])       │
+│       TO local AnalystRole                                       │
+│  7. Analyst queries:                                             │
+│     SELECT * FROM orders_domain_link.daily_orders                │
+│     → Lake Formation in Account A evaluates tags                 │
+│     → Returns filtered schema (4 columns only)                   │
+│     → Analyst sees non-PII data only                             │
+│                                                                  │
+│  CRITICAL: Tag evaluation happens in PRODUCER account            │
+│  → Consumer cannot override or bypass producer's tag assignments │
+│  → Producer controls what each sensitivity level means            │
+│  → Consumer controls which local roles get which tag levels      │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW TABLE AUTO-GOVERNANCE — WHY LF-TAGS SCALE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  DAY 1: Grant created:                                           │
+│  GRANT SELECT ON TAG(sensitivity=['public','internal'])          │
+│    TO AnalystRole                                                │
+│                                                                  │
+│  DAY 30: New table created: orders_gold.daily_returns            │
+│  → Columns tagged: return_id(public), amount(internal),          │
+│                     customer_id(confidential)                    │
+│                                                                  │
+│  IMMEDIATELY: AnalystRole can query daily_returns                │
+│  → Sees: return_id, amount                                       │
+│  → Cannot see: customer_id                                       │
+│  → NO new grant needed — tag expression already covers it        │
+│                                                                  │
+│  DAY 60: Another new table: orders_gold.payment_details          │
+│  → Same auto-governance — tag columns, instant access control    │
+│                                                                  │
+│  THIS IS WHY LF-Tags &gt; Named Resource:                           │
+│  → Named Resource: 200 tables × 6 roles = 1,200 grants          │
+│  → LF-Tags: 1 tag expression × 6 roles = 6 grants TOTAL         │
+│  → Covers ALL current AND future tables automatically            │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Access Denied" after setting up LF-Tags
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ IAMAllowedPrincipals not removed (Project 73 Step 2)
+→ LF-Tags don't apply if IAMAllowedPrincipals still has Super
+→ Must remove FIRST, then add tag-based grants
+→ Order matters: revoke old → grant new
+
+PITFALL 2: Column visible to wrong role
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Both LF-Tag grant AND Named Resource grant exist
+→ LF evaluates UNION: if EITHER grants access, column is visible
+→ Fix: remove all Named Resource grants before switching to LF-Tags
+→ Use list_permissions to audit existing grants
+
+PITFALL 3: Cross-account — consumer sees 0 columns
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Tag NOT shared to consumer account
+→ Fix: grant TAG ASSOCIATION to consumer account
+→ Then: grant SELECT on tag expression to consumer account
+→ Both steps required — missing either = 0 columns
+
+PITFALL 4: New table has no tag assignments
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Table created by Glue Crawler — crawler doesn't assign tags
+→ Tag-based grants don't match → table invisible to everyone
+→ Fix: automate tag assignment as post-crawler step
+→ Use Lambda trigger or Step Functions after crawler completes
+
+PITFALL 5: DESCRIBE TABLE shows different columns per user
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ This is CORRECT behavior — not a bug
+→ Analyst sees 4 columns, Data Scientist sees 6 columns
+→ But: analysts may think schema is wrong
+→ Fix: document that column visibility varies by role
+→ Include in data product README
+
+PITFALL 6: Spectrum doesn't respect LF-Tags
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Spectrum IAM role must have lakeformation:GetDataAccess
+→ External schema must reference Glue Catalog (not manual DDL)
+→ Lake Formation must have registered the S3 location
+→ All three conditions required — missing any = tags ignored</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TAG LIMITS:
+</span>→ Max LF-Tags per account: 50
+→ Max values per tag: 50
+→ Max tag assignments per resource: 50
+→ For QuickCart: 4 tags × 4-5 values = well within limits
+
+GRANT SCALING:
+→ Named Resource: O(tables × roles) grants
+→ LF-Tags: O(tag_expressions × roles) grants
+→ 200 tables, 6 roles: Named = 1,200 grants, Tags = 6 grants
+→ 1,000 tables, 20 roles: Named = 20,000 grants, Tags = 20 grants
+→ LF-Tags are the ONLY viable option at scale
+
+CROSS-ACCOUNT SCALING:
+→ Each consumer account needs: tag share + data share + resource link
+→ 10 consumer accounts: 10 shares (manageable)
+→ 50 consumer accounts: need automation (Terraform/CDK)
+→ Tag grants propagate to ALL consumers — add once, works everywhere
+
+PERFORMANCE:
+→ LF-Tag evaluation: &lt; 50ms per query (negligible)
+→ First query after grant change: may take 1-5 minutes (cache refresh)
+→ Subsequent queries: instant (cached permission evaluation)
+→ No performance difference between 4 tags and 40 tags</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY COLUMN-LEVEL SECURITY WORKS:
+</span>
+1. PERMISSION SIMULATION
+   → Assume each role → run DESCRIBE TABLE → count columns
+   → AnalystRole: should see 4 columns
+   → DataScientistRole: should see 6 columns
+   → ETLRole: should see 8 columns (all)
+
+2. QUERY VERIFICATION
+   → As AnalystRole: SELECT customer_id → should get "column not found"
+   → As DataScientistRole: SELECT customer_id → should succeed
+   → As AnalystRole: SELECT * → should return 4 columns only
+
+3. AUDIT TRAIL (CloudTrail)
+   → Filter: eventName = GetTable, GetDataAccess
+   → Shows: who accessed which table, when
+   → Lake Formation audit events show column-level detail
+
+4. COMPLIANCE REPORT
+   → Export all LF-Tag assignments to CSV
+   → Export all grants to CSV
+   → Cross-reference: every PII column tagged → every tag governed
+   → Present to SOC 2 auditors</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(74)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Create and Assign LF-Tags</h3>
+
+<hr>
+<h3>Part 2: Tag-Based Permission Grants</h3>
+
+<hr>
+<h3>Part 3: Consumer Account — Accept Tags and Create Resource Links</h3>
+
+<hr>
+<h3>Part 4: Column Visibility Verification &amp; Compliance Testing</h3>
+
+<hr>
+<h3>Complete File Summary &amp; Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ACCOUNT A (Producer — Orders Domain)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create LF-Tags and assign to columns</span><span>
+</span>python 74_01_create_lf_tags.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Create tag-based grants (local + cross-account)</span><span>
+</span>python 74_02_tag_based_grants.py
+
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ACCOUNT C (Consumer — Analytics Domain)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Accept shared tags, create resource links, grant local roles</span><span>
+</span>python 74_03_consumer_accept_tags.py
+
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># VERIFICATION (Either account)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: Verify column visibility and generate compliance report</span><span>
+</span>python 74_04_verify_column_security.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED STATE AFTER ALL SCRIPTS:
+</span>
+ACCOUNT A (Producer):
+┌─────────────────────────────────────────────────────────────────┐
+│ LF-Tags defined:                                                │
+│   sensitivity: [public, internal, confidential, restricted]     │
+│   pii: [true, false]                                            │
+│   domain: [orders, customers, products, analytics, platform]    │
+│   layer: [bronze, silver, gold, derived]                        │
+│                                                                 │
+│ Column tags assigned:                                           │
+│   orders_gold.daily_orders: 13 columns tagged                   │
+│   orders_gold.clickstream_events: 18 columns tagged             │
+│   customers_gold.customer_segments: 7 columns tagged            │
+│                                                                 │
+│ Tag-based grants:                                               │
+│   AnalystRole → sensitivity IN (public, internal)               │
+│   DataScientistRole → sensitivity IN (public, internal, confid) │
+│   GlueETLRole → ALL sensitivity levels                          │
+│   SecurityAuditRole → ALL sensitivity levels (read only)        │
+│   SpectrumRole → sensitivity IN (public, internal)              │
+│   Account C → tags shared + tag-based grants                    │
+└─────────────────────────────────────────────────────────────────┘
+
+ACCOUNT C (Consumer):
+┌─────────────────────────────────────────────────────────────────┐
+│ RAM shares: accepted                                            │
+│ Resource links: orders_gold_link, customers_gold_link           │
+│                                                                 │
+│ Local tag grants:                                               │
+│   AnalystRole → sensitivity IN (public, internal)               │
+│   DataScientistRole → sensitivity IN (public, internal, confid) │
+│   SpectrumRole → sensitivity IN (public, internal)              │
+│                                                                 │
+│ Query: SELECT * FROM orders_gold_link.daily_orders              │
+│   As AnalystRole → 11 columns (no PII)                         │
+│   As DataScientistRole → 13 columns (includes customer_id)     │
+└─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ LF-Tags are the SCALABLE way to do column-level security
+   (1 tag expression covers ALL current + future tables)
+→ Named Resource grants: O(tables × roles) — doesn't scale
+→ LF-Tag grants: O(tag_expressions × roles) — scales infinitely
+→ Tags are assigned to COLUMNS — each column gets a sensitivity level
+→ Grants match tag EXPRESSIONS — not individual resources
+→ Cross-account: share tags FIRST, then share tag-based grants
+→ Column filtering = columns are ABSENT (not masked) — strongest security
+→ New tables auto-governed: tag columns → instant access control
+→ CloudTrail provides complete audit trail for compliance
+
+HOW THIS BUILDS ON PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 7:  IAM policy evaluation (LF adds another evaluation layer)
+→ Project 56: Cross-account S3 (LF replaces bucket policies)
+→ Project 57: Cross-account Glue Catalog (LF replaces resource policies)
+→ Project 71: Data Mesh cross-account (LF-Tags simplify mesh governance)
+→ Project 73: Lake Formation basics (now upgraded to LF-Tags)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 75: Disaster Recovery — Entire Platform Must Survive Region Failure
+   "What happens if us-east-2 goes down?
+    How do we recover 15 TB of data, 200 tables, and 50 pipelines
+    in another region within 4 hours?"</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Full data lake platform (Project 73)
+→ Column-level security across 3 accounts (this project)
+→ Real-time + batch pipelines (Projects 71-72)
+→ SOC 2 compliance report ready
+
+THEN: AWS announces a major us-east-2 outage
+→ QuickCart's ENTIRE platform is in us-east-2
+→ No dashboards for 6 hours
+→ No data pipelines for 8 hours
+→ Revenue lost: $2.3 million in missed real-time recommendations
+→ Customer complaints: 4,200 support tickets
+
+CTO (next morning):
+"This can NEVER happen again.
+ I need a disaster recovery plan.
+ If us-east-2 goes down, we must be operational
+ in us-west-2 within 4 hours.
+ RTO: 4 hours. RPO: 1 hour.
+ Make it happen."
+
+→ Project 75: "Disaster Recovery: Entire Platform Must Survive 
+               a Region Failure"
+→ Introduces: Multi-region DR, S3 CRR, Redshift cross-region snapshots,
+              Glue Catalog backup, MariaDB replication, RTO/RPO planning</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-73.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 74 of 80</span>
+    <span class="nav-project-title">FINE-GRAINED COLUMN-LEVEL SECURITY ACROSS 3 ACCOUNTS VIA LAKE FORMATION</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-75.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-75.html") window.location = "project-75.html";
+  if (e.key === 'ArrowLeft' && "project-73.html") window.location = "project-73.html";
+});
+</script>
+</body>
+</html>

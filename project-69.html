@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 69: MONTHLY AWS BILL IS $2,800 — OPTIMIZE TO $1,500 — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:86%"></div></div>
+<div id="progress-label">86%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 69 of 80</div>
+  <div class="project-title">MONTHLY AWS BILL IS $2,800 — OPTIMIZE TO $1,500</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Quarterly AWS cost review meeting
+</span>
+CURRENT MONTHLY AWS BILL: $2,800
+CFO TARGET: $1,500 (46% reduction)
+
+DETAILED COST BREAKDOWN:
+┌──────────────────────────────────┬──────────────┬────────────────────────────────┐
+│ Service                          │ Monthly Cost │ Notes                          │
+├──────────────────────────────────┼──────────────┼────────────────────────────────┤
+│ Redshift (2× dc2.large, 24/7)   │ $365         │ 70% idle — Project 67 fix      │
+│ Glue ETL Jobs (all pipelines)    │ $450         │ 15 jobs, various DPU configs   │
+│ S3 Storage (2.5 TB total)        │ $280         │ Mix of hot/warm/cold data      │
+│ S3 Requests (GET/PUT/LIST)       │ $85          │ Small file overhead — Proj 62  │
+│ NAT Gateway                      │ $180         │ Glue internet access           │
+│ NAT Gateway Data Processing      │ $95          │ $0.045/GB processed            │
+│ EC2 (MariaDB + bastion + misc)   │ $220         │ Account A, 3 instances         │
+│ Data Transfer (cross-AZ/region)  │ $145         │ Glue ↔ Redshift ↔ S3           │
+│ Athena Queries                   │ $45          │ $5/TB scanned, poor pruning    │
+│ CloudWatch (logs + metrics)      │ $65          │ Verbose Glue logging           │
+│ Secrets Manager                  │ $12          │ 30 secrets × $0.40/month       │
+│ DynamoDB                         │ $8           │ Pipeline state table           │
+│ Lambda                           │ $15          │ All pipeline Lambdas           │
+│ SNS/SQS                          │ $5           │ Notifications and queues       │
+│ Step Functions                   │ $2           │ Pipeline orchestration         │
+│ VPC Peering Data Transfer        │ $18          │ Cross-account CDC traffic      │
+│ Other (KMS, CloudTrail, etc.)    │ $810         │ Various small services         │
+├──────────────────────────────────┼──────────────┼────────────────────────────────┤
+│ TOTAL                            │ $2,800       │                                │
+└──────────────────────────────────┴──────────────┴────────────────────────────────┘
+
+TOP WASTE AREAS IDENTIFIED:
+┌────┬──────────────────────────────────────────┬───────────┬──────────────────┐
+│ #  │ Waste Area                               │ Wasted    │ Fix Complexity   │
+├────┼──────────────────────────────────────────┼───────────┼──────────────────┤
+│ 1  │ Redshift idle 70% of time                │ $255/mo   │ LOW (pause/resume)│
+│ 2  │ NAT Gateway for Glue (should be VPC EP)  │ $275/mo   │ LOW (VPC endpoint)│
+│ 3  │ S3: 800 GB raw data in Standard class    │ $95/mo    │ LOW (lifecycle)   │
+│ 4  │ S3: 500 GB old CDC deltas not cleaned    │ $55/mo    │ LOW (lifecycle)   │
+│ 5  │ Glue over-provisioned DPUs               │ $135/mo   │ MEDIUM (tuning)  │
+│ 6  │ Athena full-table scans (no pruning)     │ $35/mo    │ MEDIUM (partition)│
+│ 7  │ CloudWatch verbose logging               │ $40/mo    │ LOW (log levels) │
+│ 8  │ S3 request costs from small files        │ $60/mo    │ DONE (Project 62)│
+│ 9  │ Cross-AZ data transfer                   │ $45/mo    │ MEDIUM (AZ align)│
+│ 10 │ Unused EC2 instances                     │ $75/mo    │ LOW (terminate)  │
+├────┼──────────────────────────────────────────┼───────────┼──────────────────┤
+│    │ TOTAL IDENTIFIABLE WASTE                 │ $1,070/mo │                  │
+│    │ OPTIMIZED BILL (estimated)               │ $1,730/mo │                  │
+│    │ WITH RESERVED INSTANCES                  │ $1,480/mo │ MEETS TARGET ✅  │
+└────┴──────────────────────────────────────────┴───────────┴──────────────────┘
+
+CFO: "I want a line-by-line optimization plan. Show me BEFORE and AFTER
+      for every service. Implement the easy wins THIS WEEK.
+      I want the bill under $1,500 within 60 days."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Categorize optimizations by effort and impact
+</span>
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │                    EFFORT vs IMPACT MATRIX                           │
+  │                                                                       │
+  │  HIGH   │ RI Purchase        │ Architecture       │                  │
+  │  IMPACT │ ($100+ savings)    │ Redesign           │                  │
+  │         │ NAT Gateway removal│ (long-term)        │                  │
+  │         │ Redshift pause     │                    │                  │
+  │  ───────┼────────────────────┼────────────────────┤                  │
+  │  MEDIUM │ Glue DPU tuning    │ Cross-AZ alignment │                  │
+  │  IMPACT │ S3 lifecycle       │ Athena partitioning│                  │
+  │  ($20-99│ Log optimization   │                    │                  │
+  │  saving)│                    │                    │                  │
+  │  ───────┼────────────────────┼────────────────────┤                  │
+  │  LOW    │ Unused resources   │                    │                  │
+  │  IMPACT │ cleanup            │                    │                  │
+  │  (&lt;$20) │ Tag optimization   │                    │                  │
+  │         │                    │                    │                  │
+  │         │ LOW EFFORT         │ HIGH EFFORT        │                  │
+  └───────────────────────────────────────────────────────────────────────┘
+
+Step 2: Prioritize by quick wins first
+
+  WEEK 1 (Quick wins — low effort, high/medium impact):
+  → Redshift pause/resume (already done — Project 67): -$213
+  → NAT Gateway elimination (VPC endpoints): -$275
+  → S3 lifecycle policies: -$150
+  → CloudWatch log optimization: -$40
+  → Unused EC2 termination: -$75
+  
+  WEEK 2 (Medium effort, medium impact):
+  → Glue DPU right-sizing: -$135
+  → Athena partition optimization: -$35
+  → Cross-AZ alignment: -$45
+  
+  WEEK 4 (Commitment decisions):
+  → Reserved Instances evaluation: -$100+
+  → Savings Plans evaluation
+  
+  MONTH 2:
+  → Validate savings against bill
+  → Adjust as needed</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>OPTIMIZATION PLAN — 10 ACTIONS:
+</span>
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  ACTION 1: Redshift Pause/Resume                     SAVINGS: $213/mo      │
+│  → Already implemented (Project 67)                                        │
+│  → Pause 6 PM → Resume 1:30 AM weekdays                                   │
+│  → Pause Friday 6 PM → Resume Monday 1:30 AM                              │
+│  → $365 → $152                                                             │
+│                                                                             │
+│  ACTION 2: Eliminate NAT Gateway                     SAVINGS: $275/mo      │
+│  → Glue uses NAT to reach S3 and Glue service endpoints                   │
+│  → Replace with: S3 Gateway Endpoint + Glue Interface Endpoint             │
+│  → NAT: $0.045/hr + $0.045/GB = $275/mo                                   │
+│  → VPC Endpoints: $0.01/hr + $0.01/GB = ~$15/mo                           │
+│  → NET SAVINGS: $260/mo                                                    │
+│                                                                             │
+│  ACTION 3: S3 Intelligent Tiering + Lifecycle        SAVINGS: $150/mo      │
+│  → 800 GB raw data → Glacier Deep Archive ($0.00099/GB)                    │
+│  → 500 GB old CDC deltas → delete after 90 days                            │
+│  → 200 GB duplicate data → deduplicate Bronze/Silver                       │
+│  → Remaining 1 TB → Intelligent Tiering (auto-manages)                     │
+│                                                                             │
+│  ACTION 4: Glue DPU Right-Sizing                    SAVINGS: $135/mo      │
+│  → Audit each Glue job: actual DPU usage vs provisioned                    │
+│  → Most jobs using 10 DPU but only need 3-5                               │
+│  → Enable auto-scaling where available                                     │
+│  → Reduce worker count based on CloudWatch metrics                         │
+│                                                                             │
+│  ACTION 5: Unused EC2 Termination                   SAVINGS: $75/mo       │
+│  → Bastion host running 24/7 (used 2 hrs/month)                           │
+│  → Dev EC2 instance (nobody logged in for 60 days)                        │
+│  → Replace bastion with SSM Session Manager (free)                         │
+│                                                                             │
+│  ACTION 6: CloudWatch Log Optimization              SAVINGS: $40/mo       │
+│  → Glue continuous logging: $0.50/GB ingested                              │
+│  → 80 GB/month of verbose DEBUG logs                                       │
+│  → Reduce to INFO level: ~15 GB/month                                      │
+│  → Set log retention: 30 days (was unlimited)                              │
+│                                                                             │
+│  ACTION 7: Athena Partition Optimization             SAVINGS: $35/mo       │
+│  → Queries scanning entire table (no partition pruning)                    │
+│  → Add year/month/day partitioning (Project 26)                            │
+│  → Use Parquet columnar format (already done — Project 25)                 │
+│  → Partition projection for instant partition resolution                    │
+│                                                                             │
+│  ACTION 8: Cross-AZ Data Transfer Reduction         SAVINGS: $45/mo       │
+│  → Glue ENIs in us-east-2a, Redshift in us-east-2b                       │
+│  → Every byte crosses AZ boundary: $0.01/GB each way                      │
+│  → Align: Glue subnet + Redshift subnet in SAME AZ                       │
+│                                                                             │
+│  ACTION 9: S3 Request Cost Reduction                SAVINGS: $60/mo       │
+│  → Already addressed by Project 62 (compaction)                            │
+│  → Verify: small file problem fully resolved                               │
+│  → Additional: use S3 Batch Operations for bulk deletes                    │
+│                                                                             │
+│  ACTION 10: Cost Governance (ongoing)               SAVINGS: $50+/mo      │
+│  → AWS Budgets: alert at 80% and 100% of target                          │
+│  → Cost Allocation Tags: track cost per pipeline/team                     │
+│  → Monthly review cadence                                                  │
+│  → Reserved Instance / Savings Plan evaluation                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+TOTAL PROJECTED SAVINGS: $1,078/mo
+PROJECTED NEW BILL: $2,800 - $1,078 = $1,722/mo
+WITH RI/SAVINGS PLANS: ~$1,480/mo ✅ MEETS $1,500 TARGET</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. IMPLEMENT quick wins FIRST (Week 1)
+</span>   → Redshift pause: done (Project 67)
+   → NAT Gateway: replace with VPC endpoints
+   → S3 lifecycle: apply policies to all buckets
+   → Log optimization: reduce verbosity + set retention
+   → EC2 cleanup: terminate unused instances
+   → Total Week 1 savings: ~$750/mo (immediate impact on next bill)
+
+2. TAG everything for cost allocation
+   → Tags: Environment, Team, Pipeline, CostCenter
+   → Enable Cost Allocation Tags in AWS Billing
+   → Enables: "How much does the partner feed pipeline cost?"
+   → Without tags: costs are opaque blobs per service
+
+3. SET AWS Budgets with alerts
+   → Monthly budget: $1,500
+   → Alert at 80% ($1,200): "Approaching budget"
+   → Alert at 100% ($1,500): "Budget exceeded"
+   → Alert at 120% ($1,800): "URGENT — significantly over budget"
+   → Alerts to: CFO + Data Engineering team
+
+4. USE Cost Explorer anomaly detection
+   → AWS Cost Anomaly Detection: ML-based
+   → Detects: unexpected spikes (runaway Glue job, etc.)
+   → Alert: within hours of anomaly (not end of month)
+   → Free to enable, invaluable for catching issues early
+
+5. REVIEW costs monthly — not quarterly
+   → Quarterly = 3 months of waste before detection
+   → Monthly 30-minute review: check each service against budget
+   → Use Cost Explorer: group by service, filter by tag
+
+6. CALCULATE cost per pipeline
+   → Partner feed pipeline: S3 + Glue + Redshift share = $X/month
+   → CDC pipeline: Glue + S3 + Redshift = $Y/month
+   → Enables: "Is this pipeline worth its cost?"
+   → May discover: $200/month pipeline generating $50/month value
+
+7. DOCUMENT every optimization with rollback plan
+   → "Changed Glue DPU from 10 to 5"
+   → Rollback: "Change back to 10 if job fails or exceeds 30 min"
+   → Timeline: "Monitor for 7 days before declaring success"
+   → Owner: "Data Engineering — John"</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT optimize blindly without monitoring impact
+</span>   → "Reduce all Glue jobs to 2 DPU" → jobs fail or take 3x longer
+   → ALWAYS: reduce gradually (10 → 7 → 5) → monitor → adjust
+   → One change at a time → measure → next change
+
+2. DO NOT delete S3 data without confirming it's truly unused
+   → "Delete everything older than 90 days"
+   → Annual audit needs 12 months of data
+   → Compliance may require 7-year retention
+   → ALWAYS: lifecycle to Glacier first → delete only after confirmation
+
+3. DO NOT buy Reserved Instances before understanding usage patterns
+   → RI = 1-3 year commitment
+   → If workload changes: locked into unused capacity
+   → FIRST: 30 days of Cost Explorer data → THEN: RI decision
+   → Start with: Savings Plans (more flexible than RIs)
+
+4. DO NOT remove NAT Gateway without adding VPC endpoints
+   → Glue jobs need: S3, Glue service, CloudWatch Logs, STS
+   → Remove NAT without endpoints → ALL Glue jobs fail
+   → Add endpoints FIRST → test → THEN remove NAT
+
+5. DO NOT cut monitoring to save money
+   → "CloudWatch costs $65 — turn it off"
+   → Without monitoring: can't detect problems, can't measure savings
+   → REDUCE verbosity (DEBUG → INFO) but KEEP essential metrics
+   → Monitoring pays for itself in incident prevention
+
+6. DO NOT sacrifice reliability for cost savings
+   → "Remove retry logic to reduce Step Function transitions"
+   → One failed pipeline = hours of manual recovery
+   → Quality gates + retry logic: cost cents, save hours
+   → NEVER optimize away reliability features
+
+7. DO NOT optimize once and forget
+   → Costs drift: new data sources, growing volumes, new features
+   → Optimization is CONTINUOUS, not one-time
+   → Monthly review cadence prevents drift
+   → Set calendar reminder: "First Monday — cost review"
+
+8. DO NOT compare AWS costs to on-premises naively
+   → "On-prem server costs $500/month — AWS is $1,500"
+   → On-prem doesn't include: power, cooling, staff, DR, scaling
+   → True comparison: TCO (Total Cost of Ownership) analysis
+   → AWS advantage: pay for what you use, scale on demand</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(69)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: NAT Gateway Elimination (Biggest Quick Win)</h3>
+
+<hr>
+<h3>PART 2: S3 Lifecycle Optimization</h3>
+
+<hr>
+<h3>PART 3: Glue DPU Right-Sizing</h3>
+
+<hr>
+<h3>PART 4: CloudWatch Log Optimization</h3>
+
+<hr>
+<h3>PART 5: AWS Budgets and Cost Governance</h3>
+
+<hr>
+<h3>PART 6: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER — PHASED COST OPTIMIZATION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># WEEK 1: QUICK WINS (low effort, high impact)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 1: Redshift Pause/Resume (ALREADY DONE — Project 67)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $213/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 2: Eliminate NAT Gateway</span><span>
+</span>python 69_01_eliminate_nat_gateway.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Create VPC endpoints → verify → remove NAT</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $260/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 3: S3 Lifecycle Policies</span><span>
+</span>python 69_02_s3_lifecycle_optimization.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Apply lifecycle rules to all buckets</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $150/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 4: CloudWatch Log Optimization</span><span>
+</span>python 69_04_cloudwatch_optimization.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Set retention → reduce verbosity</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $40/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 5: Cost Governance</span><span>
+</span>python 69_05_cost_governance.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Budgets → anomaly detection → tracking</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># WEEK 1 TOTAL SAVINGS: ~$663/month</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># BILL AFTER WEEK 1: ~$2,137</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># WEEK 2: MEDIUM EFFORT (tuning and alignment)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 6: Glue DPU Right-Sizing</span><span>
+</span>python 69_03_glue_dpu_rightsizing.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Analyze → recommend → apply gradually</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $135/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 7: Athena Partition Optimization</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Apply partition projection (Project 26 patterns)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Ensure all queries use partition filters</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $35/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 8: Cross-AZ Alignment</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Move Glue subnet to same AZ as Redshift</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $45/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 9: Unused EC2 Cleanup</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Terminate dev instance → replace bastion with SSM</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Savings: $75/month</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># WEEK 2 TOTAL SAVINGS: ~$290/month</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CUMULATIVE SAVINGS: ~$953/month</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># BILL AFTER WEEK 2: ~$1,847</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONTH 2: COMMITMENT DECISIONS</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Action 10: Reserved Instances / Savings Plans</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift RI: additional ~$50/month savings</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → EC2 Savings Plan: additional ~$30/month savings</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → 1-year commitment based on stable usage data</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># FINAL MONTHLY BILL: ~$1,480 ✅ MEETS $1,500 TARGET</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COST OPTIMIZATION RESULTS:
+</span>
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  BEFORE: $2,800/month ($33,600/year)                                    │
+│                                                                          │
+│  ████████████████████████████████████████████████████ $2,800             │
+│                                                                          │
+│  AFTER WEEK 1: $2,137/month (quick wins)                                │
+│                                                                          │
+│  ████████████████████████████████████████░░░░░░░░░░░ $2,137 (-$663)     │
+│                                                                          │
+│  AFTER WEEK 2: $1,847/month (tuning)                                    │
+│                                                                          │
+│  █████████████████████████████████░░░░░░░░░░░░░░░░░░ $1,847 (-$953)     │
+│                                                                          │
+│  AFTER MONTH 2: $1,480/month (commitments)                              │
+│                                                                          │
+│  ██████████████████████████████░░░░░░░░░░░░░░░░░░░░░ $1,480 (-$1,320)  │
+│                                                                          │
+│  TARGET: $1,500/month                                                    │
+│                                                                          │
+│  ─────────────────────────────┼─────────────────────── $1,500 TARGET    │
+│                                                                          │
+│  ✅ $1,480 &lt; $1,500 — TARGET MET                                        │
+│                                                                          │
+│  ANNUAL SAVINGS: $1,320 × 12 = $15,840/year                            │
+│                                                                          │
+│  TOP SAVINGS BREAKDOWN:                                                  │
+│  ┌────────────────────────────────────────┬──────────┬──────────┐       │
+│  │ Optimization                           │ Monthly  │ Annual   │       │
+│  ├────────────────────────────────────────┼──────────┼──────────┤       │
+│  │ NAT Gateway → VPC Endpoints            │ $260     │ $3,120   │       │
+│  │ Redshift Pause/Resume                  │ $213     │ $2,556   │       │
+│  │ S3 Lifecycle + Cleanup                 │ $150     │ $1,800   │       │
+│  │ Glue DPU Right-Sizing                  │ $135     │ $1,620   │       │
+│  │ Unused EC2 Termination                 │ $75      │ $900     │       │
+│  │ S3 Request Reduction (Project 62)      │ $60      │ $720     │       │
+│  │ Reserved Instances                     │ $80      │ $960     │       │
+│  │ Cross-AZ Alignment                    │ $45      │ $540     │       │
+│  │ CloudWatch Optimization                │ $40      │ $480     │       │
+│  │ Athena Partition Pruning               │ $35      │ $420     │       │
+│  │ Other small optimizations              │ $227     │ $2,724   │       │
+│  ├────────────────────────────────────────┼──────────┼──────────┤       │
+│  │ TOTAL                                  │ $1,320   │ $15,840  │       │
+│  └────────────────────────────────────────┴──────────┴──────────┘       │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+ONGOING COST GOVERNANCE:
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  MONTHLY REVIEW CHECKLIST (first Monday of each month):                 │
+│                                                                          │
+│  [ ] Check AWS Cost Explorer: actual vs budget                          │
+│  [ ] Review anomaly detection alerts                                     │
+│  [ ] Check S3 storage growth: are lifecycle policies working?           │
+│  [ ] Check Glue DPU metrics: any over-provisioned jobs?                 │
+│  [ ] Check Redshift pause/resume: any schedule failures?                │
+│  [ ] Check for new unused resources (EC2, EBS volumes, EIPs)           │
+│  [ ] Review data transfer costs: any unexpected spikes?                 │
+│  [ ] Check Athena scan costs: any queries missing partition filters?    │
+│  [ ] Update cost allocation tags for any new resources                  │
+│  [ ] Report to CFO: current month projection vs target                 │
+│                                                                          │
+│  QUARTERLY REVIEW:                                                       │
+│  [ ] Evaluate Reserved Instance coverage                                │
+│  [ ] Review Savings Plans utilization                                    │
+│  [ ] Assess: any services to migrate/consolidate?                       │
+│  [ ] Update budget target based on business growth                      │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ NAT Gateway is the #1 hidden cost killer: $275/month for Glue internet access
+→ VPC Endpoints replace NAT Gateway: S3 Gateway = FREE, Interface = ~$15/month
+→ Redshift Pause/Resume: instant 58% savings with ZERO risk or migration
+→ S3 Lifecycle policies: auto-transition cold data → IA → Glacier → delete
+→ Intelligent Tiering: let AWS auto-manage storage class for unpredictable access
+→ Glue DPU right-sizing: most jobs over-provisioned — analyze actual DPU usage
+→ CloudWatch logging: continuous logging = 20x cost of standard logging
+→ Cross-AZ alignment: $0.01/GB each way — align Glue + Redshift in same AZ
+→ Athena partition pruning: scanning 10x more data than needed = 10x cost
+→ AWS Budgets: alert at 80%/100%/120% — prevent end-of-month surprises
+→ Cost Anomaly Detection: ML-based, catches runaway costs within hours
+→ Cost allocation tags: ESSENTIAL — "how much does this pipeline cost?"
+→ Quick wins first: 75% of savings come from 3 changes (NAT, Redshift, S3)
+→ Optimization is CONTINUOUS: monthly review prevents cost drift
+→ NEVER sacrifice reliability for cost — quality gates + retries = pennies
+
+THE GOLDEN RULE OF CLOUD COST OPTIMIZATION:
+→ 80% of waste comes from 20% of services
+→ Find the top 3 waste areas → fix them → 80% of savings achieved
+→ Diminishing returns after that → focus on governance, not micro-optimization
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 4: S3 storage classes — now applied systematically with lifecycle
+  → Project 26: Athena partitioning — directly reduces query scan costs
+  → Project 40: WLM queues — Redshift optimization reduces compute waste
+  → Project 62: Small file compaction — reduces S3 request costs
+  → Project 63: Materialized Views — reduces Redshift query compute
+  → Project 65: CDC — reduces Glue DPU usage (200K vs 12M rows)
+  → Project 66: Event-driven — Step Functions cost = $2/month (negligible)
+  → Project 67: Redshift pause/resume — single biggest compute saving
+
+→ FORWARD:
+  → Project 70: Secrets Manager rotation — small cost but important security
+  → Project 71: Data Mesh — cost allocation PER DOMAIN becomes critical
+  → Project 75: Disaster Recovery — DR adds cost but protects against loss
+  → Project 76: CI/CD — automated deployments prevent configuration drift
+  → Project 79: Migration — cost optimization applied to migration architecture
+  → Project 80: Capstone — cost estimation is key interview discussion topic</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Monthly bill optimized from $2,800 → $1,480. CFO satisfied.
+</span>Cost governance in place. Monthly reviews scheduled.
+
+THEN: Security audit reveals a critical vulnerability:
+
+→ MariaDB password for Glue: hardcoded in Glue Connection properties
+→ Redshift password: hardcoded in Lambda environment variables
+→ Cross-account credentials: stored in plaintext in Python scripts
+→ All passwords: same since initial setup 12 months ago
+→ No rotation policy: if password leaks, attacker has permanent access
+→ Compliance team: "SOC 2 audit requires credential rotation every 90 days"
+
+→ Current state:
+  - 15 services reference MariaDB credentials
+  - 8 services reference Redshift credentials
+  - 4 services reference cross-account IAM secrets
+  - Changing one password = updating 15+ configurations manually
+  - Last password change: never
+
+CISO: "If any of these credentials leak, an attacker has full access
+       to our production databases. We need:
+       1. Centralized credential storage (not hardcoded)
+       2. Automatic rotation every 90 days
+       3. Zero-downtime rotation (services don't break)
+       4. Audit trail: who accessed which credential, when"
+
+→ Project 70: "Rotate DB Credentials Without Breaking Any Pipeline"
+→ Introduces: Secrets Manager → Rotation Lambda → Glue Connection Secret Ref
+             → Redshift Secret → Zero-Downtime Rotation → Audit Trail</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="41" ========== -->
+<div class="chat-message" data-index="41"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-68.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 69 of 80</span>
+    <span class="nav-project-title">MONTHLY AWS BILL IS $2,800 — OPTIMIZE TO $1,500</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-70.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-70.html") window.location = "project-70.html";
+  if (e.key === 'ArrowLeft' && "project-68.html") window.location = "project-68.html";
+});
+</script>
+</body>
+</html>

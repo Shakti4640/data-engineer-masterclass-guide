@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 68: VALIDATE DATA QUALITY RULES BEFORE LOADING TO GOLD LAYER — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:85%"></div></div>
+<div id="progress-label">85%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 68 of 80</div>
+  <div class="project-title">VALIDATE DATA QUALITY RULES BEFORE LOADING TO GOLD LAYER</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Account B Analytics Platform
+</span>
+THE INCIDENT (what triggered this project):
+→ Tuesday 2:15 AM: Partner feed CSV arrives in S3
+→ Event-driven pipeline (Project 66) triggers ETL
+→ Glue job processes partner CSV → silver layer → Redshift
+→ Gold layer aggregations built → MVs refreshed → dashboards served
+
+→ Tuesday 8:00 AM: CFO opens dashboard
+→ Revenue chart shows: $5,200,000 for Monday (normal: $500,000)
+→ CFO sends company-wide email: "RECORD BREAKING DAY! 🎉"
+
+→ Tuesday 9:30 AM: Data engineer investigates
+→ Partner feed had 50,000 rows (normal: ~5,000)
+→ Partner system bug: sent same 5,000 orders 10 times
+→ Every row duplicated 10x → revenue inflated 10x
+→ No quality check caught this before gold layer
+
+→ Tuesday 10:00 AM: Correction email sent
+→ "Previous revenue numbers were incorrect due to data quality issue"
+→ CEO calls meeting: "This can never happen again"
+
+POST-MORTEM REVEALS MORE ISSUES:
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Source           │ Issue                         │ Frequency  │ Impact  │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Partner feed     │ Duplicate rows (10x)          │ 1x/quarter │ HIGH    │
+│ Partner feed     │ NULL customer_id (5% of rows) │ 2x/month   │ MEDIUM  │
+│ Payment data     │ Negative amounts              │ 1x/month   │ HIGH    │
+│ Payment data     │ Future dates (year 2099)      │ 3x/year    │ LOW     │
+│ CDC MariaDB      │ Row count drops 50% suddenly  │ 1x/year    │ HIGH    │
+│ Marketing        │ Empty CSV (0 rows, headers ok)│ 1x/month   │ MEDIUM  │
+│ Marketing        │ Schema change (new column)    │ 2x/year    │ MEDIUM  │
+│ Inventory API    │ All prices = 0.00             │ 1x/quarter │ HIGH    │
+│ All sources      │ Stale data (same as yesterday)│ varies     │ MEDIUM  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CURRENT STATE (no quality gates):
+  S3 File → Glue ETL → Silver Layer → Gold Layer → MVs → Dashboard
+  ↑ no check  ↑ no check  ↑ no check  ↑ no check
+  Bad data flows through ENTIRE pipeline unchecked
+
+DESIRED STATE (quality gates at every layer):
+  S3 File → [QC1: Source] → Silver → [QC2: Silver] → Gold → [QC3: Gold] → MVs
+            ↓ fail                    ↓ fail                  ↓ fail
+         Quarantine              Quarantine              Quarantine
+         + Alert                 + Alert                 + Alert
+
+CEO: "I want quality gates. If data looks wrong, STOP the pipeline.
+      Don't load it. Alert the team. Let humans decide.
+      I'd rather have no data than WRONG data on our dashboards."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Define quality dimensions
+</span>
+  DATA QUALITY = 6 DIMENSIONS:
+  ┌──────────────────────┬──────────────────────────────────────────────┐
+  │ Dimension            │ What It Checks                               │
+  ├──────────────────────┼──────────────────────────────────────────────┤
+  │ Completeness         │ Are required fields populated? (no NULLs)   │
+  │ Uniqueness           │ Are primary keys unique? (no duplicates)    │
+  │ Validity             │ Are values in expected range/format?        │
+  │ Consistency          │ Do related fields agree? (qty × price = total) │
+  │ Timeliness           │ Is data fresh? (not stale/future-dated)     │
+  │ Volume               │ Is row count within expected range?         │
+  └──────────────────────┴──────────────────────────────────────────────┘
+
+Step 2: Map quality rules to each source
+
+  PARTNER FEED:
+  → Volume: row count between 3,000 and 8,000 (±60% of 5,000 avg)
+  → Uniqueness: order_id must be unique
+  → Completeness: customer_id, total_amount NOT NULL
+  → Validity: total_amount &gt; 0, order_date within last 7 days
+
+  PAYMENT DATA:
+  → Validity: amount &gt; 0 (no negatives)
+  → Validity: payment_date &lt;= CURRENT_DATE (no future dates)
+  → Completeness: transaction_id NOT NULL
+  → Volume: &gt; 0 rows (not empty)
+
+  CDC MARIADB:
+  → Volume: delta count &lt; 20% of total table (anomaly detection)
+  → Completeness: primary key NOT NULL
+  → Timeliness: MAX(updated_at) within last 48 hours
+
+  ALL SOURCES (silver layer):
+  → Schema: expected column count and types
+  → Freshness: etl_loaded_at within last 24 hours
+
+Step 3: Choose quality framework
+
+  ┌──────────────────────────────┬──────────┬────────────────────────────────────┐
+  │ Option                       │ Fit      │ Why                                │
+  ├──────────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Glue Data Quality (DQDL)     │ ✅ Best   │ Native Glue integration, DQDL lang │
+  │                              │          │ Built-in rules, metrics, actions   │
+  ├──────────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Great Expectations           │ ✅ Good   │ Open source, rich rule library     │
+  │                              │          │ But: requires Python package mgmt  │
+  ├──────────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Custom PySpark validation    │ ⚠️ Basic  │ Full control but manual work       │
+  │                              │          │ No standard framework              │
+  ├──────────────────────────────┼──────────┼────────────────────────────────────┤
+  │ dbt tests                    │ ✅ Good   │ SQL-based, great for warehouse     │
+  │                              │          │ But: requires dbt setup            │
+  ├──────────────────────────────┼──────────┼────────────────────────────────────┤
+  │ AWS Deequ                    │ ⚠️ Legacy │ Spark-based, predecessor to Glue DQ│
+  └──────────────────────────────┴──────────┴────────────────────────────────────┘
+
+  DECISION: Glue Data Quality (DQDL) as primary
+  → Native integration with Glue ETL jobs
+  → DQDL (Data Quality Definition Language) — declarative rules
+  → Built-in metrics → CloudWatch
+  → Built-in actions: fail job, quarantine bad rows, continue
+  + Custom PySpark for complex rules not expressible in DQDL</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  S3 SOURCE       QC GATE 1          SILVER LAYER    QC GATE 2          │
+  │  ──────────      ─────────          ────────────    ─────────          │
+  │                                                                         │
+  │  partner.csv ──► Source Quality ──► silver/partner/ ──► Silver Quality  │
+  │                  │ Row count         │                  │ Uniqueness     │
+  │                  │ Schema match      │                  │ Completeness   │
+  │                  │ Not empty         │                  │ Freshness      │
+  │                  ▼ FAIL?             │                  ▼ FAIL?          │
+  │              ┌──────────┐            │              ┌──────────┐        │
+  │              │Quarantine│            │              │Quarantine│        │
+  │              │+ Alert   │            │              │+ Alert   │        │
+  │              └──────────┘            │              └──────────┘        │
+  │                                      │                                  │
+  │                                      │                                  │
+  │  QC GATE 3          GOLD LAYER       REDSHIFT          DASHBOARD       │
+  │  ─────────          ──────────       ────────          ─────────       │
+  │                                                                         │
+  │  Gold Quality ──► gold/revenue/ ──► MV Refresh ──► Dashboard           │
+  │  │ Cross-table     │                │              │                    │
+  │  │ Aggregation     │                │              │ TRUSTED ✅         │
+  │  │ Trend check     │                │              │ DATA               │
+  │  ▼ FAIL?           │                │              │                    │
+  │  ┌──────────┐      │                │              │                    │
+  │  │STOP Gold │      │                │              │                    │
+  │  │+ Alert   │      │                │              │                    │
+  │  └──────────┘      │                │              │                    │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue Data Quality within ETL jobs ✅ (CHOSEN — primary)
+</span>→ EvaluateDataQuality transform in Glue ETL script
+→ DQDL rules defined inline or referenced from Glue Catalog
+→ Actions: pass rows to "good" output, route failures to "bad" output
+→ Metrics published to CloudWatch automatically
+→ Tightest integration with existing Glue pipeline
+
+Option B: Standalone Glue Data Quality job ✅ (CHOSEN — supplement)
+→ Separate Glue job that ONLY validates, doesn't transform
+→ Runs BEFORE ETL job in Step Function
+→ Pass → trigger ETL; Fail → quarantine + alert
+→ Clean separation: validation ≠ transformation
+
+Option C: Lambda-based validation
+→ Small Lambda reads S3 file → checks row count, schema, samples
+→ Lightweight for simple checks (volume, schema)
+→ Can't handle: uniqueness across millions of rows (memory limit)
+→ Good for: pre-flight checks before Glue starts
+
+Option D: Redshift-based validation (post-load)
+→ SQL queries on staging table before merge
+→ SELECT COUNT(DISTINCT pk) vs COUNT(*) → duplicate check
+→ Works but: bad data already in Redshift staging
+→ Better: catch before it reaches Redshift
+
+DECISION: Layered approach
+→ Layer 1: Lambda pre-flight (schema, volume, not empty) — fast, cheap
+→ Layer 2: Glue DQ within ETL (uniqueness, validity, completeness) — thorough
+→ Layer 3: Redshift post-load SQL (cross-table integrity) — final gate</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DEFINE rules in DQDL (Data Quality Definition Language)
+</span>   → Declarative: "RowCount between 3000 and 8000"
+   → Not imperative: no Python code for simple checks
+   → DQDL rules stored in Glue Catalog → reusable across jobs
+   → Version controlled alongside ETL code
+
+2. SEPARATE "hard fail" vs "soft warn" rules
+   → HARD FAIL: stops pipeline, quarantines data, alerts team
+     Example: duplicate primary keys, row count 10x normal
+   → SOFT WARN: continues pipeline but logs warning
+     Example: 2% NULL in optional field, slight volume variance
+   → Don't fail pipeline for minor issues → alert and continue
+
+3. QUARANTINE bad data — don't delete it
+   → Failed rows → s3://lake/quarantine/{source}/{batch_date}/
+   → Includes: original row + rule that failed + timestamp
+   → Team can inspect quarantined data → fix source → replay
+   → Retention: 90 days → lifecycle to Glacier
+
+4. PUBLISH quality metrics to CloudWatch
+   → Metric: DQ/PassRate per source per rule
+   → Metric: DQ/FailedRows per source
+   → Metric: DQ/RowCount per source (trend)
+   → Dashboard: quality scores over time
+   → Alarm: pass rate &lt; 95% → alert
+
+5. INTEGRATE quality gate into Step Function (Project 66)
+   → After source ETL → Quality Check step
+   → Quality passes → proceed to gold layer
+   → Quality fails → quarantine + alert + STOP
+   → Human approves override → manual retry
+
+6. TEST quality rules against KNOWN bad data
+   → Create test files with deliberate issues
+   → Run quality checks → verify each rule catches its issue
+   → Regression test: new rules don't break existing valid data
+
+7. TRACK quality trends over time
+   → Partner feed quality score: 98% → 95% → 92% → ALERT
+   → Degrading quality = source system problem
+   → Catch BEFORE it becomes a data incident
+
+8. DOCUMENT every rule with business justification
+   → Rule: "total_amount &gt; 0"
+   → Justification: "Negative amounts indicate refunds which should use status='refunded'"
+   → Owner: Data Engineering team
+   → Last reviewed: 2025-01-15</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT validate only at ingestion — validate at EVERY layer
+</span>   → Source file may be valid but transformation introduces errors
+   → Silver layer valid but gold aggregation has division-by-zero
+   → Quality gates at: source → silver → gold
+
+2. DO NOT block pipeline for trivial issues
+   → 0.1% NULL in optional email field → don't stop pipeline
+   → Set appropriate thresholds: "Completeness('email') &gt;= 95%"
+   → Reserve HARD FAIL for truly dangerous data quality issues
+
+3. DO NOT hardcode thresholds without historical context
+   → "Row count must be exactly 5,000" → fails on 5,001 rows
+   → Better: "Row count between 3,000 and 8,000" (±60% of historical average)
+   → Even better: dynamic thresholds based on rolling 30-day average
+
+4. DO NOT skip quality checks in "emergency" situations
+   → "CEO needs the data NOW, skip quality checks"
+   → This is exactly how the $5M incident happened
+   → Quality checks take &lt; 2 minutes — never worth skipping
+
+5. DO NOT run quality checks AFTER data is in production tables
+   → "Check quality on Redshift production table after loading"
+   → Bad data already visible to analysts → damage done
+   → Check BEFORE merge into production (staging → validate → merge)
+
+6. DO NOT create quality rules without monitoring
+   → Rules without dashboards = invisible
+   → Rule fails silently → nobody notices → same as no rules
+   → Every rule must publish metrics → dashboard → alarm
+
+7. DO NOT let quality rules become stale
+   → Business changes: new status codes, price ranges, etc.
+   → Rules not updated → false positives or missed issues
+   → Quarterly review: update rules with current business context
+
+8. DO NOT quarantine without alerting
+   → Quarantine = data hidden from pipeline
+   → Without alert: team doesn't know data is missing
+   → Dashboard shows $0 revenue (quarantined) → worse than wrong data
+   → Always: quarantine + alert + manual review path</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬──────────────────────┬──────────────────────────────────────┐
+</span>│ Quality Check                        │ Where to Run         │ Why                                  │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ File not empty, schema matches       │ Lambda (pre-flight)  │ Fast, cheap, catches obvious issues  │
+│ Row count in expected range          │                      │ before Glue job even starts           │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Column NULLs, uniqueness,            │ Glue DQ (DQDL)       │ Processes full dataset, scalable     │
+│ value ranges, data types             │ within ETL           │ native integration, metrics          │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Cross-table referential integrity    │ Redshift SQL         │ JOINs across tables only possible    │
+│ (FK exists in dimension table)       │ (post-staging)       │ where all tables are queryable       │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Aggregate sanity (revenue within     │ Redshift SQL         │ Aggregation checks need full data    │
+│ 2 std devs of 30-day average)        │ or Gold layer DQ     │ in warehouse context                 │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Schema drift detection               │ Glue Crawler +       │ Crawler detects new columns          │
+│ (new columns, type changes)          │ Lambda comparison    │ Lambda compares with expected schema  │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Freshness (data not stale)           │ Lambda or Glue DQ    │ Simple timestamp comparison          │
+│                                      │                      │ MAX(date) &gt;= yesterday               │
+├──────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Complex business rules               │ Custom PySpark       │ DQDL can't express all rules         │
+│ (qty × price ≈ total ± 1%)          │ in Glue ETL          │ Custom code for complex logic        │
+└──────────────────────────────────────┴──────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│            GLUE DATA QUALITY (DQDL) — INTERNAL MECHANICS                     │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  DQDL (Data Quality Definition Language):                                     │
+│  → Declarative language specific to AWS Glue                                  │
+│  → Rules expressed as simple statements                                       │
+│  → Evaluated against DynamicFrame or DataFrame                                │
+│  → Returns: pass/fail per rule + overall score + row-level results            │
+│                                                                               │
+│  DQDL RULE SYNTAX:                                                            │
+│                                                                               │
+│  Rules = [                                                                    │
+│    RowCount between 3000 and 8000,                                            │
+│    Completeness "customer_id" &gt;= 0.99,                                        │
+│    Uniqueness "order_id" &gt;= 1.0,                                              │
+│    ColumnValues "total_amount" &gt; 0,                                           │
+│    ColumnValues "order_date" &gt;= (now() - 7 days),                             │
+│    IsComplete "transaction_id",                                               │
+│    ColumnLength "email" between 5 and 100,                                    │
+│    CustomSql "SELECT COUNT(*) FROM primary WHERE status NOT IN               │
+│               ('completed','pending','shipped','cancelled','refunded')" = 0   │
+│  ]                                                                            │
+│                                                                               │
+│  RULE TYPES AVAILABLE:                                                        │
+│  ┌─────────────────────┬──────────────────────────────────────────────┐       │
+│  │ Rule Type           │ Example                                      │       │
+│  ├─────────────────────┼──────────────────────────────────────────────┤       │
+│  │ RowCount            │ RowCount between 1000 and 50000              │       │
+│  │ Completeness        │ Completeness "col" &gt;= 0.99 (99% non-null)   │       │
+│  │ Uniqueness          │ Uniqueness "col" &gt;= 1.0 (100% unique)       │       │
+│  │ IsComplete          │ IsComplete "col" (shorthand: 100% non-null) │       │
+│  │ IsUnique            │ IsUnique "col" (shorthand: 100% unique)     │       │
+│  │ ColumnValues        │ ColumnValues "price" &gt; 0                    │       │
+│  │ ColumnLength        │ ColumnLength "name" between 1 and 200       │       │
+│  │ ColumnDataType      │ ColumnDataType "id" = "String"              │       │
+│  │ ColumnCorrelation   │ ColumnCorrelation "col1" "col2" &gt; 0.8       │       │
+│  │ DataFreshness       │ DataFreshness "date_col" &lt;= 24 hours        │       │
+│  │ CustomSql           │ CustomSql "SELECT ..." = 0                  │       │
+│  │ ColumnEntropy       │ ColumnEntropy "status" between 1.0 and 3.0  │       │
+│  │ StandardDeviation   │ StandardDeviation "amount" between 10 and 500│      │
+│  │ Mean                │ Mean "price" between 20.0 and 100.0         │       │
+│  └─────────────────────┴──────────────────────────────────────────────┘       │
+│                                                                               │
+│  EXECUTION FLOW:                                                              │
+│                                                                               │
+│  1. Glue ETL reads data → DynamicFrame                                        │
+│  2. EvaluateDataQuality transform applied:                                    │
+│     → Converts DynamicFrame to Spark DataFrame internally                     │
+│     → For each rule:                                                          │
+│       a. Translates DQDL to Spark SQL/aggregation                             │
+│       b. Executes against full dataset                                        │
+│       c. Computes metric (e.g., uniqueness = 0.997)                           │
+│       d. Compares with threshold (&gt;= 1.0)                                     │
+│       e. Records: PASS or FAIL                                                │
+│  3. Returns TWO outputs:                                                      │
+│     → ruleOutcomes: DataFrame with pass/fail per rule                         │
+│     → rowLevelOutcomes: DataFrame with per-row pass/fail                      │
+│  4. Glue job decides based on outcomes:                                       │
+│     → All pass → continue pipeline                                            │
+│     → Any hard fail → quarantine + alert + stop                               │
+│     → Soft warn → continue + log                                              │
+│                                                                               │
+│  ROW-LEVEL OUTCOMES:                                                          │
+│  ┌────────────────────────────────────────────────────────────┐               │
+│  │ Input DataFrame:                                           │               │
+│  │ order_id │ customer_id │ total_amount │ status             │               │
+│  │ ORD-001  │ CUST-123    │ 49.99        │ completed          │               │
+│  │ ORD-002  │ NULL        │ -5.00        │ unknown            │               │
+│  │ ORD-001  │ CUST-456    │ 29.99        │ shipped            │ (duplicate)   │
+│  │                                                            │               │
+│  │ After EvaluateDataQuality:                                 │               │
+│  │                                                            │               │
+│  │ GOOD rows (passed all rules):                              │               │
+│  │ order_id │ customer_id │ total_amount │ status             │               │
+│  │ ORD-001  │ CUST-123    │ 49.99        │ completed          │               │
+│  │                                                            │               │
+│  │ BAD rows (failed one or more rules):                       │               │
+│  │ order_id │ customer_id │ total_amount │ status │ failures  │               │
+│  │ ORD-002  │ NULL        │ -5.00        │ unknown│ null_cust,│               │
+│  │          │             │              │        │ neg_amount │               │
+│  │ ORD-001  │ CUST-456    │ 29.99        │ shipped│ dup_id    │               │
+│  └────────────────────────────────────────────────────────────┘               │
+│                                                                               │
+│  METRICS FLOW:                                                                │
+│  → Each rule evaluation → metric published to CloudWatch                      │
+│  → Namespace: Glue/DataQuality                                                │
+│  → Dimensions: JobName, RuleName                                              │
+│  → Metrics: Score (0.0-1.0), RowsPassed, RowsFailed                          │
+│  → Enables: trending, alerting, SLA tracking                                 │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Quality check passes but data is still wrong"
+</span>→ Cause: rules don't cover the actual failure mode
+→ Duplicate rows pass: uniqueness check was on wrong column
+→ Fix: map EVERY past incident to a specific rule
+→ If incident can't be caught by existing rules → add new rule
+
+PITFALL 2: "Quality check blocks ALL data for 1 bad row"
+→ Cause: rule set to HARD FAIL on any failure
+→ 1 bad row out of 5,000 → entire batch rejected
+→ Fix: use ROW-LEVEL filtering → quarantine bad rows, pass good ones
+→ Or: threshold-based: "Completeness &gt;= 99%" (allows 1% bad)
+
+PITFALL 3: "Quality check takes longer than ETL itself"
+→ Cause: Uniqueness check on 10M rows → full data shuffle
+→ Multiple CustomSql rules → multiple full scans
+→ Fix: prioritize rules by cost → run cheap rules first
+→ If cheap rules fail → skip expensive rules (already failing)
+
+PITFALL 4: "Row count check fails after legitimate business growth"
+→ Cause: hardcoded threshold "between 3000 and 8000"
+→ Business grew: now 12,000 orders/day → rule fails daily
+→ Fix: dynamic thresholds based on rolling average
+→ Or: percentage-based: "within 200% of 30-day average"
+
+PITFALL 5: "Quarantine bucket fills up, nobody reviews it"
+→ Cause: soft-fail rules quarantine data → no alert → accumulates
+→ 6 months later: 50 GB of quarantined data nobody looked at
+→ Fix: alert on EVERY quarantine event → review SLA (24 hours)
+→ Lifecycle: auto-delete quarantine after 90 days
+
+PITFALL 6: "False positive: good data flagged as bad"
+→ Cause: rule too strict → legitimate edge cases caught
+→ Black Friday: 3x normal volume → row count check fails
+→ Fix: separate rules for known high-volume periods
+→ Or: wider thresholds with anomaly detection instead of hard limits
+
+PITFALL 7: "Quality check passes on sample but fails on full data"
+→ Cause: sampling-based checks miss rare issues
+→ 1 duplicate in 1M rows → sample of 10K unlikely to catch it
+→ Fix: ALWAYS run uniqueness and completeness on FULL data
+→ Sampling OK for: distribution checks, statistical rules
+
+PITFALL 8: "Multiple quality gates conflict"
+→ Cause: source gate passes (row count OK) but silver gate fails (duplicates)
+→ Source gate checked volume, not content → passed
+→ Silver gate checked uniqueness → failed → quarantined
+→ But: source already loaded to silver → inconsistent state
+→ Fix: source gate should include uniqueness check too
+→ Or: silver gate quarantines from silver (not source)
+
+PITFALL 9: "DQDL CustomSql rule causes Spark error"
+→ Cause: CustomSql uses SQL syntax not supported by Spark SQL
+→ DQDL translates CustomSql to Spark → Spark SQL has different functions
+→ Fix: test CustomSql rules in Spark context, not Redshift context
+→ Use Spark-compatible functions: COALESCE, CASE WHEN, etc.
+
+PITFALL 10: "Quality metrics show 100% pass but CFO still sees wrong data"
+→ Cause: quality rules check source data but error is in TRANSFORMATION
+→ Source: 5,000 valid rows → Transform: JOIN creates 50,000 rows (fan-out)
+→ Quality gate on source passes → transformation introduces duplicates
+→ Fix: quality gate on TRANSFORMED output too (silver layer check)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>RULE EXECUTION TIME BY DATA SIZE:
+</span>┌──────────────────────────┬──────────────┬────────────────────────────────────┐
+│ Rule Type                │ 100K rows    │ 10M rows                           │
+├──────────────────────────┼──────────────┼────────────────────────────────────┤
+│ RowCount                 │ &lt; 1 sec      │ &lt; 1 sec (COUNT is instant)         │
+│ Completeness             │ &lt; 2 sec      │ &lt; 5 sec (NULL count scan)          │
+│ ColumnValues (range)     │ &lt; 2 sec      │ &lt; 5 sec (filter + count)           │
+│ Uniqueness               │ 3-5 sec      │ 30-60 sec (full shuffle + group)   │
+│ CustomSql (aggregation)  │ 2-5 sec      │ 10-30 sec (depends on query)       │
+│ ColumnCorrelation        │ 5-10 sec     │ 60-120 sec (statistical compute)   │
+└──────────────────────────┴──────────────┴────────────────────────────────────┘
+
+COST OF QUALITY CHECKS:
+→ Glue DPU time for quality: ~2-5 minutes per source (3 DPU)
+→ Cost: 3 DPU × 5 min × $0.44/DPU-hr = $0.11 per source per run
+→ 5 sources daily: $0.55/day = $16.50/month
+→ vs cost of ONE data quality incident: hours of engineer time + reputation damage
+→ ROI: massive
+
+NUMBER OF RULES SCALING:
+→ 5 rules per source (current): trivial overhead
+→ 20 rules per source: moderate — some rules run in parallel
+→ 100 rules per source: may need rule prioritization
+→ Strategy: group rules by cost → run cheap first → skip expensive if cheap fails
+
+QUARANTINE STORAGE SCALING:
+→ 1% failure rate × 5,000 rows/day × 500 bytes = 25 KB/day → negligible
+→ 5% failure rate × 1M rows/day × 500 bytes = 250 MB/day → 7.5 GB/month
+→ Lifecycle: 90 days → Glacier → $0.004/GB/month</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(68)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: Pre-Flight Lambda (Fast Source Validation)</h3>
+
+<h3>PART 2: Glue Data Quality Rules (DQDL)</h3>
+
+<h3>PART 3: Glue ETL Job with Integrated Data Quality</h3>
+
+<hr>
+<h3>PART 4: Updated Step Function with Quality Gates</h3>
+
+<hr>
+<h3>PART 5: Quality Dashboard and Alerting</h3>
+
+<hr>
+<h3>PART 6: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ONE-TIME SETUP ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Deploy pre-flight Lambda</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    (package 68_01_preflight_lambda.py → Lambda: data-quality-preflight)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Deploy Glue ETL job with DQ</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    aws s3 cp 68_03_glue_etl_with_dq.py s3://quickcart-analytics-scripts/glue/etl_with_dq.py</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Create Glue job: etl-with-data-quality (pointing to this script)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create quarantine S3 bucket</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    aws s3 mb s3://quickcart-analytics-quarantine</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    (with encryption + lifecycle: 90 days → Glacier)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Update Step Function with quality gates</span><span>
+</span>python 68_04_update_step_function.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Deploy quality dashboard and alarms</span><span>
+</span>python 68_05_quality_dashboard.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- AUTOMATED FLOW (with quality gates) ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EVENT: Partner CSV lands in S3</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 1: ClassifyEvent → source=partner_feed</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 2: PreFlightQualityCheck (Lambda — 5 sec)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → File exists? ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Schema matches? ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Row count 3000-8000? ✅ (5,200 rows)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓ PASS</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 3: RunSourceETL with DQ (Glue — 3 min)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Read 5,200 rows from CSV</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → DQDL: IsUnique "order_id"? ✅ (5,200 distinct)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → DQDL: Completeness "customer_id" &gt;= 99%? ✅ (99.8%)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → DQDL: ColumnValues "total_amount" &gt; 0? ✅ (all positive)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → 5,190 good rows → silver layer</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → 10 bad rows → quarantine bucket</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Metrics → CloudWatch</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓ PASS</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 4: MarkSourceComplete → DynamoDB</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 5: CheckAllSources → 4/4 complete ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 6: GoldLayerQualityCheck (Lambda — 10 sec)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Silver layer freshness? ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   → Cross-table integrity? ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓ PASS</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 7: BuildGoldLayer (Glue — 2 min)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 8: RefreshMVs (Lambda — 30 sec)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   ↓</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 9: NotifySuccess → SNS ✅</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># TOTAL: ~6 minutes with quality gates (was ~5 minutes without)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># OVERHEAD: ~1 minute for quality checks</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># VALUE: prevents $5M false revenue incidents</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE vs AFTER — THE DUPLICATE INCIDENT:
+</span>
+┌─────────────────────────────────────────────────────────────────────────┐
+│ WITHOUT QUALITY GATES (before):                                         │
+│                                                                         │
+│ Partner sends 50,000 rows (10x duplicates) → ETL processes all         │
+│ → Silver: 50,000 rows loaded → Gold: 10x revenue aggregated           │
+│ → Dashboard: $5,200,000 (should be $520,000)                           │
+│ → CFO sends congratulatory email                                       │
+│ → Data engineer discovers issue 8 hours later                          │
+│ → Correction email sent → trust damaged                                │
+│                                                                         │
+│ COST OF INCIDENT:                                                       │
+│ → 8 hours engineer investigation: $600                                  │
+│ → Executive time (meetings, emails): $2,000                             │
+│ → Reputation damage: immeasurable                                       │
+│ → Corrective pipeline fixes: $3,000                                     │
+│ → TOTAL: ~$5,600 + reputation damage                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│ WITH QUALITY GATES (after):                                             │
+│                                                                         │
+│ Partner sends 50,000 rows (10x duplicates) → PreFlight: row count      │
+│ → 50,000 &gt; 15,000 max → ❌ HARD FAIL                                   │
+│ → Pipeline STOPPED at 2:16 AM                                           │
+│ → Alert sent to data engineering team                                   │
+│ → All data quarantined at s3://quarantine/partner_feed/...              │
+│ → Dashboard shows YESTERDAY's data (stale but CORRECT)                 │
+│ → 8:00 AM: team reviews quarantine → contacts partner                  │
+│ → 10:00 AM: partner sends corrected file (5,200 rows)                  │
+│ → 10:01 AM: pipeline re-triggers → quality passes → gold built         │
+│ → Dashboard updated with CORRECT numbers                               │
+│                                                                         │
+│ COST OF QUALITY GATES:                                                  │
+│ → Pre-flight Lambda: $0.0001 per run                                   │
+│ → Glue DQ overhead: ~1 minute extra = $0.02                            │
+│ → CloudWatch metrics: $0.30/month                                       │
+│ → TOTAL: ~$5/month                                                      │
+│ → ROI: $5,600 incident prevented / $5 monthly cost = 1,120x ROI        │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Data quality gates PREVENT bad data from reaching production — not detect after
+→ Three-layer defense: Pre-flight (Lambda) → ETL DQ (Glue DQDL) → Post-load (Redshift SQL)
+→ DQDL: declarative rule language — RowCount, IsUnique, Completeness, ColumnValues, DataFreshness
+→ Row-level filtering: good rows → silver, bad rows → quarantine (don't lose data)
+→ HARD_FAIL vs SOFT_WARN: distinguish pipeline-stopping issues from minor warnings
+→ Quarantine bucket: failed data preserved for investigation and replay
+→ Quality metrics to CloudWatch: trending, alerting, SLA tracking
+→ Quality results to S3 JSON: audit trail for compliance
+→ Overhead: ~1 minute per source (~$0.02) → prevents incidents costing thousands
+→ Step Function integration: quality failure → separate error path → distinct notification
+→ Dynamic thresholds: avoid false positives from business growth
+→ Weekly rule review: business changes require rule updates
+→ NEVER skip quality checks — "just this once" is how incidents happen
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 34: Glue transforms — DQ checks inserted between transform and write
+  → Project 44: Medallion architecture — quality gates between Bronze → Silver → Gold
+  → Project 45: Schema evolution — DQ catches unexpected schema changes
+  → Project 62: Smart write — DQ + coalesce combined in ETL output
+  → Project 65: CDC merge — DQ validates delta before staging → target merge
+  → Project 66: Event-driven pipeline — DQ gates inserted into Step Function flow
+
+→ FORWARD:
+  → Project 69: Cost optimization — DQ prevents costly re-processing of bad data
+  → Project 74: Lake Formation — DQ scores feed data catalog quality metadata
+  → Project 76: CI/CD — DQ rules version-controlled and deployed with pipeline code
+  → Project 78: SLA pipeline — DQ pass rate is key SLA metric (99.9% target)
+  → Project 79: Migration — DQ validates migrated data matches source</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Quality gates are operational. Bad data blocked. Dashboards trusted.
+</span>
+THEN: Quarterly AWS bill review meeting:
+
+→ Total monthly AWS spend: $2,800/month
+→ CFO target: $1,500/month (46% reduction needed)
+→ Breakdown:
+  - Redshift: $365 (→ $152 with pause/resume from Project 67)
+  - Glue: $450 (ETL + compaction + CDC)
+  - S3: $280 (data lake + CDC deltas + quarantine + logs)
+  - Lambda: $15
+  - Athena: $45
+  - DynamoDB: $8
+  - Step Functions: $2
+  - Other: $1,635 (NAT Gateway, EC2, transfers, etc.)
+
+→ S3 storage: 2.5 TB total
+  - 800 GB: raw data never queried (should be Glacier)
+  - 500 GB: old CDC deltas &gt; 90 days (should be deleted)
+  - 200 GB: duplicate data across Bronze/Silver/Gold
+→ Glue: 30% of DPU-hours wasted on small-file overhead (fixed by Project 62)
+→ Athena: queries scanning 10x more data than needed (partition pruning not used)
+→ NAT Gateway: $180/month for Glue internet access (should use VPC endpoints)
+
+CFO: "Cut this bill by 46%. Show me where every dollar goes
+      and what we can eliminate without breaking anything."
+
+→ Project 69: "Monthly AWS Bill Is $2,800 — Optimize to $1,500"
+→ Introduces: S3 Intelligent Tiering → Athena Partition Pruning
+             → Redshift RA3 + Pause → Glue DPU Tuning → NAT Gateway Elimination
+             → Cost Allocation Tags → Budgets + Alerts</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="37" ========== -->
+<div class="chat-message" data-index="37"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-67.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 68 of 80</span>
+    <span class="nav-project-title">VALIDATE DATA QUALITY RULES BEFORE LOADING TO GOLD LAYER</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-69.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-69.html") window.location = "project-69.html";
+  if (e.key === 'ArrowLeft' && "project-67.html") window.location = "project-67.html";
+});
+</script>
+</body>
+</html>

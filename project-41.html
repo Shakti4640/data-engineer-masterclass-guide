@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 41: FILE ARRIVAL AUTO-TRIGGERS ENTIRE ETL WITHOUT HUMAN INTERVEN — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:51%"></div></div>
+<div id="progress-label">51%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 41 of 80</div>
+  <div class="project-title">FILE ARRIVAL AUTO-TRIGGERS ENTIRE ETL WITHOUT HUMAN INTERVENTION</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 18 months old, Series A funded
+</span>Team: 8 engineers, 3-person data team (you lead it)
+
+CURRENT STATE (built through Projects 1–40):
+→ MariaDB exports CSVs to S3 nightly (Project 20, 29)
+→ Glue Crawler discovers schema (Project 23)
+→ Glue ETL transforms CSV → Parquet (Project 25)
+→ Redshift COPY loads Parquet (Project 21, 30)
+→ Athena queries the data lake (Project 24, 26)
+→ Glue Workflow chains Crawler → ETL → Crawler (Project 35)
+
+PROBLEM:
+→ The Glue Workflow (Project 35) runs on a TIME-BASED schedule (2:30 AM)
+→ But the upstream MariaDB export (Project 29) sometimes finishes at 2:15 AM
+   ...sometimes at 3:45 AM (slow nights with heavy load)
+→ When export finishes AFTER 2:30 AM:
+   - Glue Workflow runs on YESTERDAY's stale data
+   - Team doesn't notice until morning standup
+   - Dashboard shows 24-hour-old numbers
+   - Business complains: "Why is yesterday's revenue missing?"
+
+→ When export finishes BEFORE 2:30 AM:
+   - Data sits idle for 15+ minutes before processing starts
+   - Wastes time in a pipeline that could be faster
+
+CTO: "I don't want cron jobs. I don't want schedules.
+      The MOMENT a file lands in S3, processing should BEGIN.
+      Zero human intervention. Zero delay."
+
+ADDITIONAL REQUIREMENTS:
+→ Must handle: Crawl → Transform → Load → Notify (full chain)
+→ Must handle failures gracefully (retry, alert)
+→ Must be auditable (who triggered what, when, why)
+→ Must work for ALL three entities: orders, customers, products
+→ Must NOT re-trigger if someone manually re-uploads an old file</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Identify the TRIGGER
+</span>→ The event: a new CSV file lands in S3
+→ S3 can emit events on PutObject (already used in Projects 17, 18)
+→ But Projects 17/18 used S3 Event Notifications → SNS/SQS
+→ NOW we need something more powerful: ORCHESTRATION, not just notification
+
+Step 2: Identify the ORCHESTRATOR
+→ Need to run a SEQUENCE of steps: Crawl → Transform → Load → Notify
+→ Glue Workflow (Project 35) can do this, but can't be triggered by S3 events natively
+→ Step Functions can orchestrate ANY AWS service call in sequence
+→ Step Functions CAN be triggered by EventBridge
+
+Step 3: Identify the GLUE between trigger and orchestrator
+→ S3 → EventBridge (native integration since 2021)
+→ EventBridge → Step Functions (native target)
+→ No Lambda "glue code" needed for the trigger path
+
+Step 4: Design the chain
+→ S3 PutObject Event
+   → EventBridge Rule (filter by prefix + suffix)
+      → Step Functions State Machine
+         → State 1: Start Glue Crawler
+         → State 2: Wait for Crawler completion
+         → State 3: Start Glue ETL Job
+         → State 4: Wait for ETL completion
+         → State 5: Start Redshift COPY (via Lambda or Glue)
+         → State 6: Send SNS success notification
+         → Catch: Send SNS failure notification
+
+Step 5: Compare with what we had before
+
+┌──────────────────────┬──────────────────────┬───────────────────────────┐
+│ Approach             │ From Project         │ Limitation                │
+├──────────────────────┼──────────────────────┼───────────────────────────┤
+│ Cron + Script        │ Project 29           │ Fixed schedule, no event  │
+│ S3→SQS→EC2 Poller   │ Project 30           │ Custom code, hard to chain│
+│ Glue Workflow        │ Project 35           │ Time/cron trigger only    │
+│ S3→EventBridge→StepFn│ THIS PROJECT (41)    │ ✅ Event-driven, managed  │
+└──────────────────────┴──────────────────────┴───────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  MariaDB Export Script (Project 29)
+        │
+        │ Uploads CSV to S3
+        ▼
+  S3 Bucket: quickcart-raw-data-prod
+  Key: daily_exports/orders/orders_20250115.csv
+        │
+        │ S3 emits event to EventBridge (automatic since 2021)
+        ▼
+  EventBridge Rule: "quickcart-file-arrival-rule"
+  Filter: {
+    source: "aws.s3",
+    detail-type: "Object Created",
+    detail: {
+      bucket.name: "quickcart-raw-data-prod",
+      object.key: [{ prefix: "daily_exports/" }],
+      object.key: [{ suffix: ".csv" }]
+    }
+  }
+        │
+        │ Triggers with event payload
+        ▼
+  Step Functions State Machine: "quickcart-etl-pipeline"
+        │
+        ├──→ State 1: Extract entity type from S3 key
+        ├──→ State 2: Start Glue Crawler for that entity
+        ├──→ State 3: Wait until Crawler finishes
+        ├──→ State 4: Start Glue ETL Job (CSV → Parquet)
+        ├──→ State 5: Wait until ETL finishes
+        ├──→ State 6: Trigger Redshift COPY (via Lambda)
+        ├──→ State 7: Send SNS "SUCCESS" notification
+        │
+        └──→ CATCH (any failure):
+              → Send SNS "FAILURE" alert with error details</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: S3 Event Notification → Lambda → Start Glue Job
+</span>→ Works but Lambda becomes "glue code" you must maintain
+→ No built-in retry/wait/branching
+→ If Glue job fails, Lambda has already exited
+
+Option B: S3 Event Notification → SQS → EC2 Poller → Script
+→ Already built in Project 30
+→ Requires EC2 running 24/7 (cost)
+→ Custom orchestration logic in Python (fragile)
+
+Option C: S3 → EventBridge → Lambda → Glue Workflow
+→ Triggers Glue Workflow via API
+→ But Glue Workflow has limited error handling
+→ Can't easily inject dynamic parameters
+
+Option D: S3 → EventBridge → Step Functions → Glue + Lambda + SNS
+→ ✅ BEST: Fully managed, visual, auditable
+→ Built-in retry, catch, wait, parallel, choice
+→ EventBridge → Step Functions is a NATIVE integration
+→ No "glue code" for the trigger
+→ Dynamic parameters passed from S3 event → State Machine input
+
+DECISION: Option D</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Enable EventBridge notifications on the S3 bucket
+</span>   → One-time bucket-level setting
+   → Replaces S3 Event Notifications for EventBridge use cases
+   → Both can coexist (S3 Event Notifications still work for SNS/SQS)
+
+2. Use PRECISE EventBridge rule filters
+   → Filter by bucket name + prefix + suffix
+   → Prevent triggering on non-CSV files or wrong prefixes
+
+3. Pass S3 event details INTO Step Functions as input
+   → Bucket name, object key, file size, timestamp
+   → State Machine uses these dynamically (no hardcoding)
+
+4. Use Step Functions SDK integrations (not Lambda wrappers)
+   → StartCrawler → .sync (waits for completion automatically)
+   → StartJobRun → .sync (waits for completion automatically)
+   → ".sync" = Step Functions polls Glue on your behalf
+
+5. Implement idempotency
+   → Check if this file was already processed (DynamoDB tracking table)
+   → Prevent double-processing if S3 event fires twice (rare but possible)
+
+6. Use Step Functions execution name derived from file key
+   → Execution name: "orders-20250115-csv-{timestamp}"
+   → Makes CloudWatch logs searchable
+
+7. Tag all resources consistently
+   → Same tags as Project 1: Environment, Team, CostCenter</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT rely on S3 Event Notification → Lambda as orchestrator
+</span>   → Lambda has 15-minute timeout
+   → Glue jobs can run 30+ minutes
+   → Lambda exits, job runs unsupervised
+
+2. DO NOT use polling/cron as backup "just in case"
+   → Creates two trigger paths → duplicate processing
+   → If you need backup: use Step Functions retry, not cron
+
+3. DO NOT start Step Functions execution with SAME name twice
+   → Execution names must be unique within 90 days
+   → Duplicate name = API error, NOT idempotent re-run
+   → Use: {entity}-{date}-{uuid} pattern
+
+4. DO NOT pass entire S3 file content through Step Functions
+   → State Machine payload limit: 256 KB
+   → Pass only: bucket, key, metadata
+   → Let Glue/Lambda read the actual file
+
+5. DO NOT enable EventBridge on S3 without testing the filter
+   → A bad filter triggers on EVERY object in the bucket
+   → Including Athena query results, Glue temp files, etc.
+   → Test with one file FIRST before going live
+
+6. DO NOT skip the Catch block in Step Functions
+   → Uncaught errors = execution fails silently
+   → Always catch → log → alert → possibly retry
+
+7. DO NOT hardcode Glue job names or crawler names in state machine
+   → Use SSM Parameter Store or Step Functions parameters
+   → Enables promotion across dev/staging/prod</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────┬──────────────────────────┬───────────────────────────────┐
+</span>│ Pattern                             │ Use When                 │ Don't Use When                │
+├─────────────────────────────────────┼──────────────────────────┼───────────────────────────────┤
+│ Cron → Glue Workflow (Project 35)   │ Predictable schedule     │ Upstream timing varies        │
+│                                     │ No external dependency   │ Need dynamic parameters       │
+├─────────────────────────────────────┼──────────────────────────┼───────────────────────────────┤
+│ S3 → SQS → EC2 (Project 30)        │ Need custom processing   │ Need managed orchestration    │
+│                                     │ Already have EC2 fleet   │ Want to avoid EC2 cost        │
+├─────────────────────────────────────┼──────────────────────────┼───────────────────────────────┤
+│ S3 → EventBridge → Lambda          │ Single quick action      │ Need multi-step chain         │
+│                                     │ &lt; 15 min total           │ Need wait/retry/branching     │
+├─────────────────────────────────────┼──────────────────────────┼───────────────────────────────┤
+│ S3 → EventBridge → Step Functions   │ Multi-step orchestration │ Simple single-action trigger  │
+│ (THIS PROJECT)                      │ Need retry/catch/wait    │ Cost-sensitive (pennies but   │
+│                                     │ Need audit trail         │ more than cron)               │
+│                                     │ Variable upstream timing │                               │
+├─────────────────────────────────────┼──────────────────────────┼───────────────────────────────┤
+│ S3 → EventBridge → Step Functions   │ Real-time / streaming    │ Batch file arrival (use       │
+│ + Kinesis (Project 72)              │ Sub-second triggers      │ EventBridge for batch)        │
+└─────────────────────────────────────┴──────────────────────────┴───────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE THIS PATTERN</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When files arrive every second (high frequency)
+</span>   → Step Functions Standard: charged per state transition ($0.025 per 1000)
+   → 86,400 executions/day × 7 states = 604,800 transitions/day = $15/day
+   → Use: Step Functions Express (10x cheaper) or Kinesis (Project 72)
+
+2. When the "ETL" is just one Glue job with no chaining
+   → Overkill to use Step Functions for a single job
+   → Use: S3 → EventBridge → Lambda → StartJobRun (fire-and-forget)
+
+3. When you need sub-second processing latency
+   → EventBridge delivery: ~1-3 seconds
+   → Step Functions startup: ~200ms
+   → Glue job cold start: 30-60 seconds
+   → Total: ~1-2 minutes minimum
+   → For sub-second: use Kinesis + Lambda (Project 72)
+
+4. When upstream system can call an API directly
+   → If MariaDB export script can call Step Functions API directly
+   → Skip S3 event entirely — more reliable, less moving parts
+   → But: loses the S3 "file as contract" decoupling benefit</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                        INTERNAL MECHANICS: THE FULL CHAIN                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ S3 → EventBridge (How S3 events reach EventBridge)                          │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                          │
+│                                                                                 │
+│  BEFORE Nov 2021:                                                               │
+│  → S3 could only send events to: SNS, SQS, Lambda                              │
+│  → To reach EventBridge: S3 → SNS → EventBridge (or CloudTrail + EventBridge)  │
+│  → CloudTrail method: expensive ($2 per 100K events), 5-15 min delay           │
+│                                                                                 │
+│  AFTER Nov 2021 (current):                                                      │
+│  → S3 sends events DIRECTLY to EventBridge                                     │
+│  → Enabled per-bucket: "Amazon EventBridge" toggle in bucket properties        │
+│  → Behind the scenes:                                                           │
+│    1. S3 receives PutObject API call                                            │
+│    2. Object stored + replicated (Project 1 mechanics)                          │
+│    3. S3 constructs a structured JSON event:                                    │
+│       {                                                                         │
+│         "version": "0",                                                         │
+│         "source": "aws.s3",                                                     │
+│         "detail-type": "Object Created",                                        │
+│         "detail": {                                                             │
+│           "bucket": {"name": "quickcart-raw-data-prod"},                        │
+│           "object": {                                                           │
+│             "key": "daily_exports/orders/orders_20250115.csv",                  │
+│             "size": 52428800,                                                   │
+│             "etag": "d41d8cd98f00b204e9800998ecf8427e"                          │
+│           },                                                                    │
+│           "reason": "PutObject"                                                 │
+│         }                                                                       │
+│       }                                                                         │
+│    4. Event pushed to EventBridge default bus (same region)                     │
+│    5. Delivery latency: typically &lt; 1 second                                    │
+│    6. NO cost for S3 → EventBridge delivery itself                              │
+│       (EventBridge rule matching: free for first 5M events/month)              │
+│                                                                                 │
+│  KEY DIFFERENCE from S3 Event Notifications:                                    │
+│  ┌──────────────────────┬───────────────────────┬────────────────────────┐      │
+│  │ Feature              │ S3 Event Notification │ S3 → EventBridge       │      │
+│  ├──────────────────────┼───────────────────────┼────────────────────────┤      │
+│  │ Targets              │ SNS, SQS, Lambda only │ 20+ AWS services       │      │
+│  │ Filtering            │ Prefix + Suffix only  │ Any JSON field match   │      │
+│  │ Multiple rules       │ 1 per prefix+suffix   │ Unlimited rules        │      │
+│  │ Content-based filter │ No                    │ Yes (object size, etc) │      │
+│  │ Archive &amp; Replay     │ No                    │ Yes                    │      │
+│  │ Schema discovery     │ No                    │ Yes (Schema Registry)  │      │
+│  └──────────────────────┴───────────────────────┴────────────────────────┘      │
+│                                                                                 │
+│                                                                                 │
+│  ❷ EventBridge Rule Matching (How filtering works)                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                             │
+│                                                                                 │
+│  EventBridge receives ALL events on the default bus                             │
+│  Rules are evaluated CONCURRENTLY against every event                           │
+│                                                                                 │
+│  Matching engine:                                                               │
+│  → Pattern matching on JSON event structure                                     │
+│  → Supports: exact match, prefix, suffix, numeric range,                        │
+│    exists/not-exists, anything-but, IP address match                            │
+│  → Evaluated in O(1) time regardless of number of rules                         │
+│    (compiled into a trie/automaton, NOT iterated sequentially)                  │
+│                                                                                 │
+│  Our rule pattern:                                                              │
+│  {                                                                              │
+│    "source": ["aws.s3"],                         ← must be S3                   │
+│    "detail-type": ["Object Created"],            ← must be creation             │
+│    "detail": {                                                                  │
+│      "bucket": {                                                                │
+│        "name": ["quickcart-raw-data-prod"]       ← exact bucket                 │
+│      },                                                                         │
+│      "object": {                                                                │
+│        "key": [{"prefix": "daily_exports/"}],    ← must be in this prefix       │
+│        "key": [{"suffix": ".csv"}]               ← must be CSV                  │
+│      }                                                                          │
+│    }                                                                            │
+│  }                                                                              │
+│                                                                                 │
+│  WHAT HAPPENS on match:                                                         │
+│  → EventBridge invokes the Target (Step Functions)                              │
+│  → Passes the event JSON as input to the state machine execution               │
+│  → Uses IAM role to call states:StartExecution                                  │
+│                                                                                 │
+│                                                                                 │
+│  ❸ Step Functions Execution (How orchestration works)                           │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                           │
+│                                                                                 │
+│  State Machine receives input JSON (the S3 event)                               │
+│  Creates a new EXECUTION (instance of the state machine)                        │
+│                                                                                 │
+│  Execution lifecycle:                                                           │
+│  1. RUNNING → transitions between states                                        │
+│  2. Each state has: Input → Processing → Output → Next                          │
+│  3. State types used here:                                                      │
+│     - Pass: transform/inject data (no side effects)                             │
+│     - Task: call an AWS service API (.sync = wait for completion)               │
+│     - Wait: pause for N seconds                                                 │
+│     - Choice: branch based on condition                                         │
+│     - Catch/Retry: error handling                                               │
+│                                                                                 │
+│  ".sync" integration pattern (CRITICAL CONCEPT):                                │
+│  ┌────────────────────────────────────────────────────────────────┐             │
+│  │ glue:startJobRun           → Fire and forget (returns immediately)│          │
+│  │ glue:startJobRun.sync      → Step Functions WAITS until job ends  │          │
+│  │                                                                    │          │
+│  │ HOW .sync WORKS internally:                                        │          │
+│  │ 1. Step Functions calls Glue StartJobRun API                       │          │
+│  │ 2. Gets back JobRunId                                              │          │
+│  │ 3. Step Functions creates an internal "task token"                  │          │
+│  │ 4. Polls Glue GetJobRun every ~30 seconds (YOU don't pay for this)│          │
+│  │ 5. When Glue job status = SUCCEEDED → next state                   │          │
+│  │ 6. When Glue job status = FAILED → Catch block                     │          │
+│  │ 7. Polling is managed by Step Functions service, not your code     │          │
+│  └────────────────────────────────────────────────────────────────┘             │
+│                                                                                 │
+│  State-to-state data flow:                                                      │
+│  → Each state receives InputPath (filter input JSON)                            │
+│  → Processes it                                                                 │
+│  → Emits ResultPath (where to put result in JSON)                               │
+│  → Passes OutputPath (filter output JSON) to next state                         │
+│  → This is called the "I/O Processing" model of Step Functions                  │
+│                                                                                 │
+│                                                                                 │
+│  ❹ Pricing Model                                                               │
+│  ━━━━━━━━━━━━━━━                                                               │
+│                                                                                 │
+│  EventBridge:                                                                   │
+│  → Custom events: $1.00 per million events                                      │
+│  → S3 → EventBridge: no additional charge (AWS service events = free matching)  │
+│  → Rule matching: free                                                          │
+│  → Our volume: 3 files/day = 90 events/month = essentially FREE                │
+│                                                                                 │
+│  Step Functions Standard:                                                       │
+│  → $0.025 per 1,000 state transitions                                           │
+│  → Our pipeline: ~8 states per execution × 3 executions/day                     │
+│  → 24 transitions/day × 30 = 720/month = $0.018/month                           │
+│  → Free tier: 4,000 transitions/month                                           │
+│  → WE PAY: $0.00 (within free tier)                                             │
+│                                                                                 │
+│  Glue: (same as Project 25, 35)                                                 │
+│  → DPU-hours consumed by crawler + ETL job                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "EventBridge rule never fires"
+</span>→ Cause #1: Forgot to ENABLE EventBridge on the S3 bucket
+   - Bucket Properties → Amazon EventBridge → Edit → Enable
+   - This is a BUCKET-LEVEL setting, not an account-level setting
+→ Cause #2: Rule filter is wrong (key prefix mismatch, missing "detail")
+→ Debug: CloudWatch Metrics → EventBridge → "TriggeredRules" metric
+→ Debug: Remove all filters temporarily, see if rule fires on ANY S3 event
+
+PITFALL 2: "Step Functions execution starts but immediately fails"
+→ Cause: IAM role for EventBridge target lacks states:StartExecution
+→ Or: IAM role for Step Functions lacks glue:StartJobRun, glue:GetCrawler
+→ Fix: check BOTH roles (EventBridge invocation role + Step Functions execution role)
+
+PITFALL 3: "Glue Crawler succeeds but ETL job gets wrong table"
+→ Cause: Crawler updates the catalog table, but ETL references old table name
+→ Fix: Pass crawler output (database + table name) dynamically through state machine
+→ Or: Use fixed naming convention and verify in ETL job
+
+PITFALL 4: "Same file triggers TWO executions"
+→ Cause: S3 multipart upload completes → CompleteMultipartUpload event fires
+→ AND: S3 may emit both "PutObject" and "CompleteMultipartUpload" events
+→ Fix: Filter EventBridge rule by "reason": ["PutObject"] only
+→ Or: Implement idempotency check in first state (DynamoDB lookup)
+
+PITFALL 5: "Step Functions .sync task hangs forever"
+→ Cause: Glue job is stuck (waiting for DPU capacity, networking issue)
+→ Fix: Set TimeoutSeconds on every Task state (e.g., 1800 = 30 min)
+→ Without timeout: execution runs for up to 1 year (Standard) and you pay
+
+PITFALL 6: "EventBridge fires for Athena output files too"
+→ Cause: Athena writes results to S3 in same bucket
+→ These are .csv files under a different prefix
+→ Fix: PRECISE prefix filter: "daily_exports/" not just ".csv"
+
+PITFALL 7: "Step Functions can't parse the entity name from S3 key"
+→ Cause: Used wrong JSONPath expression in InputPath
+→ S3 key: "daily_exports/orders/orders_20250115.csv"
+→ Need to extract "orders" — Step Functions has LIMITED string manipulation
+→ Fix: Use a Pass state with intrinsic functions (States.ArrayGetItem + States.StringSplit)
+→ Or: Use a lightweight Lambda for parsing (adds cost but adds flexibility)
+
+PITFALL 8: "Works in dev, breaks in prod — different account"
+→ Cause: IAM roles, bucket names, Glue database names all hardcoded
+→ Fix: Parameterize everything via SSM Parameter Store or CloudFormation parameters</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT LOAD:
+</span>→ 3 files/day → 3 Step Functions executions → 3 Glue jobs
+→ Easily within free tier for EventBridge + Step Functions
+
+SCALING TO 100 FILES/DAY:
+→ 100 executions × 8 states = 800 transitions/day
+→ Still within free tier (4,000/month)
+→ But: 100 concurrent Glue jobs may exceed account limit
+→ Default Glue concurrent job runs: 50 (soft limit)
+→ Solution: Add a "Choice" state to check Glue capacity before starting
+→ Or: Add SQS buffering before Step Functions (rate limiting)
+
+SCALING TO 10,000 FILES/DAY:
+→ Step Functions Standard: $6/month (still cheap)
+→ But: 10,000 concurrent executions may hit throttling
+→ Step Functions Standard: 1,300 state transitions/second (default)
+→ Solutions:
+   1. Switch to Step Functions Express ($1 per million executions)
+   2. Batch files: trigger once per "batch complete" marker file
+   3. Fan-out: one parent execution spawns parallel child executions
+
+CONCURRENT EXECUTION LIMITS:
+→ Step Functions Standard: 1,000,000 open executions per account per region
+→ EventBridge: 10,000 rules per bus (default, can increase)
+→ EventBridge target invocations: 10,000/second (soft limit)
+→ Glue: 50 concurrent job runs (default, increase via support)
+→ Glue Crawlers: 100 concurrent crawlers (default)
+
+MULTI-REGION CONSIDERATION:
+→ EventBridge rules are REGIONAL
+→ S3 event only goes to EventBridge in the SAME region as the bucket
+→ Cross-region: use EventBridge cross-region event bus forwarding</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR &amp; DEBUG THIS PIPELINE:
+</span>
+1. EventBridge Metrics (CloudWatch):
+   → TriggeredRules: confirms rule matched an event
+   → Invocations: confirms target was invoked
+   → FailedInvocations: target invocation failed (IAM issue?)
+
+2. Step Functions Console:
+   → Visual execution graph (green/red per state)
+   → Click any state → see input JSON, output JSON, error message
+   → Execution history: every state transition timestamped
+   → This is the #1 reason to use Step Functions — VISUAL DEBUGGING
+
+3. Step Functions Execution Input:
+   → Contains the full S3 event JSON
+   → Can see: which file triggered this, when, what size
+
+4. Glue Job Logs (CloudWatch):
+   → Glue ETL job logs: /aws-glue/jobs/output
+   → Glue Crawler logs: /aws-glue/crawlers
+   → Cross-reference with Step Functions execution timeline
+
+5. SNS Notifications:
+   → Success: "Pipeline completed for orders_20250115.csv in 4m 32s"
+   → Failure: "Pipeline FAILED at Glue ETL stage. Error: OutOfMemoryError"
+
+6. CloudTrail:
+   → Every API call logged: StartExecution, StartJobRun, StartCrawler
+   → Who triggered, what role, from where
+   → Essential for audit and compliance
+
+7. X-Ray Tracing (optional):
+   → Step Functions supports X-Ray integration
+   → Trace the entire execution across services
+   → See latency breakdown: which state took longest</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(41)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Enable EventBridge on S3 Bucket</h3>
+
+<h3>Step 2: Create IAM Roles</h3>
+
+<h3>Step 3: Create the Step Functions State Machine</h3>
+
+<h3>Step 4: Create the EventBridge Rule</h3>
+
+<h3>Step 5: Create the SNS Topic for Notifications</h3>
+
+<h3>Step 6: Create Sample Glue Resources (Crawler + ETL Job)</h3>
+
+<h3>Step 7: End-to-End Test Script</h3>
+
+<h3>Step 8: Diagnostic and Debugging Utility</h3>
+
+<h3>Step 9: Cleanup Script</h3>
+
+<h3>Execution Order Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time, run in order)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Enable EventBridge on S3 bucket</span><span>
+</span>python 41_01_enable_eventbridge_on_s3.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Create IAM roles</span><span>
+</span>python 41_02_create_iam_roles.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Create SNS topic for alerts</span><span>
+</span>python 41_05_create_sns_topic.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: Create Step Functions state machine</span><span>
+</span>python 41_03_create_state_machine.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 5: Create EventBridge rule (connects S3 → Step Functions)</span><span>
+</span>python 41_04_create_eventbridge_rule.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 6: Create Glue resources (crawlers + ETL jobs + scripts)</span><span>
+</span>python 41_06_create_glue_resources.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># TEST</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Upload a file → watch pipeline trigger automatically</span><span>
+</span>python 41_07_test_end_to_end.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># If something breaks:</span><span>
+</span>python 41_08_diagnose_pipeline.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CLEANUP</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 41_09_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED END-TO-END FLOW:
+</span>
+======================================================================
+🧪 END-TO-END PIPELINE TEST
+======================================================================
+
+📤 Uploading test file: s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv
+   Rows: 100
+   Size: 12847 bytes
+   ✅ Upload complete
+
+⏳ EventBridge should detect this within ~1-3 seconds...
+
+🔍 Monitoring Step Functions executions...
+   State Machine: arn:aws:states:us-east-2:123456789012:stateMachine:quickcart-etl-pipeline
+----------------------------------------------------------------------
+
+🚀 EXECUTION DETECTED!
+   Name: 2b4a6c8d-1234-5678-9abc-def012345678
+   Started: 2025-01-15 00:00:05+00:00
+
+📊 Tracking execution state transitions:
+----------------------------------------------------------------------
+  [00:00:05] ▶️  ENTERED: ExtractEntityInfo
+  [00:00:05] ✅ EXITED:  ExtractEntityInfo
+  [00:00:05] ▶️  ENTERED: StartGlueCrawler
+  [00:00:06] ⚙️  TASK STARTED (API call in progress)
+  [00:00:07] ✅ TASK SUCCEEDED
+  [00:00:07] ✅ EXITED:  StartGlueCrawler
+  [00:00:07] ▶️  ENTERED: WaitForCrawler
+  [00:00:37] ✅ EXITED:  WaitForCrawler
+  [00:00:37] ▶️  ENTERED: GetCrawlerStatus
+  [00:00:38] ✅ EXITED:  GetCrawlerStatus
+  [00:00:38] ▶️  ENTERED: CheckCrawlerDone
+  [00:00:38] ✅ EXITED:  CheckCrawlerDone
+  [00:00:38] ▶️  ENTERED: WaitForCrawler          ← Crawler still running
+  [00:01:08] ✅ EXITED:  WaitForCrawler
+  [00:01:08] ▶️  ENTERED: GetCrawlerStatus
+  [00:01:09] ✅ EXITED:  GetCrawlerStatus
+  [00:01:09] ▶️  ENTERED: CheckCrawlerDone
+  [00:01:09] ✅ EXITED:  CheckCrawlerDone          ← Crawler READY
+  [00:01:09] ▶️  ENTERED: StartGlueETLJob
+  [00:01:10] ⚙️  TASK STARTED (API call in progress)
+  [00:03:42] ✅ TASK SUCCEEDED                     ← .sync waited ~2.5 min
+  [00:03:42] ✅ EXITED:  StartGlueETLJob
+  [00:03:42] ▶️  ENTERED: NotifySuccess
+  [00:03:43] ✅ TASK SUCCEEDED
+  [00:03:43] ✅ EXITED:  NotifySuccess
+  [00:03:43] 🎉 EXECUTION SUCCEEDED
+----------------------------------------------------------------------
+
+📋 FINAL STATUS: SUCCEEDED
+   Duration: 218.3 seconds
+
+📦 Checking curated output: s3://quickcart-raw-data-prod/curated/orders/
+   📄 curated/orders/part-00000-snappy.parquet (3.2 KB)
+   📄 curated/orders/part-00001-snappy.parquet (3.1 KB)
+   Total: 2 files, 6.3 KB
+
+======================================================================
+🧪 TEST COMPLETE
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 → EventBridge (native since Nov 2021) eliminates need for CloudTrail-based triggers
+→ EventBridge → Step Functions is a native integration (no Lambda glue needed)
+→ Step Functions .sync pattern waits for Glue job completion automatically
+→ Step Functions intrinsic functions (States.StringSplit, States.Format)
+  enable dynamic parameter extraction WITHOUT Lambda
+→ Crawler polling loop: Start → Wait → GetStatus → Choice → (loop or proceed)
+→ Catch blocks on EVERY task state prevent silent failures
+→ TimeoutSeconds on task states prevent infinite hangs
+→ Diagnostic script systematically checks every link in the chain
+→ Event-driven &gt; time-driven when upstream timing is unpredictable
+
+WHAT CHANGED FROM PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 17/18: S3 → SNS/SQS (notification only, no orchestration)
+→ Project 28: S3 → SNS → SQS → EC2 (custom orchestration, EC2 cost)
+→ Project 29: Cron schedule (fixed timing, misses late files)
+→ Project 30: S3 → SQS → EC2 → Redshift COPY (custom code, fragile)
+→ Project 35: Glue Workflow (chaining, but cron-triggered only)
+→ THIS PROJECT: S3 → EventBridge → Step Functions → Glue → SNS
+  (event-driven, managed, visual, auditable, retry-capable)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 42: CDC — Capture Only Changed Rows from MariaDB
+   (now that pipeline auto-triggers, we need INCREMENTAL logic
+   so we don't reprocess ALL historical data every night)
+
+→ Project 55: Full orchestration with Athena + Redshift steps added
+   (extend this state machine with query validation + warehouse load)
+
+→ Project 66: Replace ALL cron + Glue Workflows with EventBridge + Step Functions
+   (apply this pattern to every pipeline in the platform)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The pipeline now triggers automatically when files arrive.
+</span>But there's a new problem:
+
+Every night, the MariaDB export (Project 29) dumps ALL rows:
+→ orders table: 5 million rows → 500 MB CSV
+→ But only ~2,000 rows are NEW since yesterday
+
+The Glue ETL job processes ALL 5 million rows every night.
+→ 99.96% of the work is redundant
+→ Glue job takes 8 minutes (should take 30 seconds)
+→ Costs $0.44/run in DPU-hours (should cost $0.02)
+→ Redshift COPY replaces entire table (instead of merging changes)
+
+CTO: "We're paying to reprocess the same data every night.
+      Can't we detect WHAT CHANGED and only process that?"
+
+YOU: "Yes — that's Change Data Capture (CDC).
+      We need a watermark column in MariaDB,
+      a filtered export, and a MERGE strategy in Redshift."
+
+→ Project 42: "Capture Only Changed Rows from MariaDB Nightly"
+→ Introduces: CDC patterns, watermark columns, Glue bookmarks + WHERE,
+  Redshift MERGE / DELETE+INSERT, audit columns</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-40.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 41 of 80</span>
+    <span class="nav-project-title">FILE ARRIVAL AUTO-TRIGGERS ENTIRE ETL WITHOUT HUMAN INTERVENTION</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-42.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-42.html") window.location = "project-42.html";
+  if (e.key === 'ArrowLeft' && "project-40.html") window.location = "project-40.html";
+});
+</script>
+</body>
+</html>

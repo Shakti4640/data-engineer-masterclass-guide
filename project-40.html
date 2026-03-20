@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 40: MULTIPLE TEAMS COMPETE FOR REDSHIFT RESOURCES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:50%"></div></div>
+<div id="progress-label">50%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 40 of 80</div>
+  <div class="project-title">MULTIPLE TEAMS COMPETE FOR REDSHIFT RESOURCES</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Growing team, growing contention
+</span>Current State (after Projects 31-39):
+→ Redshift cluster: 2 × ra3.xlplus nodes (optimized tables — Project 39)
+→ 8 analysts using Tableau dashboards (connect to Redshift)
+→ 3 data engineers running ETL jobs
+→ Nightly pipeline: MariaDB → Bronze → Silver → Redshift (Project 35)
+→ Spectrum for cold/reference data (Project 38)
+
+THE CONTENTION CRISIS:
+━━━━━━━━━━━━━━━━━━━━━
+
+9:00 AM — Morning Dashboard Rush:
+→ 8 analysts open Tableau simultaneously
+→ Each dashboard: 5 queries → 40 concurrent queries hit Redshift
+→ Default concurrency: 5 queries at a time
+→ 35 queries QUEUED → analysts wait 30-60 seconds
+→ Tableau shows "loading..." spinners everywhere
+
+9:15 AM — ETL Overrun:
+→ Nightly pipeline (Project 35) usually finishes at 2:50 AM
+→ Today: MariaDB had 2x data → pipeline finished at 8:45 AM
+→ VACUUM + ANALYZE (Project 39) still running at 9:15 AM
+→ VACUUM holds table locks → analyst queries queue behind it
+→ 40 analyst queries + VACUUM = complete gridlock
+
+11:00 AM — Ad-Hoc Heavy Query:
+→ Senior analyst runs: SELECT * FROM fact_orders GROUP BY customer_city
+→ Full table scan + GROUP BY = 45M rows shuffled = 15 seconds
+→ This ONE query consumes all cluster resources
+→ Other 7 analysts' simple queries (0.3s normally) now take 8 seconds
+→ "One person's query is killing everyone's dashboards"
+
+2:00 PM — Tableau Auto-Refresh:
+→ Tableau extracts refresh every 2 hours
+→ 5 dashboards × 10 queries each = 50 queries burst
+→ Cluster overwhelmed for 3 minutes every 2 hours
+→ Anyone querying during refresh window: terrible experience
+
+CEO's email to CTO:
+"I can't get my revenue dashboard to load during the morning meeting.
+ Fix this by end of week."
+
+→ Data engineer: "We need Workload Management — separate queues
+   for dashboards vs ETL vs ad-hoc, with different priorities
+   and resource limits."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Redshift resource model
+</span>→ Redshift has FIXED compute capacity (2 nodes × 2 slices = 4 slots)
+→ Queries share these resources
+→ Without WLM: first-come-first-served, no priority
+→ One heavy query can monopolize all resources
+
+Step 2: Understand WLM components
+→ QUEUES: separate lanes for different workloads
+→ SLOTS: how many concurrent queries per queue
+→ MEMORY: how much RAM per queue/slot
+→ TIMEOUT: max runtime per queue
+→ PRIORITY: which queue gets resources first
+→ QMR (Query Monitoring Rules): auto-kill runaway queries
+→ SQA (Short Query Acceleration): fast-track tiny queries
+→ CONCURRENCY SCALING: auto-add capacity for burst traffic
+
+Step 3: Design queue strategy
+→ Queue 1: "Dashboard" — high priority, many slots, short timeout
+→ Queue 2: "ETL" — medium priority, few slots, long timeout
+→ Queue 3: "Ad-hoc" — low priority, few slots, medium timeout
+→ Queue 4: "Maintenance" — lowest priority, 1 slot, long timeout
+→ Default: catches unclassified queries
+
+Step 4: Dependencies from previous projects
+→ Project 10: Redshift cluster
+→ Project 32: ETL loading (competes with analysts)
+→ Project 38: Spectrum queries (mixed with local queries)
+→ Project 39: VACUUM/ANALYZE (competes with analysts)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    REDSHIFT WORKLOAD MANAGEMENT                         │
+│                                                                         │
+│  INCOMING QUERIES                                                       │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                   │
+│  │ Tableau   │ │ Glue ETL │ │ Analyst  │ │ VACUUM   │                   │
+│  │ Dashboard │ │ Load     │ │ Ad-hoc   │ │ ANALYZE  │                   │
+│  └─────┬────┘ └─────┬────┘ └─────┬────┘ └─────┬────┘                   │
+│        │             │            │             │                        │
+│        ▼             ▼            ▼             ▼                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                    WLM ROUTER                                   │    │
+│  │  Routes queries to queues based on:                             │    │
+│  │  → User group membership                                       │    │
+│  │  → Query group label                                            │    │
+│  │  → Query pattern matching                                       │    │
+│  └──┬────────────┬──────────────┬────────────────┬────────────────┘    │
+│     │            │              │                │                      │
+│     ▼            ▼              ▼                ▼                      │
+│  ┌────────┐  ┌────────┐   ┌─────────┐   ┌────────────┐                │
+│  │QUEUE 1 │  │QUEUE 2 │   │QUEUE 3  │   │QUEUE 4     │                │
+│  │Dashboard│  │ETL     │   │Ad-hoc   │   │Maintenance │                │
+│  │        │  │        │   │         │   │            │                │
+│  │Pri: HIGH│  │Pri: MED│   │Pri: LOW │   │Pri: LOWEST│                │
+│  │Slots: 15│  │Slots: 3│   │Slots: 5 │   │Slots: 1   │                │
+│  │Mem: 40% │  │Mem: 30%│   │Mem: 20% │   │Mem: 10%   │                │
+│  │Timeout: │  │Timeout:│   │Timeout: │   │Timeout:   │                │
+│  │ 30 sec  │  │ 2 hours│   │ 5 min   │   │ 4 hours   │                │
+│  │         │  │        │   │         │   │           │                │
+│  │ SQA: ON │  │SQA: OFF│   │SQA: OFF │   │SQA: OFF   │                │
+│  └────────┘  └────────┘   └─────────┘   └────────────┘                │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ CONCURRENCY SCALING (burst capacity)                            │    │
+│  │ → Auto-adds transient clusters when queues are full             │    │
+│  │ → Dashboard queue: scaling ON (handle 9 AM burst)               │    │
+│  │ → ETL queue: scaling OFF (predictable load)                     │    │
+│  │ → 1 hour/day free credits → covers morning rush                 │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ QUERY MONITORING RULES (QMR)                                    │    │
+│  │ → Rule 1: Kill queries scanning &gt; 1 billion rows (runaway)      │    │
+│  │ → Rule 2: Kill queries running &gt; 300 seconds in ad-hoc queue    │    │
+│  │ → Rule 3: Log queries with &gt; 5 GB Spectrum scan                 │    │
+│  │ → Rule 4: Move long dashboard queries to ad-hoc queue           │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ SHORT QUERY ACCELERATION (SQA)                                  │    │
+│  │ → Redshift predicts query runtime at parse time                 │    │
+│  │ → Queries predicted &lt; 5 seconds → bypass queues entirely        │    │
+│  │ → Dashboard queries (0.2-0.5s) → instantly executed             │    │
+│  │ → No waiting behind heavy queries                               │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Increase cluster size (throw hardware at the problem)
+</span>→ 2 nodes → 4 nodes: $1,564/month → $3,128/month
+→ More resources = less contention
+→ Pros: simplest, no configuration
+→ Cons: 2x cost, doesn't solve priority problem
+
+Option B: WLM queues only (basic resource isolation)
+→ Separate queues for dashboard vs ETL vs ad-hoc
+→ Pros: isolates workloads, prevents one type from blocking another
+→ Cons: fixed slots → can't handle burst traffic
+
+Option C: WLM + SQA + Concurrency Scaling (RECOMMENDED)
+→ WLM: separate queues with priority
+→ SQA: fast-track short queries (dashboards)
+→ Concurrency Scaling: auto-add capacity for bursts
+→ QMR: auto-kill runaway queries
+→ Pros: comprehensive, handles all scenarios
+→ Cons: more configuration, requires monitoring
+
+Option D: Migrate to Redshift Serverless (Project 67)
+→ Auto-scales compute based on demand
+→ No WLM configuration needed (serverless manages it)
+→ Pros: zero management, auto-scales
+→ Cons: potentially higher cost for sustained workloads
+
+DECISION: Option C — WLM + SQA + Concurrency Scaling + QMR
+→ Addresses all four complaints from the problem statement
+→ Dashboard priority ensures CEO's dashboard always loads
+→ ETL isolated from analyst impact
+→ Runaway queries auto-killed
+→ Burst traffic handled by concurrency scaling</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create Redshift USER GROUPS for routing
+</span>   → dashboard_users: Tableau service account + analyst users
+   → etl_users: Glue service account
+   → adhoc_users: analysts with ad-hoc access
+   → maintenance_users: admin/maintenance scripts
+   → WLM routes queries to queues based on user group
+
+2. Enable Short Query Acceleration (SQA) FIRST
+   → Biggest immediate win — zero queue configuration needed
+   → Dashboard queries (0.2-0.5s) skip all queues
+   → Eliminates 90% of dashboard latency complaints
+   → Enable: modify cluster parameter group → SQA = true
+
+3. Configure WLM queues with Automatic WLM (recommended)
+   → Automatic WLM: Redshift manages memory/slots dynamically
+   → You define: queues, priorities, user group routing
+   → Redshift decides: optimal slot count and memory per query
+   → Much simpler than Manual WLM
+
+4. Enable Concurrency Scaling for dashboard queue
+   → Handles 9 AM burst: 40 queries when normal capacity is 15
+   → Auto-adds transient clusters for overflow
+   → 1 hour/day free → covers typical morning rush
+   → Cost: $0 for first hour, then cluster-rate per second
+
+5. Set Query Monitoring Rules (QMR) as safety nets
+   → Kill: queries scanning &gt; 1 billion rows
+   → Kill: queries running &gt; 5 minutes in dashboard queue
+   → Log: queries with &gt; 10 GB Spectrum scan
+   → Hop: move long-running dashboard queries to ad-hoc queue
+
+6. Schedule ETL and maintenance outside peak hours
+   → ETL: 2:00-3:00 AM (Project 35 workflow)
+   → VACUUM: 3:00-3:30 AM (Project 39 maintenance)
+   → ANALYZE: 3:30-3:45 AM
+   → If ETL overruns: ETL queue has lower priority → dashboards unaffected
+
+7. Monitor queue utilization with CloudWatch
+   → WLM queue metrics: query count, wait time, throughput
+   → Concurrency Scaling: scaling events, cost
+   → Set alarms: dashboard queue wait time &gt; 5 seconds</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use Manual WLM unless you're an expert
+</span>   → Manual WLM: you set fixed slot count + memory per slot
+   → Get it wrong: wasted memory or OOM errors
+   → Automatic WLM: Redshift manages this dynamically
+   → Amazon recommends Automatic WLM for almost all cases
+
+2. DO NOT put all users in the same queue
+   → Default: single queue with 5 concurrent slots
+   → 40 queries → 35 queued → everyone waits
+   → Separate queues ensure priority enforcement
+
+3. DO NOT set dashboard timeout too high
+   → Dashboard query should complete in &lt; 5 seconds
+   → If it takes &gt; 30 seconds: something is wrong (bad query or table design)
+   → Timeout = 30 seconds → kills stuck dashboard queries
+   → User sees error → refreshes → fast retry
+
+4. DO NOT enable Concurrency Scaling on ETL queue
+   → ETL runs at 2 AM — no contention
+   → Concurrency Scaling on ETL = paying for extra clusters at 2 AM
+   → Only enable on dashboard queue (where burst happens)
+
+5. DO NOT create more than 8 queues
+   → Each queue reserves resources even when empty
+   → Too many queues = fragmented resources
+   → 4 queues covers 99% of use cases
+
+6. DO NOT forget to assign users to groups
+   → WLM routes by user group
+   → If Tableau user not in dashboard_users group → goes to default queue
+   → Default queue = low priority → slow dashboards
+   → Verify: every service account and user is in correct group
+
+7. DO NOT set QMR to kill queries without logging first
+   → First: set QMR to LOG (observe what would be killed)
+   → After 1 week: review logs → tune thresholds
+   → Then: switch to ABORT (actually kill)
+   → Prevents accidentally killing legitimate long queries</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬────────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use                    │ Why                              │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Dashboard queries slow due to    │ SQA (Short Query       │ Bypasses queues entirely for     │
+│ queuing behind heavy queries     │ Acceleration)          │ short queries (&lt; 5 sec)          │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ ETL blocks dashboard queries     │ WLM queues with        │ Dashboard = HIGH priority        │
+│ during overlap                   │ priority               │ ETL = MEDIUM → dashboards first  │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ 9 AM burst: 40 queries when      │ Concurrency Scaling    │ Auto-adds clusters for overflow  │
+│ capacity is 15                   │                        │ 1 hour/day free                  │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ One heavy query kills everyone   │ QMR (Query Monitoring  │ Auto-kill or hop runaway queries │
+│                                  │ Rules)                 │                                  │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Need to limit specific user's    │ WLM queue timeout +    │ Per-queue timeout prevents abuse │
+│ query runtime                    │ QMR rules              │                                  │
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Sustained high concurrency       │ Add nodes or move to   │ WLM manages contention but       │
+│ (50+ concurrent always)          │ Serverless (Proj 67)   │ can't create compute from nothing│
+├──────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Unpredictable workload patterns  │ Redshift Serverless    │ Auto-scales RPU based on demand  │
+│ (spiky, variable)                │ (Project 67)           │ No WLM configuration needed      │
+└──────────────────────────────────┴────────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│         REDSHIFT WLM — INTERNAL MECHANICS                                        │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  QUERY LIFECYCLE WITH WLM:                                                       │
+│  ═════════════════════════                                                       │
+│                                                                                  │
+│  1. QUERY ARRIVES                                                                │
+│     → Client sends SQL to Leader Node                                            │
+│     → Leader identifies: user, user group, query group (if SET)                  │
+│                                                                                  │
+│  2. SQA CHECK (if enabled)                                                       │
+│     → Leader predicts query runtime using ML model                               │
+│     → Model trained on cluster's historical query patterns                       │
+│     → If predicted runtime &lt; SQA threshold (default 5 sec):                      │
+│       → Query BYPASSES all WLM queues                                            │
+│       → Executes immediately in dedicated SQA pool                               │
+│       → Dashboard queries (0.2s) → instant execution                             │
+│     → If predicted runtime &gt;= threshold:                                         │
+│       → Proceeds to WLM routing                                                 │
+│                                                                                  │
+│  ┌────────────────────────────────────────────────────────────────┐               │
+│  │ SQA DECISION:                                                  │               │
+│  │                                                                │               │
+│  │ Query: SELECT category, SUM(revenue)                           │               │
+│  │        FROM fact_orders WHERE order_date &gt; '2025-01-01'        │               │
+│  │        GROUP BY category                                       │               │
+│  │                                                                │               │
+│  │ ML Model checks:                                               │               │
+│  │ → Table size: 45M rows                                         │               │
+│  │ → SORTKEY on order_date: zone maps → scan ~2M rows             │               │
+│  │ → GROUP BY on 8 categories: tiny aggregation                   │               │
+│  │ → Historical similar queries: 0.3s average                     │               │
+│  │ → PREDICTION: 0.4 seconds → SQA ELIGIBLE ✅                    │               │
+│  │ → BYPASS queues → execute immediately                          │               │
+│  │                                                                │               │
+│  │ Query: SELECT * FROM fact_orders GROUP BY customer_city         │               │
+│  │                                                                │               │
+│  │ ML Model checks:                                               │               │
+│  │ → Full table scan (no SORTKEY filter): 45M rows                │               │
+│  │ → GROUP BY 500+ cities: heavy aggregation                      │               │
+│  │ → PREDICTION: 12 seconds → NOT SQA ELIGIBLE ❌                 │               │
+│  │ → Route to WLM queue                                           │               │
+│  └────────────────────────────────────────────────────────────────┘               │
+│                                                                                  │
+│  3. WLM QUEUE ROUTING                                                            │
+│     → WLM checks user group membership                                           │
+│     → Routes to matching queue:                                                  │
+│                                                                                  │
+│     ┌──────────────────────────────────────────────────────────┐                  │
+│     │ User: tableau_svc → Group: dashboard_users               │                  │
+│     │ → Matches Queue 1 (Dashboard) → route to Queue 1         │                  │
+│     │                                                          │                  │
+│     │ User: glue_loader → Group: etl_users                     │                  │
+│     │ → Matches Queue 2 (ETL) → route to Queue 2               │                  │
+│     │                                                          │                  │
+│     │ User: analyst_jane → Group: adhoc_users                  │                  │
+│     │ → Matches Queue 3 (Ad-hoc) → route to Queue 3            │                  │
+│     │                                                          │                  │
+│     │ User: admin → Group: maintenance_users                   │                  │
+│     │ → Matches Queue 4 (Maintenance) → route to Queue 4       │                  │
+│     │                                                          │                  │
+│     │ User: unknown → No group match                           │                  │
+│     │ → Route to DEFAULT queue (Queue 5)                        │                  │
+│     └──────────────────────────────────────────────────────────┘                  │
+│                                                                                  │
+│  4. QUEUE ADMISSION                                                              │
+│     → Queue has current slot count (Automatic WLM manages this)                  │
+│     → If slot available: query starts executing immediately                      │
+│     → If no slot: query WAITS in queue                                           │
+│     → Wait time depends on priority:                                             │
+│                                                                                  │
+│     ┌──────────────────────────────────────────────────────────┐                  │
+│     │ PRIORITY SCHEDULING:                                     │                  │
+│     │                                                          │                  │
+│     │ HIGH priority query arrives → preempts resource          │                  │
+│     │ allocation from LOWER priority queues                    │                  │
+│     │                                                          │                  │
+│     │ Dashboard (HIGH) waiting + ETL (MEDIUM) running:         │                  │
+│     │ → Redshift reduces ETL memory allocation                 │                  │
+│     │ → Frees resources for dashboard query                    │                  │
+│     │ → Dashboard starts → ETL slows down (but doesn't stop)  │                  │
+│     │                                                          │                  │
+│     │ This is NOT preemptive killing — it's resource sharing   │                  │
+│     │ Lower priority queries get less CPU/memory, not killed   │                  │
+│     └──────────────────────────────────────────────────────────┘                  │
+│                                                                                  │
+│  5. CONCURRENCY SCALING (for burst overflow)                                     │
+│     → Queue 1 (Dashboard) has 15 slots, all occupied                             │
+│     → 16th dashboard query arrives → no slot available                           │
+│     → Concurrency Scaling ENABLED on Queue 1:                                    │
+│       → Redshift spins up TRANSIENT cluster (same node type)                     │
+│       → Takes 30-60 seconds to provision                                         │
+│       → Overflow queries routed to transient cluster                             │
+│       → Transient cluster auto-terminates when queue drains                      │
+│     → Billing: per-second at same rate as main cluster                           │
+│     → FREE: 1 hour/day of concurrency scaling per cluster                        │
+│                                                                                  │
+│  6. QUERY MONITORING RULES (during execution)                                    │
+│     → Rules evaluated CONTINUOUSLY during query execution                        │
+│     → If rule triggers:                                                          │
+│       → LOG: record violation in system table (no action)                        │
+│       → HOP: move query to different queue (lower priority)                      │
+│       → ABORT: kill the query immediately                                        │
+│                                                                                  │
+│     ┌──────────────────────────────────────────────────────────┐                  │
+│     │ Example QMR rule: "Kill runaway scans"                   │                  │
+│     │                                                          │                  │
+│     │ Rule: IF scan_row_count &gt; 1,000,000,000 THEN ABORT      │                  │
+│     │                                                          │                  │
+│     │ Query: SELECT * FROM fact_orders CROSS JOIN dim_customers │                  │
+│     │ → Accidental cross join: 45M × 2M = 90 TRILLION rows    │                  │
+│     │ → After scanning 1 billion rows → QMR triggers           │                  │
+│     │ → Query ABORTED → resources freed                        │                  │
+│     │ → User sees: "Query aborted by QMR rule"                 │                  │
+│     │ → Without QMR: query runs for 6 hours, blocks everything │                  │
+│     └──────────────────────────────────────────────────────────┘                  │
+│                                                                                  │
+│  AUTOMATIC vs MANUAL WLM:                                                        │
+│  ═════════════════════════                                                       │
+│  ┌─────────────────┬──────────────────────┬──────────────────────┐               │
+│  │                 │ Manual WLM           │ Automatic WLM        │               │
+│  ├─────────────────┼──────────────────────┼──────────────────────┤               │
+│  │ Slot count      │ YOU set (fixed)      │ Redshift manages     │               │
+│  │ Memory per slot │ YOU set (fixed %)    │ Redshift manages     │               │
+│  │ Concurrency     │ Fixed per queue      │ Dynamic per queue    │               │
+│  │ Priority        │ Not supported        │ Supported (HIGH/     │               │
+│  │                 │                      │ MEDIUM/LOW/etc.)     │               │
+│  │ SQA             │ Separate config      │ Integrated           │               │
+│  │ Complexity      │ High (tune manually) │ Low (set priorities) │               │
+│  │ Recommended     │ Legacy only          │ YES — default        │               │
+│  └─────────────────┴──────────────────────┴──────────────────────┘               │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "WLM configured but queries still go to default queue"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: User not added to the correct Redshift group
+→ WLM routes by user GROUP, not individual user
+→ Fix: ALTER GROUP dashboard_users ADD USER tableau_svc;
+→ Verify: SELECT * FROM pg_group WHERE groname = 'dashboard_users';
+
+PITFALL 2: "Concurrency Scaling enabled but not activating"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: Concurrency Scaling not enabled on the specific queue
+→ Cause B: Query type not eligible (DDL, COPY not eligible)
+→ Cause C: Free credits exhausted and billing not enabled
+→ Fix: Verify queue has concurrency_scaling_mode = 'auto'
+→ Check: svl_query_summary → look for concurrency_scaling flag
+
+PITFALL 3: "SQA not accelerating dashboard queries"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Queries predicted as &gt; 5 seconds (SQA threshold)
+→ This happens when: table statistics are stale
+→ Stale stats → model overestimates query time → not SQA eligible
+→ Fix: Run ANALYZE (Project 39) → fresh stats → better SQA predictions
+
+PITFALL 4: "QMR kills legitimate long-running query"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: QMR threshold too aggressive
+→ Analyst's complex but valid query exceeds row scan limit
+→ Fix: Start with LOG action (observe for 1 week)
+→ Then: tune thresholds based on observed patterns
+→ For specific users: put in separate queue with higher limits
+
+PITFALL 5: "ETL queue starved — nightly load takes 3x longer"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Dashboard queue has HIGH priority → ETL gets minimum resources
+→ During business hours: dashboards consume 90% of resources
+→ ETL runs at 2 AM but overruns into 9 AM → gets deprioritized
+→ Fix: Schedule ETL to finish before 8 AM (buffer time)
+→ Fix: Give ETL queue MEDIUM priority (not LOW)
+→ Fix: Set dashboard queue to reduce priority outside business hours
+
+PITFALL 6: "Cluster parameter change requires reboot"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ WLM changes via parameter group require cluster reboot
+→ Reboot = 5-10 minutes downtime
+→ Fix: Use dynamic WLM properties (JSON) that apply without reboot
+→ Most WLM queue changes are dynamic (no reboot)
+→ SQA enable/disable requires reboot</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WLM QUEUE SIZING GUIDE:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+┌──────────────────┬───────────────┬───────────────┬───────────────┐
+│ Queue            │ 2-node cluster│ 4-node cluster│ 8-node cluster│
+├──────────────────┼───────────────┼───────────────┼───────────────┤
+│ Dashboard (HIGH) │ 8-15 slots    │ 15-25 slots   │ 25-50 slots   │
+│ ETL (MEDIUM)     │ 2-3 slots     │ 3-5 slots     │ 5-8 slots     │
+│ Ad-hoc (LOW)     │ 3-5 slots     │ 5-8 slots     │ 8-15 slots    │
+│ Maintenance      │ 1 slot        │ 1-2 slots     │ 2-3 slots     │
+└──────────────────┴───────────────┴───────────────┴───────────────┘
+→ Automatic WLM manages exact numbers dynamically
+→ These are guidelines for priority weight allocation
+
+CONCURRENCY SCALING COST:
+→ 1 hour/day FREE per cluster (covers morning rush)
+→ Additional: $0.25 per transient cluster per second
+→ Typical morning burst: 15 minutes → $0 (within free hour)
+→ If burst exceeds 1 hour: ~$13.50/hour additional
+→ Monthly estimate: $0-$50 depending on burst patterns
+
+WHEN TO ADD NODES vs WLM:
+→ Average utilization &lt; 60%: WLM is sufficient
+→ Average utilization 60-80%: WLM + Concurrency Scaling
+→ Average utilization &gt; 80% sustained: add nodes
+→ Spiky (&lt; 30% average, &gt; 90% peak): Concurrency Scaling
+→ Unpredictable: consider Redshift Serverless (Project 67)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(40)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Configure WLM (Generate SQL)</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE SETUP AND EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. Configure WLM:                                                       │
+│    $ python 40_01_configure_wlm.py                                      │
+│    → Generates SQL + applies parameter group changes                    │
+│    → Run user group SQL on Redshift                                     │
+│                                                                         │
+│ 2. Reboot cluster for SQA (schedule maintenance window):                │
+│    $ aws redshift reboot-cluster --cluster-identifier quickcart-dwh     │
+│    → Takes 5-10 minutes                                                 │
+│    → Schedule during off-peak (Sunday 3 AM)                             │
+│                                                                         │
+│ 3. Update ETL scripts to use query groups:                              │
+│    → Glue loader: SET query_group TO 'etl' before COPY                  │
+│    → Maintenance: SET query_group TO 'maintenance' before VACUUM        │
+│    → Tableau: automatically routed by user group membership             │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ WHAT HAPPENS NOW (daily flow)                                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 2:00 AM — ETL runs (NORMAL priority):                                   │
+│ → Pipeline: MariaDB → Bronze → Silver → Redshift                       │
+│ → ETL queue: 3 concurrent slots, NORMAL priority                        │
+│ → No contention — cluster idle at 2 AM                                  │
+│                                                                         │
+│ 2:50 AM — Maintenance runs (LOWEST priority):                           │
+│ → VACUUM DELETE ONLY, ANALYZE                                           │
+│ → Maintenance queue: 1 slot, LOWEST priority                            │
+│ → No contention — cluster still idle                                    │
+│                                                                         │
+│ 9:00 AM — Morning dashboard rush:                                       │
+│ → 40 queries hit cluster simultaneously                                 │
+│ → SQA: 30 queries predicted &lt; 5s → BYPASS queues → instant ⚡          │
+│ → Remaining 10 queries → Dashboard queue (HIGHEST priority)             │
+│ → Concurrency Scaling: extra cluster spins up for overflow              │
+│ → ALL dashboard queries complete in &lt; 3 seconds                         │
+│                                                                         │
+│ 9:15 AM — ETL overrun (if pipeline was late):                           │
+│ → ETL still running (NORMAL priority)                                   │
+│ → Dashboard queries arrive (HIGHEST priority)                           │
+│ → Redshift reduces ETL resources → gives to dashboards                  │
+│ → Dashboards: 0.3-0.5s (unaffected)                                    │
+│ → ETL: slightly slower but still running                                │
+│                                                                         │
+│ 11:00 AM — Heavy ad-hoc query:                                          │
+│ → Analyst runs full table GROUP BY (LOW priority)                       │
+│ → QMR monitors: scan_row_count approaching 1 billion                    │
+│ → If cross-join detected → QMR ABORTS query                            │
+│ → If legitimate but slow → runs at LOW priority                         │
+│ → Dashboard queries: UNAFFECTED (HIGHEST priority)                      │
+│                                                                         │
+│ 2:00 PM — Tableau auto-refresh burst:                                   │
+│ → 50 queries burst                                                      │
+│ → SQA handles most → instant                                            │
+│ → Concurrency Scaling handles overflow → extra cluster                  │
+│ → Normal analysts: UNAFFECTED                                           │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ BEFORE vs AFTER COMPARISON                                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ ┌──────────────────────────────┬──────────────┬──────────────┐          │
+│ │ Scenario                     │ Before WLM   │ After WLM    │          │
+│ ├──────────────────────────────┼──────────────┼──────────────┤          │
+│ │ 9 AM dashboard (40 queries)  │ 30-60 sec    │ 0.3-3 sec    │          │
+│ │ Dashboard during ETL         │ 30+ sec      │ 0.3-0.5 sec  │          │
+│ │ Heavy ad-hoc query impact    │ Blocks all   │ No impact    │          │
+│ │ Tableau auto-refresh         │ 3 min chaos  │ Seamless     │          │
+│ │ Runaway cross-join           │ 6 hour block │ Auto-killed  │          │
+│ │ CEO's dashboard in meeting   │ 12 sec wait  │ 0.5 sec      │          │
+│ └──────────────────────────────┴──────────────┴──────────────┘          │
+│                                                                         │
+│ CEO's reaction: "It just works now." ✅                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ WLM separates workloads into priority queues (dashboard &gt; ETL &gt; ad-hoc)
+→ SQA bypasses all queues for short queries (&lt; 5s predicted) — biggest win
+→ Concurrency Scaling auto-adds clusters for burst traffic (1 hr/day free)
+→ QMR auto-kills runaway queries (cross-joins, billion-row scans)
+→ Automatic WLM is recommended — Redshift manages slots/memory dynamically
+→ User GROUPS drive routing — must assign every user to correct group
+→ Query GROUPS enable dynamic routing from scripts (SET query_group)
+→ Priority doesn't kill lower-priority queries — reduces their resources
+→ ANALYZE freshness affects SQA accuracy — stale stats → wrong predictions
+→ Start QMR with LOG action → observe 1 week → then switch to ABORT
+→ Dashboard queue + Concurrency Scaling = handles any burst size
+→ ETL should ALWAYS finish before business hours to avoid contention
+→ Monitor: queue wait times, SQA hit rate, QMR violations, scaling cost
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 10: Redshift cluster (where WLM runs)
+→ Project 32: ETL loading (competes with dashboards)
+→ Project 38: Spectrum queries (routed through same WLM)
+→ Project 39: VACUUM/ANALYZE (maintenance queue)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 41: Event-driven pipeline triggers — avoid ETL overrun
+   (start pipeline earlier or on-demand → less overlap with business hours)
+→ Project 49: Redshift Stored Procedures — encapsulate maintenance
+   (wrap VACUUM + ANALYZE + SET query_group in procedure)
+→ Project 52: EC2 Auto Scaling — scale workers based on SQS queue
+   (similar concept: auto-scale compute for variable demand)
+→ Project 63: Redshift Materialized Views — reduce query load
+   (pre-computed results → fewer queries hit main cluster)
+→ Project 67: Redshift Serverless — auto-managed WLM
+   (serverless handles concurrency automatically → no WLM config)
+→ Project 69: Cost optimization — right-size cluster with WLM data
+   (WLM metrics show actual utilization → informed sizing decisions)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's Redshift is now well-governed:
+</span>→ Dashboards always fast (SQA + HIGHEST priority)
+→ ETL isolated from analysts (separate queue)
+→ Runaway queries auto-killed (QMR)
+→ Burst traffic handled (Concurrency Scaling)
+→ CEO's dashboard: 0.5 seconds in meetings ✅
+
+The entire pipeline is now automated and optimized:
+→ MariaDB → Bronze → Silver → Redshift (Project 35 Workflow)
+→ Gold CTAS (Project 36) → Views (Project 37)
+→ Spectrum (Project 38) → Optimized tables (Project 39)
+→ WLM (Project 40)
+
+BUT: The pipeline still runs on a FIXED SCHEDULE (2 AM cron).
+Partner data arrives at RANDOM times during the day.
+File lands at 11:30 AM → next processing: 2:00 AM tomorrow.
+That's 14.5 hours of delay.
+
+Business team: "When a partner sends us data, we need it
+in our dashboards within 30 MINUTES, not 14 hours."
+
+CTO: "Can we trigger the pipeline the INSTANT a file lands in S3?"
+
+→ Project 41: "File Arrival Auto-Triggers Entire ETL Without Human Intervention"
+→ Introduces: S3 Event Notifications → EventBridge → Step Functions,
+              Event-Driven Architecture, Replace Cron with Events,
+              Glue Job Start API, Dynamic Pipeline Triggering</code></pre></div>
+<hr>
+</div>
+</div>
+
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-39.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 40 of 80</span>
+    <span class="nav-project-title">MULTIPLE TEAMS COMPETE FOR REDSHIFT RESOURCES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-41.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-41.html") window.location = "project-41.html";
+  if (e.key === 'ArrowLeft' && "project-39.html") window.location = "project-39.html";
+});
+</script>
+</body>
+</html>

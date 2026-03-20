@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 13: BUFFER INCOMING MESSAGES SO NO DATA IS LOST — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:16%"></div></div>
+<div id="progress-label">16%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 13 of 80</div>
+  <div class="project-title">BUFFER INCOMING MESSAGES SO NO DATA IS LOST</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — SNS notifications working (Project 12)
+</span>Situation:
+→ Multiple data sources now feed into the QuickCart data platform
+→ Each source generates "processing requests" that need to be handled
+
+SCENARIO — THE 3 AM FLOOD:
+→ 2:00 AM: Marketing uploads 200 campaign CSV files to S3
+→ 2:01 AM: S3 event notifications fire via SNS (Project 12 pattern)
+→ 2:01 AM: EC2 processing script receives notifications
+→ Problem: EC2 script can process 1 file every 30 seconds
+→ 200 files × 30 seconds = 100 minutes needed
+→ But SNS delivers ALL 200 notifications in &lt; 5 seconds
+→ EC2 script picks up the FIRST notification, processes it
+→ The other 199 notifications? GONE. SNS already delivered them.
+→ Nobody was listening when they arrived.
+
+MONDAY MORNING:
+→ Analyst: "Where are the 200 campaign files? I only see 1 loaded."
+→ You: "SNS delivered 200 notifications but our processor was busy 
+   with the first one. The other 199 were lost."
+→ CTO: "We need a BUFFER. Something that HOLDS messages until 
+   the processor is ready for them."
+
+SECOND SCENARIO — ORDER OF OPERATIONS:
+→ Order system sends: "Order Created" → "Payment Received" → "Shipped"
+→ All 3 events arrive within 1 second
+→ If processor handles "Shipped" before "Order Created":
+   → Tries to update order that doesn't exist yet
+   → Processing fails silently
+→ CTO: "Some events MUST be processed in ORDER."
+
+THIRD SCENARIO — POISON MESSAGE:
+→ One malformed CSV file causes the processor to crash
+→ Processor restarts, picks up same file, crashes again
+→ Infinite crash loop — nothing else gets processed
+→ CTO: "If a message keeps failing, QUARANTINE it. 
+   Don't let one bad message kill the entire pipeline."
+
+REQUIREMENTS:
+→ Hold messages until consumer is ready (buffering)
+→ Don't lose messages if consumer is temporarily down
+→ Optionally guarantee message ORDER (FIFO)
+→ Quarantine repeatedly failing messages (Dead Letter Queue)
+→ Scale: handle bursts of 1000s of messages
+→ Cost: pay only for what you use</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the fundamental problem
+</span>→ SNS is PUSH-based: delivers immediately, doesn't wait
+→ If subscriber is busy/down: message is lost (for HTTP endpoints)
+→ Need: PULL-based system where consumer reads at its own pace
+→ This is a MESSAGE QUEUE
+
+Step 2: Understand SQS basics
+→ Producer SENDS messages to queue
+→ Messages PERSIST in queue until consumed (up to 14 days)
+→ Consumer POLLS queue for messages
+→ Consumer PROCESSES message
+→ Consumer DELETES message from queue (acknowledgment)
+→ If consumer crashes: message becomes VISIBLE again (retry)
+
+Step 3: Choose Standard vs FIFO
+→ Standard Queue:
+   → Nearly unlimited throughput
+   → At-least-once delivery (may deliver duplicates)
+   → Best-effort ordering (mostly in order, no guarantee)
+→ FIFO Queue:
+   → Exactly-once processing
+   → Strict ordering within message groups
+   → 300 messages/second (3000 with batching)
+   → Name must end with ".fifo"
+
+Step 4: Design for QuickCart
+→ File processing queue: Standard (order doesn't matter, need throughput)
+→ Order events queue: FIFO (must process in sequence per order)
+→ Dead Letter Queue: catches repeatedly failing messages</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QUEUE ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────────────┐
+  │                      PRODUCERS                               │
+  │                                                              │
+  │  S3 Events    │  Pipeline Scripts  │  Order System  │  SNS  │
+  │  (Project 17) │  (Project 28)      │  (future)      │ (P12) │
+  └──────┬────────┴────────┬───────────┴──────┬─────────┴──┬────┘
+         │                 │                  │            │
+         ▼                 ▼                  ▼            ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │                      AMAZON SQS                              │
+  │                                                              │
+  │  ┌──────────────────────────┐  ┌──────────────────────────┐ │
+  │  │ Queue: file-processing   │  │ Queue: order-events.fifo │ │
+  │  │ Type: STANDARD           │  │ Type: FIFO               │ │
+  │  │                          │  │                           │ │
+  │  │ → At-least-once delivery │  │ → Exactly-once delivery  │ │
+  │  │ → Unlimited throughput   │  │ → Ordered per group      │ │
+  │  │ → Visibility: 300s       │  │ → Visibility: 300s       │ │
+  │  │ → Retention: 7 days      │  │ → Retention: 7 days      │ │
+  │  │ → Max msg: 256 KB        │  │ → Max msg: 256 KB        │ │
+  │  │                          │  │                           │ │
+  │  │ DLQ: file-processing-dlq │  │ DLQ: order-events-dlq    │ │
+  │  │ Max receives: 3          │  │ Max receives: 3           │ │
+  │  └──────────┬───────────────┘  └──────────┬────────────────┘ │
+  │             │                              │                  │
+  │             ▼                              ▼                  │
+  │  ┌──────────────────────────┐  ┌──────────────────────────┐ │
+  │  │ DLQ: file-processing-dlq│  │ DLQ: order-events-dlq    │ │
+  │  │ Poison messages land here│  │ .fifo                    │ │
+  │  │ Manual review required   │  │ Failed order events      │ │
+  │  │ Retention: 14 days       │  │ Retention: 14 days       │ │
+  │  └──────────────────────────┘  └──────────────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
+         │                              │
+         ▼                              ▼
+  ┌──────────────────┐          ┌──────────────────┐
+  │ EC2 Consumer     │          │ EC2 Consumer      │
+  │ (long polling)   │          │ (long polling)     │
+  │ Processes files  │          │ Processes events   │
+  │ Deletes on done  │          │ Deletes on done    │
+  └──────────────────┘          └──────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: SQS Standard Queue
+</span>→ Nearly unlimited throughput (thousands of msg/sec)
+→ At-least-once delivery (consumer must handle duplicates)
+→ Best-effort ordering (mostly in order)
+→ Best for: file processing, batch jobs, fan-out consumption
+
+Option B: SQS FIFO Queue
+→ 300 msg/sec (3000 with batching)
+→ Exactly-once processing (deduplication built in)
+→ Strict ordering within message groups
+→ Best for: order events, financial transactions, state machines
+
+Option C: Amazon Kinesis Data Streams
+→ Real-time streaming (sub-second latency)
+→ Multiple consumers read same stream
+→ 7-day retention, replay from any point
+→ Best for: real-time analytics, log aggregation
+→ Overkill for QuickCart's batch-oriented needs
+
+Option D: Amazon MQ (managed RabbitMQ/ActiveMQ)
+→ Full-featured message broker
+→ AMQP, MQTT, STOMP protocols
+→ Best for: migrating from on-prem message brokers
+→ More complex than SQS
+
+DECISION:
+→ Standard Queue for file processing (throughput matters)
+→ FIFO Queue for order events (ordering matters)
+→ DLQ for both (quarantine poison messages)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create Dead Letter Queue BEFORE main queue
+</span>   → DLQ must exist when main queue references it
+   → Set maxReceiveCount = 3 (message fails 3 times → moves to DLQ)
+   → Set DLQ retention to 14 days (maximum — gives time to investigate)
+
+2. Set visibility timeout based on processing time
+   → If processor takes 30 seconds: set visibility to 5× = 150 seconds
+   → WHY: if processor crashes at 29 seconds, message becomes visible 
+     again at 150 seconds — another consumer picks it up
+   → Too short: message becomes visible while still being processed → duplicate
+   → Too long: message stuck invisible after crash → delayed retry
+
+3. Use LONG POLLING (WaitTimeSeconds = 20)
+   → Short polling: returns immediately (even if queue empty) — wastes API calls
+   → Long polling: waits up to 20 seconds for messages — saves money
+   → Max: 20 seconds per ReceiveMessage call
+   → Reduces API calls by 90%+ for low-volume queues
+
+4. ALWAYS delete message after successful processing
+   → receive_message → process → delete_message
+   → If you don't delete: message becomes visible again after visibility timeout
+   → Consumer processes it AGAIN → duplicate processing
+
+5. Use message attributes for metadata
+   → file_type: "csv" | "parquet"
+   → source: "marketing" | "sales"
+   → Consumers can filter or route based on attributes
+   → Don't put metadata in message body — harder to parse
+
+6. Set message retention based on business need
+   → Default: 4 days
+   → Max: 14 days
+   → If not consumed in 14 days: message permanently deleted
+   → QuickCart: 7 days (enough time to fix issues)
+
+7. Enable server-side encryption (SSE-SQS)
+   → Messages encrypted at rest
+   → Transparent to producers/consumers
+   → Free with SQS-managed keys
+   → Or use KMS for customer-managed keys
+
+8. Monitor queue depth with CloudWatch
+   → ApproximateNumberOfMessagesVisible = backlog
+   → ApproximateNumberOfMessagesNotVisible = in-flight
+   → ApproximateAgeOfOldestMessage = how long oldest message waiting
+   → Alarm when backlog exceeds threshold (Project 54)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use short polling in production
+</span>   → Short polling: returns immediately even if empty
+   → Empty receives still count as API calls ($0.40/million)
+   → 10 consumers × 1 poll/second × 86400 seconds = 864,000 calls/day
+   → Long polling: same scenario = ~43,200 calls/day (20x reduction)
+
+2. DO NOT set visibility timeout shorter than processing time
+   → Message becomes visible while still being processed
+   → Another consumer picks it up → duplicate processing
+   → Rule: visibility = 5× expected processing time
+
+3. DO NOT forget to delete messages after processing
+   → Undeleted message becomes visible again after timeout
+   → Consumer processes it again → infinite reprocessing loop
+   → Wastes compute, creates duplicate data
+
+4. DO NOT use SQS as a database
+   → SQS is a transit system — messages are meant to be consumed and deleted
+   → Don't store messages permanently — use S3 or DynamoDB
+   → Max retention: 14 days — messages auto-delete after
+
+5. DO NOT put large payloads in SQS messages
+   → Max message size: 256 KB
+   → For larger data: put data in S3, send S3 key in SQS message
+   → Pattern: {"s3_bucket": "quickcart", "s3_key": "path/to/file.csv"}
+   → SQS Extended Client Library handles this automatically
+
+6. DO NOT create FIFO queues when ordering isn't required
+   → FIFO: 300 msg/sec limit (3000 with batching)
+   → Standard: nearly unlimited
+   → FIFO costs 25% more than Standard
+   → Only use FIFO when ORDER or EXACTLY-ONCE truly matters
+
+7. DO NOT ignore Dead Letter Queue messages
+   → DLQ messages = processing failures that need investigation
+   → Set CloudWatch alarm on DLQ depth &gt; 0
+   → Review DLQ daily — fix root cause, reprocess if needed
+
+8. DO NOT process messages in batches larger than 10
+   → ReceiveMessage max: 10 messages per call
+   → DeleteMessageBatch max: 10 per call
+   → AWS hard limit — can't change</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                         │ Use              │ Why                                  │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Decouple producer from consumer  │ SQS Standard     │ Producer sends, consumer reads       │
+│ (different speeds)               │ (This Project)   │ at own pace — no data loss           │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Messages must be processed in    │ SQS FIFO         │ Strict ordering within message       │
+│ exact order                      │ (This Project)   │ groups, exactly-once delivery         │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Quarantine failing messages      │ SQS Dead Letter  │ After N failures, message moves      │
+│                                  │ Queue            │ to DLQ for manual review             │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Push notification to humans      │ SNS              │ Email/SMS delivery — humans don't    │
+│ (email, SMS)                     │ (Project 12)     │ poll queues                          │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ One event → multiple consumers   │ SNS → SQS        │ SNS fans out to multiple SQS queues  │
+│                                  │ (Project 14)     │ Each consumer has own queue           │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Real-time streaming (sub-second) │ Kinesis          │ Multiple consumers, replay, real-time │
+│                                  │ (Project 72)     │ analytics                            │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────────┤
+│ Complex event routing rules      │ EventBridge      │ Content-based filtering and routing   │
+│                                  │ (Project 66)     │                                      │
+└──────────────────────────────────┴──────────────────┴──────────────────────────────────────┘
+
+KEY DECISION MATRIX:
+                        Standard SQS    FIFO SQS      Kinesis
+─────────────────────   ────────────    ────────      ───────
+Throughput              Unlimited       300-3000/sec  1MB/sec/shard
+Ordering                Best-effort     Guaranteed    Per-shard
+Delivery                At-least-once   Exactly-once  At-least-once
+Retention               14 days max     14 days max   7 days (365 max)
+Multiple consumers      No (1 read=gone) No          Yes (fan-out)
+Replay                  No              No            Yes
+Cost model              Per request     Per request   Per shard-hour</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE SQS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need real-time streaming with sub-second latency
+</span>   → SQS long polling adds up to 20 seconds delay
+   → Use: Kinesis Data Streams (millisecond latency)
+
+2. When multiple consumers need to read the SAME message
+   → SQS: once a message is read and deleted, it's gone
+   → Use: SNS fan-out to multiple SQS queues (Project 14)
+   → Use: Kinesis (multiple consumers read same stream)
+
+3. When you need to replay historical messages
+   → SQS: consumed messages are deleted, no replay
+   → Use: Kinesis (replay from any point in retention window)
+   → Use: S3 + Athena (query historical event data)
+
+4. When you need pub/sub with human subscribers
+   → SQS: consumers must poll programmatically
+   → Humans don't poll queues — they read email
+   → Use: SNS for human notifications (Project 12)
+
+5. When message size exceeds 256 KB
+   → SQS max: 256 KB per message
+   → Use: SQS Extended Client (stores payload in S3, sends reference)
+   → Or: put data in S3, send S3 key as message
+
+6. When you need request/response pattern
+   → SQS is one-way: producer → queue → consumer
+   → No built-in response channel
+   → Use: API Gateway + Lambda for synchronous request/response</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                    SQS INTERNAL ARCHITECTURE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  1. MESSAGE LIFECYCLE                                                       │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Producer                    SQS                         Consumer           │
+│  ────────                    ───                         ────────           │
+│      │                        │                             │               │
+│  1.  │── send_message() ────&gt;│                             │               │
+│      │                        │  Store message on          │               │
+│      │  Response: MessageId   │  redundant servers         │               │
+│      │&lt;──────────────────────│  (3 AZs minimum)           │               │
+│      │                        │                             │               │
+│      │                        │  Message state: VISIBLE     │               │
+│      │                        │                             │               │
+│  2.  │                        │&lt;── receive_message() ──────│               │
+│      │                        │                             │               │
+│      │                        │  Message state: INVISIBLE   │               │
+│      │                        │  (visibility timeout starts)│               │
+│      │                        │                             │               │
+│      │                        │  Response: Message +        │               │
+│      │                        │  ReceiptHandle ────────────&gt;│               │
+│      │                        │                             │               │
+│  3.  │                        │                             │ Process msg   │
+│      │                        │                             │ (30 seconds)  │
+│      │                        │                             │               │
+│  4.  │                        │&lt;── delete_message() ───────│               │
+│      │                        │    (ReceiptHandle)          │               │
+│      │                        │                             │               │
+│      │                        │  Message PERMANENTLY        │               │
+│      │                        │  DELETED from queue         │               │
+│      │                        │                             │               │
+│                                                                             │
+│  IF CONSUMER CRASHES (no delete_message):                                   │
+│      │                        │                             │               │
+│  3b. │                        │  Visibility timeout expires │  (crashed)    │
+│      │                        │  Message state: VISIBLE     │               │
+│      │                        │  (available for another     │               │
+│      │                        │   consumer to pick up)      │               │
+│      │                        │                             │               │
+│  4b. │                        │&lt;── receive_message() ──────│  (new/same    │
+│      │                        │                             │   consumer)   │
+│      │                        │  ReceiveCount incremented   │               │
+│      │                        │  (was 1, now 2)             │               │
+│                                                                             │
+│  IF ReceiveCount &gt;= maxReceiveCount (DLQ configured):                       │
+│      │                        │                             │               │
+│  5.  │                        │  Message MOVED to DLQ       │               │
+│      │                        │  (Dead Letter Queue)        │               │
+│      │                        │  Original message deleted   │               │
+│      │                        │  from main queue            │               │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  2. VISIBILITY TIMEOUT — THE CRITICAL CONCEPT                               │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Timeline for a message with VisibilityTimeout = 120 seconds:               │
+│                                                                             │
+│  T=0s    Producer sends message                                             │
+│  T=10s   Consumer A receives message                                        │
+│          → Message becomes INVISIBLE for 120 seconds                        │
+│          → No other consumer can see it                                     │
+│  T=40s   Consumer A finishes processing                                     │
+│          → Consumer A calls delete_message                                  │
+│          → Message permanently gone ✅                                      │
+│                                                                             │
+│  CRASH SCENARIO:                                                            │
+│  T=0s    Producer sends message                                             │
+│  T=10s   Consumer A receives message                                        │
+│          → Message becomes INVISIBLE for 120 seconds                        │
+│  T=25s   Consumer A CRASHES (no delete_message called)                      │
+│  T=130s  Visibility timeout expires (10 + 120 = 130)                        │
+│          → Message becomes VISIBLE again                                    │
+│  T=135s  Consumer B receives message (ReceiveCount = 2)                     │
+│          → Consumer B processes and deletes ✅                              │
+│                                                                             │
+│  VISIBILITY TIMEOUT TOO SHORT:                                              │
+│  T=0s    Producer sends message                                             │
+│  T=10s   Consumer A receives message (timeout = 30s)                        │
+│  T=40s   Visibility timeout expires (10 + 30 = 40)                          │
+│          → Message becomes VISIBLE again                                    │
+│  T=41s   Consumer B receives SAME message                                   │
+│  T=45s   Consumer A finishes, calls delete — succeeds                       │
+│  T=50s   Consumer B finishes, calls delete — already deleted                │
+│          → BOTH consumers processed the SAME message = DUPLICATE ❌         │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  3. STANDARD vs FIFO — INTERNAL DIFFERENCES                                 │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  STANDARD QUEUE:                                                            │
+│  ┌──────────────────────────────────────────────────────┐                  │
+│  │  Distributed across multiple servers                  │                  │
+│  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐        │                  │
+│  │  │Server A│ │Server B│ │Server C│ │Server D│        │                  │
+│  │  │msg 1   │ │msg 2   │ │msg 3   │ │msg 4   │        │                  │
+│  │  │msg 5   │ │msg 6   │ │msg 7   │ │msg 8   │        │                  │
+│  │  └────────┘ └────────┘ └────────┘ └────────┘        │                  │
+│  │                                                       │                  │
+│  │  receive_message() picks from ANY server              │                  │
+│  │  → Might get msg 3 before msg 1 (best-effort order)  │                  │
+│  │  → Might get msg 1 twice (at-least-once delivery)    │                  │
+│  │  → Nearly UNLIMITED throughput (servers scale)        │                  │
+│  └──────────────────────────────────────────────────────┘                  │
+│                                                                             │
+│  FIFO QUEUE:                                                                │
+│  ┌──────────────────────────────────────────────────────┐                  │
+│  │  Ordered log per MessageGroupId                       │                  │
+│  │                                                       │                  │
+│  │  Group "order-001": [msg1, msg2, msg3] → in order    │                  │
+│  │  Group "order-002": [msg4, msg5]       → in order    │                  │
+│  │  Group "order-003": [msg6]             → in order    │                  │
+│  │                                                       │                  │
+│  │  Messages within SAME group: strictly ordered         │                  │
+│  │  Messages across groups: processed in parallel        │                  │
+│  │                                                       │                  │
+│  │  Deduplication:                                       │                  │
+│  │  → Content-based: SHA-256 hash of message body        │                  │
+│  │  → Or: explicit MessageDeduplicationId                │                  │
+│  │  → Dedup window: 5 minutes                            │                  │
+│  │  → Same message within 5 min = silently ignored       │                  │
+│  │                                                       │                  │
+│  │  Throughput: 300 msg/sec (3000 with batching)         │                  │
+│  │  → Single group: 300 msg/sec sequential               │                  │
+│  │  → Multiple groups: up to 300 × N groups in parallel  │                  │
+│  └──────────────────────────────────────────────────────┘                  │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  4. LONG POLLING vs SHORT POLLING                                           │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  SHORT POLLING (WaitTimeSeconds = 0, default):                              │
+│  → SQS checks a SUBSET of servers                                           │
+│  → Returns immediately (even if empty)                                      │
+│  → May miss messages on unchecked servers                                   │
+│  → Results in many empty responses = wasted API calls                       │
+│                                                                             │
+│  LONG POLLING (WaitTimeSeconds = 1-20):                                     │
+│  → SQS checks ALL servers                                                   │
+│  → Waits up to WaitTimeSeconds for messages to arrive                      │
+│  → Returns as soon as at least 1 message found                             │
+│  → Returns empty only after full wait with no messages                     │
+│  → Reduces empty responses by 90%+                                         │
+│  → ALWAYS use long polling in production                                   │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  5. DEAD LETTER QUEUE — QUARANTINE MECHANICS                                │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Main Queue ──── RedrivePolicy ────→ DLQ                                   │
+│  {                                                                          │
+│    "deadLetterTargetArn": "arn:aws:sqs:...:file-processing-dlq",           │
+│    "maxReceiveCount": 3                                                     │
+│  }                                                                          │
+│                                                                             │
+│  Message journey:                                                           │
+│  1. Consumer receives message (ReceiveCount = 1) → crashes                 │
+│  2. Visibility timeout expires → message visible again                     │
+│  3. Consumer receives message (ReceiveCount = 2) → crashes                 │
+│  4. Visibility timeout expires → message visible again                     │
+│  5. Consumer receives message (ReceiveCount = 3) → crashes                 │
+│  6. ReceiveCount (3) &gt;= maxReceiveCount (3)                                │
+│  7. SQS MOVES message to DLQ automatically                                │
+│  8. Message removed from main queue                                        │
+│  9. Other messages continue processing normally                            │
+│                                                                             │
+│  DLQ message retains:                                                       │
+│  → Original message body and attributes                                    │
+│  → Original MessageId                                                       │
+│  → New ReceiptHandle (for DLQ operations)                                  │
+│  → Retention timer resets (based on DLQ retention setting)                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Messages are processed twice"
+</span>→ Cause: visibility timeout too short for processing time
+→ Fix: set visibility timeout = 5× average processing time
+→ Also: make consumer IDEMPOTENT (processing same message twice = same result)
+→ Pattern: check "already processed" flag in database before processing
+
+PITFALL 2: "Messages stuck in queue — consumer not receiving"
+→ Cause #1: visibility timeout too long — messages invisible from previous crash
+→ Debug: check ApproximateNumberOfMessagesNotVisible (in-flight count)
+→ Cause #2: consumer polling wrong queue URL
+→ Debug: verify queue URL matches exactly
+
+PITFALL 3: "DLQ fills up but nobody notices"
+→ Cause: no monitoring on DLQ
+→ Fix: CloudWatch alarm on DLQ ApproximateNumberOfMessagesVisible &gt; 0
+→ Alert via SNS (Project 12) when poison messages appear
+
+PITFALL 4: "FIFO queue throughput is too low"
+→ Cause: all messages in ONE message group → sequential processing
+→ Fix: use meaningful MessageGroupId (e.g., order_id, customer_id)
+→ Different groups process in PARALLEL
+→ 100 groups × 300 msg/sec = 30,000 msg/sec effective throughput
+
+PITFALL 5: "Consumer deletes message but processing actually failed"
+→ Cause: delete_message called BEFORE processing completes
+→ Pattern: receive → process → delete (in that order, ALWAYS)
+→ Never: receive → delete → process
+
+PITFALL 6: "Queue retention expired — messages lost"
+→ Cause: messages sat in queue for &gt; retention period (default 4 days)
+→ Consumer was down for a week — messages auto-deleted
+→ Fix: set retention to 14 days for critical queues
+→ Fix: alarm on ApproximateAgeOfOldestMessage &gt; threshold
+
+PITFALL 7: "Message body is truncated"
+→ Cause: message exceeds 256 KB limit
+→ send_message silently truncates? No — it returns error
+→ Fix: use SQS Extended Client (stores in S3) for large messages
+→ Or: send reference (S3 key) instead of actual data</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>THROUGHPUT:
+</span>→ Standard Queue: nearly unlimited (tested at 100,000+ msg/sec)
+→ FIFO Queue: 300 msg/sec (3,000 with batching per API call)
+→ FIFO with multiple groups: 300 × N groups
+→ QuickCart: ~200 files/night = trivially within any limit
+
+CONSUMER SCALING:
+→ 1 consumer: processes messages sequentially
+→ 10 consumers: 10 messages processed in parallel
+→ 100 consumers: 100 in parallel (Standard queue)
+→ FIFO: one consumer PER message group for ordering guarantee
+→ Auto Scaling (Project 52): scale consumers based on queue depth
+
+MESSAGE SIZE:
+→ Max: 256 KB per message
+→ For larger payloads: SQS Extended Client Library
+   → Stores message body in S3
+   → Sends S3 reference as SQS message
+   → Consumer transparently retrieves from S3
+→ QuickCart: messages are references (S3 keys), not actual data — well under 256 KB
+
+COST:
+→ Standard: $0.40 per million requests (first 1M free/month)
+→ FIFO: $0.50 per million requests (first 1M free/month)
+→ Each request = send, receive, or delete
+→ Batch operations: 10 messages per request = 10x cost savings
+→ QuickCart: ~1000 messages/day = ~$0/month (free tier)
+
+RETENTION SCALING:
+→ Min: 60 seconds
+→ Default: 4 days
+→ Max: 14 days
+→ After retention: messages permanently auto-deleted
+→ No storage cost — included in per-request pricing</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY SQS IS WORKING:
+</span>
+1. Queue attributes:
+   → aws sqs get-queue-attributes --queue-url &lt;url&gt; --attribute-names All
+   → Check: ApproximateNumberOfMessages (backlog)
+   → Check: ApproximateNumberOfMessagesNotVisible (in-flight)
+   → Check: ApproximateNumberOfMessagesDelayed (delayed delivery)
+
+2. CloudWatch metrics:
+   → NumberOfMessagesSent: messages entering queue
+   → NumberOfMessagesReceived: messages read by consumers
+   → NumberOfMessagesDeleted: messages successfully processed
+   → ApproximateAgeOfOldestMessage: how long oldest message waiting
+   → SentMessageSize: average message size
+
+3. Send + receive test:
+   → Send test message → immediately receive → verify content → delete
+   → Round-trip should take &lt; 1 second
+
+4. DLQ monitoring:
+   → Check DLQ message count daily
+   → Any message in DLQ = something went wrong
+   → Read DLQ messages to understand failure patterns</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(13)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create SQS Queues with DLQ</h3>
+
+<h3>Step 2: Producer — Send Messages to Queue</h3>
+
+<h3>Step 3: Consumer — Poll, Process, Delete Messages</h3>
+
+<h3>Step 4: Dead Letter Queue Inspector</h3>
+
+<h3>Step 5: Queue Monitoring Dashboard</h3>
+
+<h3>Step 6: End-to-End Integration Test</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Prerequisites:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → boto3 installed (from Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS topics created (Project 12 — optional, for integration)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create all queues (Standard + FIFO + DLQs)</span><span>
+</span>python3 01_create_queues.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Send test messages (producer)</span><span>
+</span>python3 02_producer.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Consume messages (consumer)</span><span>
+</span><span>python3 03_consumer.py standard          </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Process file events</span><span>
+</span><span>python3 03_consumer.py fifo              </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Process order events</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Check DLQ for any failures</span><span>
+</span>python3 04_dlq_inspector.py stats standard
+<span>python3 04_dlq_inspector.py peek standard </span><span class="token" style="color: rgb(54, 172, 170);">5</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Monitor all queues</span><span>
+</span><span>python3 05_queue_monitor.py              </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># One-time check</span><span>
+</span><span>python3 05_queue_monitor.py </span><span class="token" style="color: rgb(57, 58, 52);">watch</span><span> </span><span class="token" style="color: rgb(54, 172, 170);">30</span><span>     </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Continuous (every 30s)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Run integration tests</span><span>
+</span>python3 06_integration_test.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. If DLQ has messages and root cause is fixed:</span><span>
+</span><span>python3 04_dlq_inspector.py redrive standard </span><span class="token" style="color: rgb(54, 172, 170);">10</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED INTEGRATION TEST OUTPUT:
+</span>
+=================================================================
+🧪 SQS INTEGRATION TEST
+   Time: 2025-07-15 10:30:45
+=================================================================
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 1: Send → Receive → Delete (Standard Queue)
+─────────────────────────────────────────────────────────────────
+   📤 Sent: abc123-def456-ghi789
+   📩 Received: correct message ✅
+   🗑️  Deleted: message removed from queue ✅
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 2: Visibility Timeout (message returns after timeout)
+─────────────────────────────────────────────────────────────────
+   📤 Sent test message
+   📩 Received (now invisible for 5 seconds)
+   ⏳ Waiting 7 seconds for visibility timeout to expire...
+   📩 Same message reappeared after timeout ✅
+   🗑️  Cleaned up
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 3: Batch Send (10 messages in 1 API call)
+─────────────────────────────────────────────────────────────────
+   📤 Batch sent: 10/10 succeeded ✅
+   🗑️  Cleaned up 10 messages
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 4: Message Attributes (metadata)
+─────────────────────────────────────────────────────────────────
+   📤 Sent message with 3 attributes
+   📩 Attributes received correctly:
+      source=marketing, priority=5, file_type=csv ✅
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 5: Queue Depth (verify all cleaned up)
+─────────────────────────────────────────────────────────────────
+   Queue depth: 0 (approximately empty) ✅
+
+=================================================================
+📊 INTEGRATION TEST RESULTS
+   Passed: 5/5
+   Failed: 0/5
+   🟢 ALL TESTS PASSED
+=================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SQS is a PULL-BASED message queue — consumers read at their own pace
+→ Messages PERSIST until consumed + deleted (up to 14 days)
+→ STANDARD Queue: unlimited throughput, at-least-once, best-effort ordering
+→ FIFO Queue: exactly-once, strict ordering per MessageGroupId, 300 msg/sec
+→ VISIBILITY TIMEOUT: hides message during processing
+   → Too short: duplicate processing
+   → Too long: delayed retry after crash
+   → Rule: 5× expected processing time
+→ LONG POLLING: WaitTimeSeconds=20 reduces API calls by 90%
+→ DEAD LETTER QUEUE: quarantines messages after N failures
+   → maxReceiveCount = 3: three strikes and you're out
+   → DLQ messages need manual investigation
+   → Redrive: move back to main queue after fixing root cause
+→ ALWAYS: receive → process → delete (in that order)
+→ NEVER: delete before processing completes
+
+SNS vs SQS — THE MENTAL MODEL:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ SNS = megaphone (shouts to everyone, doesn't wait)
+→ SQS = mailbox (holds messages until recipient picks up)
+→ SNS = push (immediate delivery, fire-and-forget)
+→ SQS = pull (consumer controls pace, guaranteed delivery)
+→ Together (Project 14): SNS fans out → multiple SQS queues buffer
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): messages reference S3 keys, not actual data
+→ Project 5 (EC2): consumers run on EC2 instances
+→ Project 12 (SNS): SNS pushes to humans, SQS buffers for machines
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 14 (SNS → SQS Fan-out): one event reaches multiple consumers
+→ Project 17 (S3 → SNS): file arrival triggers notification
+→ Project 18 (S3 → SQS): file arrival queues processing job
+→ Project 27 (EC2 polls SQS): continuous worker pattern
+→ Project 28 (End-to-end): S3 → SNS → SQS → EC2 → Notify
+→ Project 50 (DLQ patterns): advanced poison message handling
+→ Project 52 (Auto Scaling): scale EC2 workers based on queue depth
+→ Project 59 (Cross-account): Account A's SNS → Account B's SQS</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has both notification (SNS) and buffering (SQS) systems.
+</span>But they're separate — SNS sends to humans, SQS buffers for machines.
+
+The data team realizes a powerful pattern:
+"When a file lands in S3, we need to:
+ 1. Email the data team (human notification)
+ 2. Queue a processing job (machine processing)  
+ 3. Log the event for audit (compliance tracking)
+
+ That's ONE event → THREE consumers.
+ If we publish to SNS and subscribe SQS queues to the topic,
+ ONE publish delivers to ALL consumers simultaneously.
+ This is the FAN-OUT pattern."
+
+→ Project 14: "One Event Must Reach Multiple Consumers"
+→ Introduces: SNS → SQS Fan-out → Subscription → Raw Delivery
+→ Combines Project 12 (SNS) + Project 13 (SQS) into a unified pattern
+→ This becomes the foundation for event-driven architectures</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-12.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 13 of 80</span>
+    <span class="nav-project-title">BUFFER INCOMING MESSAGES SO NO DATA IS LOST</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-14.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-14.html") window.location = "project-14.html";
+  if (e.key === 'ArrowLeft' && "project-12.html") window.location = "project-12.html";
+});
+</script>
+</body>
+</html>

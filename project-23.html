@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 23: AUTO-DISCOVER SCHEMA OF CSVs SITTING IN S3 — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:29%"></div></div>
+<div id="progress-label">29%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 23 of 80</div>
+  <div class="project-title">AUTO-DISCOVER SCHEMA OF CSVs SITTING IN S3</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — data flowing in multiple directions now
+</span>Situation:
+→ S3 has accumulated files from multiple sources:
+   - Daily CSV exports from order system (Project 1)
+   - UNLOAD Parquet files from Redshift (Project 22)
+   - MariaDB table extracts as CSVs (Project 20)
+   - Partner data drops in various formats
+
+→ Current S3 structure:
+   s3://quickcart-raw-data-prod/
+    ├── daily_exports/
+    │    ├── orders/        (30 CSV files, ~50MB each)
+    │    ├── customers/     (30 CSV files, ~10MB each)
+    │    └── products/      (30 CSV files, ~2MB each)
+    ├── exports/
+    │    └── data_science/
+    │         └── orders_snapshot/  (4 Parquet files)
+    └── mariadb_extracts/
+         ├── users/         (CSV files)
+         └── transactions/  (CSV files)
+
+→ Analytics team wants to query ALL of this using Athena (Project 16)
+→ But Athena requires a Glue Data Catalog table definition
+→ In Project 15 we created catalog entries MANUALLY
+   → Specified each column name and data type by hand
+   → Works for 1 table — nightmare for 6+ tables with 50+ total columns
+
+→ Analyst says: "I have 6 different datasets across 3 S3 prefixes.
+   Each has different columns. Some are CSV, some Parquet.
+   I don't want to manually define schemas for all of them."
+
+CTO: "There must be an automated way to discover what's in these files."
+YOU: "Glue Crawler. Point it at S3 → it reads the files →
+      auto-discovers columns, data types, partitions, file format →
+      creates Glue Catalog tables automatically.
+      Athena can query within minutes — zero manual schema work."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the GAP between S3 and Athena
+</span>→ S3 stores raw bytes — it has NO concept of "columns" or "data types"
+→ Athena needs schema metadata to parse those bytes into queryable rows
+→ Glue Data Catalog is the metadata store (introduced in Project 15)
+→ In Project 15: we MANUALLY created catalog tables
+→ Problem: manual is error-prone and doesn't scale
+
+Step 2: Understand what a Glue Crawler does
+→ Crawler = automated schema discovery agent
+→ You tell it: "look at this S3 prefix"
+→ It reads file samples → infers:
+   - File format (CSV, Parquet, JSON, ORC, Avro)
+   - Column names and data types
+   - Partition structure (year=2025/month=01/)
+   - Number of rows (approximate)
+→ Creates/updates Glue Catalog tables with discovered schema
+
+Step 3: Plan the crawling strategy
+→ One crawler per dataset? Or one crawler for everything?
+→ Best practice: one crawler per S3 prefix with homogeneous data
+→ Why: mixing CSVs and Parquet in one crawler causes confusion
+→ QuickCart: 3 crawlers for daily_exports (orders, customers, products)
+   + 1 crawler for Parquet exports
+   + 1 crawler for MariaDB extracts
+
+Step 4: Understand Crawler output
+→ Crawler creates tables in a Glue Database (logical grouping)
+→ Table name derived from S3 prefix (e.g., "daily_exports_orders")
+→ Once table exists in catalog → Athena can query immediately
+→ Re-running crawler: UPDATES existing table if schema changed</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  S3: quickcart-raw-data-prod/
+   ├── daily_exports/orders/*.csv         ──┐
+   ├── daily_exports/customers/*.csv      ──┤
+   ├── daily_exports/products/*.csv       ──┤
+   ├── exports/data_science/*.parquet     ──┤
+   └── mariadb_extracts/users/*.csv       ──┘
+                                             │
+         Glue Crawlers scan each prefix      │
+                                             ▼
+   ┌─────────────────────────────────────────────────────┐
+   │              GLUE DATA CATALOG                      │
+   │                                                     │
+   │  Database: quickcart_datalake                       │
+   │   ├── Table: daily_exports_orders                   │
+   │   │    Columns: order_id(string), customer_id(      │
+   │   │    string), quantity(int), total_amount(double), │
+   │   │    status(string), order_date(string)           │
+   │   │    Format: CSV, Location: s3://.../orders/      │
+   │   │                                                 │
+   │   ├── Table: daily_exports_customers                │
+   │   │    Columns: customer_id(string), name(string),  │
+   │   │    email(string), city(string), tier(string)    │
+   │   │                                                 │
+   │   ├── Table: daily_exports_products                 │
+   │   │    Columns: product_id(string), name(string),   │
+   │   │    category(string), price(double)              │
+   │   │                                                 │
+   │   ├── Table: orders_snapshot (Parquet)              │
+   │   │    Columns: auto-discovered from Parquet schema │
+   │   │                                                 │
+   │   └── Table: mariadb_extracts_users                 │
+   │        Columns: auto-discovered from CSV            │
+   └─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │                     ATHENA                          │
+   │                                                     │
+   │  SELECT * FROM quickcart_datalake.daily_exports_    │
+   │  orders WHERE status = 'completed';                 │
+   │                                                     │
+   │  → Works immediately — no manual schema needed!     │
+   └─────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Manual Glue Catalog table creation (Project 15 approach)
+</span>→ CREATE EXTERNAL TABLE with all columns specified
+→ Works but tedious: 6 tables × 8-12 columns each = 60+ column definitions
+→ Error-prone: one typo = query fails
+→ Doesn't auto-update when source schema changes
+→ REJECTED for scale
+
+Option B: Glue Crawler (automated discovery)
+→ Point at S3 → auto-discovers everything
+→ Creates/updates catalog tables
+→ Handles CSV, Parquet, JSON, ORC, Avro
+→ Detects partitions automatically
+→ Scheduled or on-demand
+→ SELECTED ✅
+
+Option C: AWS CLI / boto3 manual catalog registration
+→ Programmatic version of Option A
+→ You write code to define schema
+→ More flexible but still requires knowing schema upfront
+→ Good for: when you KNOW the schema and want version control
+→ Used alongside crawlers (not replacement)
+
+Option D: Athena CREATE TABLE DDL
+→ Same as Project 15 — manual SQL
+→ Fine for one-off tables
+→ Doesn't auto-update
+
+DECISION: Option B — Glue Crawler for discovery
+→ Supplemented with Option C for tables needing precise control</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a DEDICATED Glue Database for the data lake
+</span>   → Logical grouping: all QuickCart tables in one database
+   → Name: quickcart_datalake (lowercase, underscores)
+   → Separate from any default database
+
+2. Create SEPARATE crawlers per data format/source
+   → Crawler 1: daily_exports/ CSVs
+   → Crawler 2: exports/data_science/ Parquet
+   → Crawler 3: mariadb_extracts/ CSVs
+   → WHY separate: each format needs different classifier settings
+   → Mixing formats in one crawler causes misclassification
+
+3. Set TABLE PREFIX on each crawler
+   → Prevents naming collisions
+   → Crawler for daily_exports/ → prefix "raw_"
+   → Creates: raw_orders, raw_customers, raw_products
+   → Without prefix: table names derived from S3 folder names only
+
+4. Configure SCHEMA CHANGE POLICY
+   → "Update table definition in catalog" — applies schema changes
+   → "Add new columns only" — never removes columns (safest)
+   → "Log" — just logs changes without modifying catalog
+   → Production: "Add new columns only" prevents accidental column deletion
+
+5. Configure CRAWLER RECRAWL POLICY
+   → "Crawl all folders" — re-scans everything (thorough but slow)
+   → "Crawl new folders only" — only new S3 prefixes (fast)
+   → "Event-based" — triggers on S3 events (most efficient)
+   → Start with "Crawl all folders" → optimize later
+
+6. Set appropriate IAM Role for crawler
+   → Needs: s3:GetObject, s3:ListBucket on target buckets
+   → Needs: glue:* for catalog operations
+   → Needs: logs:* for CloudWatch logging
+
+7. Run crawler ON-DEMAND first to validate
+   → Don't schedule until you verify output is correct
+   → Check created tables in Glue console
+   → Test with Athena query before scheduling</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT point ONE crawler at the entire bucket root
+</span>   → s3://quickcart-raw-data-prod/ as single target
+   → Crawler tries to merge CSVs + Parquets + manifests into one table
+   → Results: schema confusion, wrong data types, garbage tables
+   → Rule: one crawler target = one homogeneous data format
+
+2. DO NOT skip the table prefix
+   → Without prefix: crawler creates table named "orders"
+   → Another crawler also creates table named "orders"
+   → Second crawler OVERWRITES first table's schema
+   → With prefix: "raw_orders" vs "parquet_orders" — no collision
+
+3. DO NOT trust crawler data type inference blindly
+   → Crawler samples a SUBSET of files (not all)
+   → If first 1000 rows of "price" column are "9.99", "12.50"
+     → Crawler infers: DOUBLE
+   → But row 50,001 has "N/A"
+     → Athena query fails: "HIVE_BAD_DATA: Field price is not a valid DOUBLE"
+   → ALWAYS spot-check inferred types
+   → Override in catalog if needed
+
+4. DO NOT run crawler too frequently on unchanged data
+   → Each run costs time and API calls
+   → Daily data → daily crawler run (max)
+   → Hourly data → consider event-based crawling
+   → Unchanged data → on-demand only
+
+5. DO NOT let crawler create tables in the "default" database
+   → Default database is shared, messy, hard to manage
+   → Always specify a dedicated database
+   → Makes permissions, discovery, and cleanup easier
+
+6. DO NOT ignore crawler logs when tables look wrong
+   → CloudWatch Logs: /aws-glue/crawlers
+   → Shows: which files were read, what was inferred, errors
+   → Most schema issues are explained in these logs
+
+7. DO NOT use crawler for data with NO consistent schema
+   → Free-form JSON with varying keys per record
+   → CSVs where column count changes between files
+   → Crawler creates unusable tables with merged/conflicting columns
+   → Pre-process such data to standardize schema FIRST (Glue ETL — Project 25)
+
+8. DO NOT assume crawler handles HEADER detection perfectly for CSV
+   → Crawler may misinterpret first data row as header or vice versa
+   → Configure custom classifier to explicitly set "has header" behavior</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use               │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Discover schema of S3 files      │ Glue Crawler      │ Automated, handles multiple      │
+│ automatically                    │                   │ formats, creates catalog tables  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Schema is known and stable       │ Manual Catalog    │ Version-controlled, precise,     │
+│                                  │ (Project 15)      │ no inference errors              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Schema evolves frequently        │ Crawler +         │ Crawler detects changes,         │
+│                                  │ Schema Evolution  │ policy controls how to handle    │
+│                                  │ (Project 45)      │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Parquet files from UNLOAD        │ Glue Crawler      │ Parquet has embedded schema —    │
+│ (Project 22)                     │                   │ crawler reads it perfectly        │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ CSV files with consistent headers│ Glue Crawler +    │ Crawler discovers, classifier    │
+│                                  │ CSV Classifier    │ handles header detection          │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ JDBC source (MariaDB, Redshift)  │ JDBC Crawler      │ Crawler connects via JDBC,       │
+│                                  │ (Project 31)      │ reads table schemas              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ One-time exploration of new data │ Crawler ON-DEMAND │ Quick discovery, no schedule     │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Continuous ingestion pipeline    │ Crawler SCHEDULED │ Keeps catalog in sync with new   │
+│                                  │ or EVENT-BASED    │ data arrivals                    │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE CRAWLER</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When schema is 100% known and NEVER changes
+</span>   → Manual catalog definition is simpler and more precise
+   → Crawler adds unnecessary complexity for static schemas
+   → Example: dimension tables with fixed 5 columns
+
+2. When S3 prefix contains MIXED file formats
+   → CSVs + Parquets + JSONs in same prefix
+   → Crawler gets confused trying to merge schemas
+   → Separate by format first, then crawl each
+
+3. When files have NO consistent structure
+   → Log files with varying formats
+   → Free-form text files
+   → Crawler creates useless tables
+   → Pre-process with Glue ETL or Lambda first
+
+4. When you need REAL-TIME catalog updates
+   → Crawler takes 30-120 seconds minimum to run
+   → For sub-second catalog updates: use boto3 glue.create_table() directly
+   → Event-driven architecture: S3 event → Lambda → catalog update
+
+5. When you need COLUMN-LEVEL descriptions/comments
+   → Crawler discovers structure but NOT business meaning
+   → "col1: string" tells you nothing about what it represents
+   → Add descriptions manually via console or API after crawling
+
+6. When cost optimization is critical at extreme scale
+   → Crawler with 100,000+ files scans extensively
+   → Each scan = S3 GET requests ($0.0004 per 1000)
+   → 100K files × daily crawler = cost adds up
+   → Consider: crawl ONCE, then manage catalog programmatically</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                   GLUE CRAWLER — INTERNAL EXECUTION FLOW                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHASE 1: INITIALIZATION                                                    │
+│  ───────────────────────                                                    │
+│  1. Crawler service assumes the configured IAM Role                         │
+│  2. Reads crawler configuration:                                            │
+│     → S3 targets (one or more prefixes)                                     │
+│     → Database name (where to create tables)                                │
+│     → Table prefix                                                          │
+│     → Classifiers (built-in + custom)                                       │
+│     → Schema change policy                                                  │
+│     → Recrawl policy                                                        │
+│                                                                             │
+│  PHASE 2: S3 LISTING                                                        │
+│  ───────────────────                                                        │
+│  1. Crawler calls S3 LIST on each target prefix                             │
+│  2. Builds inventory of ALL files under each prefix                         │
+│  3. Groups files by:                                                        │
+│     → Common prefix (potential table boundary)                              │
+│     → File extension (.csv, .parquet, .json, .orc)                          │
+│     → Partition-like path patterns (year=2025/month=01/)                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  GROUPING EXAMPLE:                                              │        │
+│  │                                                                 │        │
+│  │  Input prefix: s3://bucket/daily_exports/                       │        │
+│  │                                                                 │        │
+│  │  Files found:                                                   │        │
+│  │   daily_exports/orders/orders_20250101.csv                      │        │
+│  │   daily_exports/orders/orders_20250102.csv                      │        │
+│  │   daily_exports/customers/customers_20250101.csv                │        │
+│  │   daily_exports/products/products_20250101.csv                  │        │
+│  │                                                                 │        │
+│  │  Crawler groups:                                                │        │
+│  │   Group 1: daily_exports/orders/     → TABLE: orders            │        │
+│  │   Group 2: daily_exports/customers/  → TABLE: customers         │        │
+│  │   Group 3: daily_exports/products/   → TABLE: products          │        │
+│  │                                                                 │        │
+│  │  One S3 prefix with consistent schema = ONE table               │        │
+│  │  Multiple sub-prefixes with different schemas = MULTIPLE tables  │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 3: CLASSIFICATION (Format Detection)                                 │
+│  ──────────────────────────────────────────                                  │
+│  1. For each file group, crawler reads SAMPLE bytes                         │
+│  2. Runs through CLASSIFIER CHAIN (ordered priority):                       │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  CLASSIFIER CHAIN:                                              │        │
+│  │                                                                 │        │
+│  │  Step 1: Custom classifiers (if any defined)                    │        │
+│  │     → User-defined Grok patterns, JSON paths, CSV settings      │        │
+│  │     → Checked FIRST — highest priority                          │        │
+│  │                                                                 │        │
+│  │  Step 2: Built-in classifiers (checked in order):               │        │
+│  │     → Parquet classifier: checks magic bytes "PAR1"             │        │
+│  │     → ORC classifier: checks magic bytes "ORC"                  │        │
+│  │     → Avro classifier: checks magic bytes "Obj\x01"            │        │
+│  │     → JSON classifier: tries to parse as JSON                   │        │
+│  │     → CSV classifier: detects delimiters, headers               │        │
+│  │     → XML classifier: checks for XML structure                  │        │
+│  │                                                                 │        │
+│  │  Step 3: First classifier that returns CERTAINTY &gt; threshold    │        │
+│  │     → Wins — that format is assigned to the file group          │        │
+│  │     → If no classifier matches → files marked as UNKNOWN        │        │
+│  │                                                                 │        │
+│  │  PARQUET ADVANTAGE:                                             │        │
+│  │  → Parquet files contain SCHEMA IN THE FILE FOOTER              │        │
+│  │  → Crawler reads footer → gets exact column names + types       │        │
+│  │  → Zero inference needed — 100% accurate                        │        │
+│  │                                                                 │        │
+│  │  CSV CHALLENGE:                                                 │        │
+│  │  → CSV has no embedded schema                                   │        │
+│  │  → Crawler must INFER: delimiter, header presence, data types   │        │
+│  │  → Reads first N rows → guesses types from values               │        │
+│  │  → "123" → bigint? string? depends on context                   │        │
+│  │  → "2025-01-15" → date? string? depends on classifier config    │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 4: SCHEMA INFERENCE                                                  │
+│  ─────────────────────────                                                  │
+│  1. For each file group + detected format:                                  │
+│  2. Crawler reads SAMPLE of data (not all files — too expensive)            │
+│     → For CSV: reads first ~1000 rows from first few files                  │
+│     → For Parquet: reads footer metadata (instant, no data scan)            │
+│  3. Infers column names:                                                    │
+│     → CSV with header: first row = column names                             │
+│     → CSV without header: generates col0, col1, col2...                     │
+│     → Parquet: reads schema from file metadata                              │
+│  4. Infers data types:                                                      │
+│     → Examines values in each column across sample                          │
+│     → All integers? → bigint                                                │
+│     → Mix of integers and decimals? → double                                │
+│     → Any non-numeric? → string                                             │
+│     → Looks like date? → string (conservative — CSV dates stay string)      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  TYPE INFERENCE HIERARCHY (for CSV):                            │        │
+│  │                                                                 │        │
+│  │  Most specific ──────────────────────────────→ Most general     │        │
+│  │  bigint → double → string                                      │        │
+│  │                                                                 │        │
+│  │  "123"      → bigint                                           │        │
+│  │  "123.45"   → double                                           │        │
+│  │  "hello"    → string                                           │        │
+│  │  "2025-01"  → string (crawler is conservative with dates)      │        │
+│  │  ""         → string (empty = could be anything)               │        │
+│  │                                                                 │        │
+│  │  If ANY value in a column is non-numeric → entire column = str  │        │
+│  │  This is the SAFE default — prevents query failures             │        │
+│  │  You can OVERRIDE types in catalog after crawling               │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 5: PARTITION DETECTION                                               │
+│  ────────────────────────────                                                │
+│  1. Crawler examines path structure for Hive-style patterns                 │
+│  2. Detects: key=value/ directories                                         │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  PARTITION DETECTION:                                           │        │
+│  │                                                                 │        │
+│  │  Path: s3://bucket/orders/order_date=2025-01-01/file.parquet   │        │
+│  │  → Detected partition column: order_date                        │        │
+│  │  → Partition value: 2025-01-01                                  │        │
+│  │  → Table gets partition column in schema                        │        │
+│  │                                                                 │        │
+│  │  Path: s3://bucket/orders/year=2025/month=01/day=01/file.csv   │        │
+│  │  → Detected partitions: year, month, day                        │        │
+│  │  → Three partition columns added to table schema                │        │
+│  │                                                                 │        │
+│  │  Path: s3://bucket/orders/2025/01/01/file.csv                  │        │
+│  │  → NO Hive-style keys                                          │        │
+│  │  → Crawler may detect as: partition_0=2025, partition_1=01...   │        │
+│  │  → Less clean — prefer Hive-style naming in your S3 layout     │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 6: CATALOG UPDATE                                                    │
+│  ───────────────────────                                                    │
+│  1. Crawler compares discovered schema with existing catalog                │
+│  2. Based on schema change policy:                                          │
+│     → NEW TABLE: creates table with discovered schema                       │
+│     → EXISTING TABLE, schema unchanged: no action                           │
+│     → EXISTING TABLE, new columns found:                                    │
+│        - "Update": replaces entire schema                                   │
+│        - "Add new columns only": appends new columns                        │
+│        - "Log": writes change to CloudWatch, no catalog change              │
+│     → EXISTING TABLE, columns removed from source:                          │
+│        - "Update": removes columns from catalog                             │
+│        - "Add new columns only": keeps old columns (safe)                   │
+│  3. Writes table metadata to Glue Data Catalog                              │
+│  4. Logs results to CloudWatch                                              │
+│                                                                             │
+│  PHASE 7: COMPLETION                                                        │
+│  ───────────────────                                                        │
+│  1. Crawler state changes to READY                                          │
+│  2. CloudWatch metrics updated (CrawlerRunTime, TablesCreated)              │
+│  3. EventBridge event emitted (can trigger downstream automation)           │
+│  4. Typical duration: 30 seconds to 15 minutes depending on file count      │
+│                                                                             │
+│  COST MODEL:                                                                │
+│  ───────────                                                                │
+│  → Crawler runtime billed per DPU-hour                                      │
+│  → Minimum 10 minutes billing per run                                       │
+│  → 1 DPU = $0.44/hour → minimum cost ~$0.073 per run                       │
+│  → S3 LIST + GET requests charged separately                                │
+│  → Parquet crawling is FASTER (schema in footer, no data scan)              │
+│  → CSV crawling is SLOWER (must read and parse data samples)                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Crawler created ONE table instead of THREE"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: all CSVs under one prefix have same column count
+→ Crawler merges: orders(8 cols) + customers(7 cols) → confused
+→ If column counts happen to match → merged into single table
+→ Fix: create SEPARATE crawlers for each sub-prefix
+   - Crawler 1 target: s3://bucket/daily_exports/orders/
+   - Crawler 2 target: s3://bucket/daily_exports/customers/
+   - Crawler 3 target: s3://bucket/daily_exports/products/
+
+PITFALL 2: "Column types are all STRING even for numeric data"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV has mixed values — even ONE non-numeric row makes entire column STRING
+→ Example: price column has "N/A" in row 500 → entire column → STRING
+→ Fix A: clean source data before crawling
+→ Fix B: manually update column type in Glue Catalog after crawling
+→ Fix C: use Parquet instead of CSV — types are embedded and exact
+
+PITFALL 3: "Crawler treats CSV header row as data"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: built-in CSV classifier failed to detect header
+→ Columns named: col0, col1, col2... instead of order_id, customer_id...
+→ Fix: create a CUSTOM CSV classifier with explicit header handling
+→ Set: "Has header: true" in custom classifier
+→ Attach custom classifier to crawler (higher priority than built-in)
+
+PITFALL 4: "Crawler runs for 30 minutes on 100 files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: "Crawl all folders" policy re-scans everything every time
+→ Fix: switch to "Crawl new folders only" after initial crawl
+→ Or: use event-based crawling (S3 event → triggers crawler)
+→ First run: always slow (initial discovery)
+→ Subsequent runs: should be fast if only new files added
+
+PITFALL 5: "Athena query returns 0 rows but table exists in catalog"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: table's S3 location points to wrong prefix
+→ Cause B: partitioned table but no partitions registered
+→ Debug A: check table's "Location" in Glue console → verify S3 path
+→ Debug B: run MSCK REPAIR TABLE in Athena to discover partitions
+→ Or: re-run crawler to pick up new partitions
+
+PITFALL 6: "Crawler creates duplicate tables on re-run"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: S3 path structure changed between runs
+→ Crawler sees new prefix pattern → creates new table
+→ Old table still exists → now have: orders AND orders_v2
+→ Fix: keep S3 structure stable, use schema change policy "Update"
+→ Clean up orphaned tables manually
+
+PITFALL 7: "Crawler IAM role access denied"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Role needs THREE sets of permissions:
+   1. S3: s3:GetObject, s3:ListBucket (read source data)
+   2. Glue: glue:* (create/update catalog)
+   3. Logs: logs:CreateLogGroup, logs:PutLogEvents (CloudWatch)
+→ Missing ANY of these → crawler fails
+→ Trust policy must allow: glue.amazonaws.com to assume role
+
+PITFALL 8: "Crawler inferred wrong delimiter for CSV"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: data contains commas inside quoted fields
+→ Crawler misdetects: pipe-delimited instead of comma
+→ Result: all data in one column
+→ Fix: custom CSV classifier with explicit delimiter = ","
+→ Set quote character = '"'</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FILE COUNT SCALING:
+</span>━━━━━━━━━━━━━━━━━━
+→ 10 files:     crawler runs in ~30 seconds
+→ 100 files:    crawler runs in ~1-2 minutes
+→ 1,000 files:  crawler runs in ~3-5 minutes
+→ 10,000 files: crawler runs in ~10-15 minutes
+→ 100,000 files: crawler runs in ~30-60 minutes (expensive!)
+
+COST SCALING:
+━━━━━━━━━━━━━
+→ Minimum: $0.073 per run (10-minute minimum billing)
+→ 1 run/day × 30 days = ~$2.19/month (trivial)
+→ 24 runs/day × 30 days = ~$52.56/month (hourly schedule)
+→ Optimize: use event-based triggers instead of schedules
+
+PARTITION SCALING:
+━━━━━━━━━━━━━━━━━━
+→ 365 partitions (daily for 1 year): crawler handles fine
+→ 8,760 partitions (hourly for 1 year): crawler slows down
+→ 100,000+ partitions: crawler becomes very slow
+→ Solution: Partition Projection (Project 26) — no crawling needed
+→ Athena computes partitions mathematically instead of scanning catalog
+
+MULTI-TABLE SCALING:
+━━━━━━━━━━━━━━━━━━━━
+→ 1 crawler can discover multiple tables from one prefix
+→ But mixing formats reduces accuracy
+→ Best practice: one crawler per homogeneous data source
+→ 10 data sources = 10 crawlers (manageable)
+→ 100 data sources = consider programmatic catalog management
+
+OPTIMIZATION TIPS:
+━━━━━━━━━━━━━━━━━━
+→ Use Parquet over CSV — crawling is 10x faster (no data sampling)
+→ Use "Crawl new folders only" after initial crawl
+→ Use event-based triggers (S3 → EventBridge → crawler)
+→ Group related tables under same crawler (same format, same source)
+→ Use Partition Projection for high-cardinality partitions</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CRAWLER WORKED CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Glue Console verification:
+   → AWS Console → Glue → Databases → quickcart_datalake
+   → Check: tables listed with correct names
+   → Click each table: verify columns, types, S3 location
+
+2. CLI verification:
+   → aws glue get-tables --database-name quickcart_datalake
+   → Shows all tables with full schema
+
+3. Athena verification (most important):
+   → SELECT * FROM quickcart_datalake.raw_orders LIMIT 10;
+   → If this works → crawler did its job
+   → If error → check table schema vs actual file content
+
+4. CloudWatch Logs:
+   → Log group: /aws-glue/crawlers
+   → Shows: files scanned, tables created/updated, errors
+   → Most useful for debugging "why did crawler create wrong schema"
+
+5. Crawler metrics:
+   → CloudWatch → Metrics → Glue → Crawler
+   → CrawlerRunTime, TablesCreated, TablesUpdated, TablesDeleted
+   → Set alarms on TablesDeleted &gt; 0 (unexpected table removal)
+
+6. Catalog API verification:
+   → boto3: glue.get_table(DatabaseName=..., Name=...)
+   → Returns full schema: columns, types, S3 location, partition keys
+   → Compare with expected schema</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(23)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create IAM Role for Glue Crawler</h3>
+
+<h3>Step 2: Create Glue Database</h3>
+
+<h3>Step 3: Create Custom CSV Classifier</h3>
+
+<h3>Step 4: Create and Run Glue Crawlers</h3>
+
+<h3>Step 5: Verify Discovered Tables</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+📋 TABLES IN DATABASE: quickcart_datalake
+======================================================================
+   Found 4 table(s)
+
+──────────────────────────────────────────────────────────────────────
+📊 TABLE: curated_orders_snapshot
+──────────────────────────────────────────────────────────────────────
+   Description:    N/A
+   Created:        2025-01-30 03:15:42
+   Updated:        2025-01-30 03:15:42
+   S3 Location:    s3://quickcart-raw-data-prod/exports/data_science/orders_snapshot/
+   Format:         PARQUET
+   SerDe:          org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+
+   📋 Columns (12):
+   Name                           Type            Comment
+   ────────────────────────────── ─────────────── ────────────────────
+   order_id                       string
+   customer_id                    string
+   product_id                     string
+   quantity                       int
+   unit_price                     double
+   total_amount                   double
+   status                         string
+   order_date                     date
+   day_of_week                    int
+   month_num                      int
+   is_completed                   int
+   is_high_value                  int
+
+   🔑 Partition Keys: None (non-partitioned)
+
+   📊 Statistics:
+   Records:      10000000
+   Avg Row Size: 82 bytes
+   Total Size:   209715200 bytes
+   Classification: parquet
+
+──────────────────────────────────────────────────────────────────────
+📊 TABLE: raw_customers
+──────────────────────────────────────────────────────────────────────
+   Description:    N/A
+   Created:        2025-01-30 03:14:18
+   Updated:        2025-01-30 03:14:18
+   S3 Location:    s3://quickcart-raw-data-prod/daily_exports/customers/
+   Format:         CSV
+   SerDe:          org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+   📋 Columns (7):
+   Name                           Type            Comment
+   ────────────────────────────── ─────────────── ────────────────────
+   customer_id                    string
+   name                           string
+   email                          string
+   city                           string
+   state                          string
+   tier                           string
+   signup_date                    string
+
+   🔑 Partition Keys: None (non-partitioned)
+
+   📊 Statistics:
+   Records:      1500000
+   Avg Row Size: 65 bytes
+   Total Size:   314572800 bytes
+   Classification: csv
+
+──────────────────────────────────────────────────────────────────────
+📊 TABLE: raw_orders
+──────────────────────────────────────────────────────────────────────
+   Description:    N/A
+   Created:        2025-01-30 03:13:55
+   Updated:        2025-01-30 03:13:55
+   S3 Location:    s3://quickcart-raw-data-prod/daily_exports/orders/
+   Format:         CSV
+   SerDe:          org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+   📋 Columns (8):
+   Name                           Type            Comment
+   ────────────────────────────── ─────────────── ────────────────────
+   order_id                       string
+   customer_id                    string
+   product_id                     string
+   quantity                       bigint
+   unit_price                     double
+   total_amount                   double
+   status                         string
+   order_date                     string
+
+   🔑 Partition Keys: None (non-partitioned)
+
+   📊 Statistics:
+   Records:      10000000
+   Avg Row Size: 85 bytes
+   Total Size:   1572864000 bytes
+   Classification: csv
+
+──────────────────────────────────────────────────────────────────────
+📊 TABLE: raw_products
+──────────────────────────────────────────────────────────────────────
+   Description:    N/A
+   Created:        2025-01-30 03:14:35
+   Updated:        2025-01-30 03:14:35
+   S3 Location:    s3://quickcart-raw-data-prod/daily_exports/products/
+   Format:         CSV
+   SerDe:          org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+
+   📋 Columns (6):
+   Name                           Type            Comment
+   ────────────────────────────── ─────────────── ────────────────────
+   product_id                     string
+   name                           string
+   category                       string
+   price                          double
+   stock_quantity                  bigint
+   is_active                      string
+
+   🔑 Partition Keys: None (non-partitioned)
+
+   📊 Statistics:
+   Records:      150000
+   Avg Row Size: 55 bytes
+   Total Size:   62914560 bytes
+   Classification: csv
+
+
+📋 ATHENA PREVIEW QUERIES
+   Copy-paste these into Athena query editor:
+
+-- Preview: curated_orders_snapshot
+SELECT * FROM quickcart_datalake.curated_orders_snapshot LIMIT 10;
+SELECT COUNT(*) as row_count FROM quickcart_datalake.curated_orders_snapshot;
+
+-- Preview: raw_customers
+SELECT * FROM quickcart_datalake.raw_customers LIMIT 10;
+SELECT COUNT(*) as row_count FROM quickcart_datalake.raw_customers;
+
+-- Preview: raw_orders
+SELECT * FROM quickcart_datalake.raw_orders LIMIT 10;
+SELECT COUNT(*) as row_count FROM quickcart_datalake.raw_orders;
+
+-- Preview: raw_products
+SELECT * FROM quickcart_datalake.raw_products LIMIT 10;
+SELECT COUNT(*) as row_count FROM quickcart_datalake.raw_products;</code></pre></div>
+<hr>
+<h3>Step 6: Update Crawler-Inferred Data Types (Post-Crawl Fix)</h3>
+
+<h3>Step 7: Schedule Crawler for Recurring Runs</h3>
+
+<h3>Step 8: Crawler Monitoring and Alerting</h3>
+
+<h3>Step 9: Test with Athena Queries</h3>
+
+<h3>Step 10: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket with CSV files (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 with Parquet files from UNLOAD (Project 22)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Athena configured with output location (Project 16)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create IAM role for Glue Crawler</span><span>
+</span>python 01_create_crawler_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create Glue Database</span><span>
+</span>python 02_create_glue_database.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create custom CSV classifier</span><span>
+</span>python 03_create_csv_classifier.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Create and run all crawlers</span><span>
+</span>python 04_create_and_run_crawlers.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Verify discovered tables</span><span>
+</span>python 05_verify_discovered_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Fix column types where crawler inferred wrong</span><span>
+</span>python 06_fix_column_types.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Schedule crawlers for daily runs</span><span>
+</span>python 07_schedule_crawler.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Monitor crawler health</span><span>
+</span>python 08_monitor_crawlers.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 9. Test in Athena</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Run 09_test_athena_queries.sql in Athena query editor</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue Crawler automates schema discovery from S3 files
+→ It reads file samples → infers format, columns, types, partitions
+→ Creates/updates Glue Catalog tables — Athena can query immediately
+→ Parquet crawling is FAST and ACCURATE (schema in file footer)
+→ CSV crawling is SLOWER and LESS ACCURATE (requires inference)
+→ Custom classifiers fix CSV header/delimiter detection issues
+→ ALWAYS verify and fix inferred types after crawling
+→ One crawler per homogeneous data source — never mix formats
+→ Table prefix prevents naming collisions between crawlers
+→ Schema change policy controls how catalog evolves with data
+→ Schedule crawlers AFTER data arrives (stagger timing)
+→ Monitor with CloudWatch + SNS alerts for failures
+
+CRAWLER ACCURACY BY FORMAT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Parquet:  99% accurate (embedded schema)
+→ ORC:     99% accurate (embedded schema)
+→ Avro:    99% accurate (embedded schema)
+→ JSON:    85% accurate (infers from values)
+→ CSV:     70% accurate (guesses delimiter, types, header)
+→ Lesson:  use Parquet whenever possible (Project 25 converts CSV → Parquet)
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 files that crawler discovers
+→ Project 12: SNS alerts when crawler fails
+→ Project 15: Manual catalog creation (now automated by crawler)
+→ Project 16: Athena needs catalog tables (crawler creates them)
+→ Project 22: UNLOAD Parquet files that crawler catalogs perfectly
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 24: Athena queries the tables crawler just created
+→ Project 25: Glue ETL converts CSVs to Parquet (better for crawling)
+→ Project 26: Partition pruning on crawler-discovered partitions
+→ Project 35: Chain Crawler → ETL → Crawler as orchestrated workflow
+→ Project 45: Schema evolution when source columns change</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ S3 files (CSV + Parquet) ✅
+→ Glue Catalog tables auto-discovered by crawlers ✅
+→ Schema metadata available for query engines ✅
+
+Analyst opens Athena and runs:
+  SELECT * FROM quickcart_datalake.raw_orders LIMIT 10;
+  → Works! 🎉
+
+Then runs a real analytics query:
+  SELECT status, COUNT(*), SUM(total_amount)
+  FROM quickcart_datalake.raw_orders
+  GROUP BY status;
+  → Works! But...
+  → "Data scanned: 1.5 GB"
+  → Cost: $0.0075 per query
+  → 200 queries/day = $1.50/day = $45/month just for one table
+
+Analyst asks: "Can we make these queries cheaper and faster?"
+CTO: "We're paying to scan 1.5 GB when we only need 2 columns?"
+YOU: "Two solutions:
+      1. Athena with better query patterns (column selection, filtering)
+      2. Convert CSV to Parquet — Athena reads only needed columns
+      
+      The Parquet table scanned only 50 MB for the same query.
+      That's 30x cheaper. Let me show you how to query efficiently."
+
+→ Project 24: "Analysts Want to SQL-Query S3 Data Without Redshift Cost"
+→ Introduces: Athena query patterns → Cost control → Workgroups
+→ Uses the catalog tables created by crawlers in this project</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-22.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 23 of 80</span>
+    <span class="nav-project-title">AUTO-DISCOVER SCHEMA OF CSVs SITTING IN S3</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-24.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-24.html") window.location = "project-24.html";
+  if (e.key === 'ArrowLeft' && "project-22.html") window.location = "project-22.html";
+});
+</script>
+</body>
+</html>

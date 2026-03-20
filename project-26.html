@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 26: SLASH ATHENA QUERY COST BY 90% WITH PARTITIONING — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:32%"></div></div>
+<div id="progress-label">32%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 26 of 80</div>
+  <div class="project-title">SLASH ATHENA QUERY COST BY 90% WITH PARTITIONING</div>
+  <div class="project-tags"><span class="project-tag">Athena</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — silver Parquet layer now in place (Project 25)
+</span>Situation:
+→ CSV → Parquet conversion cut query cost by 30x (Project 25) ✅
+→ But analysts still see unnecessary data scanning:
+
+   Query: SELECT * FROM silver_orders WHERE order_date = DATE '2025-01-15'
+   Expected scan: ~7 MB (one day out of 30)
+   Actual scan:   200 MB (entire Parquet dataset)
+   
+   WHY? All 30 days of data are MIXED across 4 Parquet files
+   → Athena must open every file → check row group stats → read matching rows
+   → Row group statistics help skip SOME chunks but not entire files
+   → For date-filtered queries: 97% of data scanned is WASTED
+
+→ Analyst workflow patterns:
+   - 60% of queries filter by order_date (last 7 days, specific date)
+   - 20% of queries filter by status
+   - 20% are full table scans (monthly reports)
+
+→ Cost projection WITHOUT partitioning:
+   9,000 queries/month × average 50 MB scan = 450 GB/month
+   450 GB × $0.005/GB = $2.25/month (already good from Parquet)
+
+→ Cost projection WITH date partitioning:
+   5,400 date-filtered queries × 7 MB scan = 37.8 GB
+   1,800 status-filtered queries × 50 MB scan = 90 GB
+   1,800 full-scan queries × 200 MB scan = 360 GB
+   Total: 487.8 GB → BUT date-filtered dropped from 270 GB to 37.8 GB
+   Savings: ~$1.16/month (47% reduction on already-cheap Parquet)
+
+→ At SCALE (1 year of data, 10x more analysts):
+   WITHOUT partitioning: 200 MB → 2.4 GB per query (12 months data)
+   WITH partitioning: still 7 MB per query (one day's folder)
+   → Partitioning savings GROW as data grows
+   → After 1 year: 340x cost reduction vs unpartitioned
+
+CTO: "As data grows, won't our Athena costs grow linearly?"
+YOU: "Not with partitioning. Athena only scans the folders it needs.
+      1 day query scans 7 MB whether you have 30 days or 3 years of data.
+      It's the difference between searching one filing cabinet drawer
+      vs dumping the entire cabinet on the floor."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHAT partitioning means
+</span>→ Physical organization of data into folders by column value
+→ S3 layout: s3://bucket/table/partition_col=value/files.parquet
+→ Each unique partition value gets its own S3 "folder" (prefix)
+→ Athena reads ONLY folders matching WHERE clause filters
+→ Folders not matching = never opened = zero cost
+
+Step 2: Understand HOW partitioning saves money
+→ Without: 4 Parquet files contain ALL dates mixed
+   Query WHERE date='2025-01-15' → opens ALL 4 files → scans 200 MB
+→ With: 30 folders, each containing one day's Parquet files
+   Query WHERE date='2025-01-15' → opens ONLY that folder → scans 7 MB
+→ Data not in the matching folder is NEVER read from S3
+
+Step 3: Choose the RIGHT partition key
+→ Must be a column frequently used in WHERE clauses
+→ Must have MODERATE cardinality (not too few, not too many)
+→ Too few partitions (2-3): minimal benefit
+→ Too many partitions (1M+): S3 listing overhead, Glue Catalog bloat
+→ Sweet spot: 100-10,000 partitions
+→ For QuickCart: order_date (365 values/year) = perfect
+
+Step 4: Choose the partitioning METHOD
+→ Method A: Hive-style partitions with MSCK REPAIR TABLE
+   → Crawler or manual partition registration
+   → Each partition stored in Glue Catalog
+   → Works universally but requires catalog management
+→ Method B: Partition Projection
+   → Athena computes partitions MATHEMATICALLY
+   → No catalog entries needed for each partition
+   → Faster, no crawler needed, no MSCK REPAIR
+   → Recommended for date-based partitioning
+→ BOTH methods produce same query cost savings
+→ Difference is in MANAGEMENT overhead
+
+Step 5: Modify Glue ETL job to write partitioned output
+→ Add partitionKeys=["order_date"] to write options
+→ Output structure changes from flat to date-organized
+→ Re-run conversion for all historical data
+→ Update catalog table definition with partition info</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  BEFORE (Project 25 — unpartitioned):
+  ─────────────────────────────────────
+  s3://bucket/silver/orders/
+   ├── part-00000.snappy.parquet    (contains ALL dates mixed)
+   ├── part-00001.snappy.parquet    (contains ALL dates mixed)
+   ├── part-00002.snappy.parquet    (contains ALL dates mixed)
+   └── part-00003.snappy.parquet    (contains ALL dates mixed)
+
+  Query: WHERE order_date = '2025-01-15'
+  → Opens ALL 4 files → scans 200 MB → finds ~333K matching rows
+
+
+  AFTER (this project — partitioned):
+  ────────────────────────────────────
+  s3://bucket/silver_partitioned/orders/
+   ├── order_date=2025-01-01/
+   │    └── part-00000.snappy.parquet    (~7 MB, 333K rows)
+   ├── order_date=2025-01-02/
+   │    └── part-00000.snappy.parquet    (~7 MB, 333K rows)
+   ├── order_date=2025-01-03/
+   │    └── part-00000.snappy.parquet
+   │    ...
+   ├── order_date=2025-01-15/
+   │    └── part-00000.snappy.parquet    ← ONLY THIS SCANNED
+   │    ...
+   └── order_date=2025-01-30/
+        └── part-00000.snappy.parquet
+
+  Query: WHERE order_date = '2025-01-15'
+  → Opens ONLY order_date=2025-01-15/ folder → scans 7 MB
+  → 29 other folders NEVER touched → zero cost
+
+  COST COMPARISON (single date-filtered query):
+  ┌────────────────────────────┬──────────┬───────────┐
+  │ Format                     │ Scanned  │ Cost      │
+  ├────────────────────────────┼──────────┼───────────┤
+  │ CSV unpartitioned          │ 1,500 MB │ $0.007500 │
+  │ Parquet unpartitioned      │   200 MB │ $0.001000 │
+  │ Parquet PARTITIONED        │     7 MB │ $0.000035 │
+  │                            │          │           │
+  │ Total savings vs CSV:      │    214x  │   214x    │
+  └────────────────────────────┴──────────┴───────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Hive-style partitions + MSCK REPAIR TABLE
+</span>→ Standard Hive partitioning (key=value/ folders)
+→ MSCK REPAIR TABLE scans S3 to discover new partitions
+→ Registers each partition in Glue Catalog
+→ Works but: MSCK REPAIR is slow for many partitions
+→ Requires re-running after every new partition appears
+→ Good for: static or slowly-growing data
+
+Option B: Hive-style partitions + Glue Crawler
+→ Crawler detects new partition folders (Project 23)
+→ Automatically registers in Glue Catalog
+→ Better than MSCK REPAIR (scheduled, automated)
+→ But: crawler takes 30-120 seconds per run
+→ Good for: daily batch data with scheduled crawlers
+
+Option C: Partition Projection (recommended for date keys)
+→ Athena computes partitions MATHEMATICALLY
+→ Define: start date, end date, interval
+→ Athena generates partition list at query time
+→ No catalog entries per partition
+→ No MSCK REPAIR or crawler needed
+→ Instant recognition of new partitions
+→ SELECTED ✅ for date-based partitioning
+
+Option D: Iceberg/Hudi tables with hidden partitioning
+→ Modern table formats with built-in partitioning
+→ Handles partition evolution, time travel
+→ More complex setup
+→ Covered conceptually — advanced use case
+
+DECISION: Implement BOTH Option A and Option C
+→ Option A: understand the fundamentals (MSCK REPAIR)
+→ Option C: production-grade solution (Partition Projection)
+→ Same underlying S3 layout — different catalog approach</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. CHOOSE partition key based on query patterns
+</span>   → 60% of queries filter by order_date → partition by order_date
+   → If queries also filter by status: consider TWO-LEVEL partitioning
+     order_date=2025-01-15/status=completed/file.parquet
+   → But: more levels = more folders = more management overhead
+   → Start with ONE partition key → add more only if needed
+
+2. USE Hive-style naming convention: key=value/
+   → order_date=2025-01-15/ (not just 2025-01-15/)
+   → Athena, Glue, Spark all auto-detect Hive-style partitions
+   → Non-Hive paths (plain date folders) require manual mapping
+
+3. KEEP partition values in standard format
+   → Dates: YYYY-MM-DD (ISO 8601)
+   → Not: 01-15-2025 or Jan-15 or 20250115
+   → Consistent format enables range queries: BETWEEN '2025-01-01' AND '2025-01-31'
+
+4. TARGET one Parquet file per partition (for daily data)
+   → 333K rows/day × 85 bytes/row = ~28 MB/day
+   → One ~7 MB Parquet file per day (after compression)
+   → Sweet spot: 1-4 files per partition
+   → Use coalesce(1) in Glue job for daily partitions
+
+5. USE Partition Projection for date-based keys
+   → Zero catalog management overhead
+   → Instant recognition of new dates
+   → No MSCK REPAIR or crawler needed for partitions
+   → Define once in table properties → works forever
+
+6. TEST with EXPLAIN before running expensive queries
+   → EXPLAIN shows if partition pruning is happening
+   → Look for: "partition filter" in plan
+   → If missing: query scans all partitions (check WHERE clause)
+
+7. VERIFY partition pruning with data scanned metric
+   → Full table scan: ~200 MB
+   → Single date partition: ~7 MB
+   → If date-filtered query scans 200 MB → pruning NOT working
+   → Common cause: wrong data type in WHERE clause</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT partition by high-cardinality columns
+</span>   → Partitioning by order_id → 10M partitions (one per order)
+   → Each partition: 1 tiny file → S3 listing nightmare
+   → Athena: "HIVE_EXCEEDED_PARTITION_LIMIT"
+   → Rule: &lt; 10,000 partitions per table (soft limit)
+   → order_date (365/year) ✅, order_id (10M) ❌
+
+2. DO NOT partition by columns NOT used in WHERE clauses
+   → Partitioning by product_id when nobody filters by product
+   → Adds folder complexity but zero query benefit
+   → Partition key MUST match query filter patterns
+
+3. DO NOT create empty partitions
+   → order_date=2025-02-30/ (doesn't exist)
+   → Partition Projection may generate invalid dates
+   → Athena handles gracefully (returns 0 rows) but wastes LIST calls
+
+4. DO NOT forget to include partition column in Glue write
+   → partitionKeys=["order_date"] in write_dynamic_frame
+   → Without this: Glue writes flat files (no folders)
+   → Then catalog says "partitioned" but S3 says "flat" → 0 rows
+
+5. DO NOT mix partitioned and unpartitioned files in same prefix
+   → s3://bucket/silver/orders/some_flat_file.parquet
+   → s3://bucket/silver/orders/order_date=2025-01-15/file.parquet
+   → Athena gets confused → may miss data or double-count
+   → Use SEPARATE prefix: silver_partitioned/orders/
+
+6. DO NOT use MSCK REPAIR TABLE on tables with 100K+ partitions
+   → MSCK scans EVERY folder in S3 → very slow
+   → 100K folders = 100K S3 LIST calls = minutes to complete
+   → Use Partition Projection instead → zero scanning
+
+7. DO NOT partition by date AND time if queries only filter by date
+   → order_date=2025-01-15/order_hour=14/ → 365 × 24 = 8,760 partitions/year
+   → If nobody filters by hour: 24x more folders for zero benefit
+   → Only add partition levels that queries actually use
+
+8. DO NOT use string comparison for date partition filtering
+   → WHERE order_date = '2025-01-15' → STRING comparison
+   → WHERE order_date = DATE '2025-01-15' → DATE comparison
+   → String comparison may miss partition pruning in some engines
+   → Always use proper DATE type in WHERE clause</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────────┬────────────────────────────────┐
+</span>│ Scenario                         │ Use                   │ Why                            │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Date-based partitioning          │ Partition Projection  │ Zero catalog management,       │
+│ (daily/monthly/yearly)           │                       │ auto-discovers new dates        │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Enum-based partitioning          │ Partition Projection  │ Define allowed values           │
+│ (status, region, country)        │ (injected type)       │ (completed, pending, shipped)   │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Irregular partition values       │ MSCK REPAIR +         │ Cannot predict values           │
+│ (customer segments, ad-hoc)      │ Crawler               │ mathematically                  │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ &lt; 100 partitions total           │ MSCK REPAIR           │ Simple, one-time command        │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ 100 - 100K partitions            │ Partition Projection  │ Avoids catalog bloat            │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ &gt; 100K partitions                │ Partition Projection  │ ONLY viable option at scale     │
+│                                  │ (mandatory)           │                                 │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Multi-level partitioning         │ Both supported        │ year/month/day or date/region   │
+│ (year→month→day)                 │                       │                                 │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Parquet + partitioning           │ Glue ETL write with   │ Best combo: columnar +          │
+│ (maximum optimization)           │ partitionKeys         │ partition pruning               │
+└──────────────────────────────────┴───────────────────────┴────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE PARTITIONING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When table is tiny (&lt; 100 MB)
+</span>   → Athena minimum charge: 10 MB per query
+   → Partitioning 50 MB into 30 folders: 1.7 MB per partition
+   → Still charged 10 MB minimum → no savings
+   → Adds folder management complexity for zero benefit
+
+2. When queries NEVER filter by any column
+   → All queries are SELECT * or full-table aggregations
+   → Partitioning adds S3 folder overhead
+   → Every query still scans all partitions
+   → No benefit, only downsides
+
+3. When partition key has cardinality &gt; 100,000
+   → 100K folders = 100K S3 prefixes
+   → S3 LIST operations become slow
+   → Glue Catalog bloated (if not using Projection)
+   → Consider bucketing instead (not native to Athena though)
+
+4. When data is append-only with no date correlation
+   → Log files with sequential IDs but no timestamp
+   → No natural partition key that matches query patterns
+   → Partitioning by arbitrary ranges adds complexity
+
+5. When using Iceberg/Hudi table format
+   → These formats handle partitioning internally
+   → Hidden partitioning: Iceberg partitions by month(timestamp)
+   → No Hive-style folders needed
+   → More advanced — future consideration</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│              ATHENA PARTITION PRUNING — INTERNAL MECHANICS                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  METHOD 1: HIVE-STYLE PARTITIONS (Traditional)                              │
+│  ─────────────────────────────────────────────                               │
+│                                                                             │
+│  S3 LAYOUT:                                                                 │
+│  s3://bucket/table/                                                         │
+│   ├── order_date=2025-01-01/file.parquet                                    │
+│   ├── order_date=2025-01-02/file.parquet                                    │
+│   └── order_date=2025-01-30/file.parquet                                    │
+│                                                                             │
+│  GLUE CATALOG STORES:                                                       │
+│  ┌──────────────────────────────────────────────────────────────┐           │
+│  │ Table: silver_orders_partitioned                             │           │
+│  │ Location: s3://bucket/silver_partitioned/orders/             │           │
+│  │ Partition Keys: [order_date: date]                           │           │
+│  │                                                              │           │
+│  │ Registered Partitions:                                       │           │
+│  │  ├── order_date=2025-01-01 → s3://bucket/.../01-01/         │           │
+│  │  ├── order_date=2025-01-02 → s3://bucket/.../01-02/         │           │
+│  │  ├── order_date=2025-01-03 → s3://bucket/.../01-03/         │           │
+│  │  │   ... (one entry per partition)                           │           │
+│  │  └── order_date=2025-01-30 → s3://bucket/.../01-30/         │           │
+│  │                                                              │           │
+│  │  EACH partition = separate catalog entry                     │           │
+│  │  30 days = 30 catalog entries                                │           │
+│  │  3 years = 1,095 catalog entries                             │           │
+│  │  10 years = 3,650 catalog entries (manageable)               │           │
+│  └──────────────────────────────────────────────────────────────┘           │
+│                                                                             │
+│  QUERY EXECUTION:                                                           │
+│  SELECT * FROM silver_orders_partitioned                                    │
+│  WHERE order_date = DATE '2025-01-15'                                       │
+│                                                                             │
+│  1. Athena reads table metadata from Glue Catalog                           │
+│  2. Finds partition key: order_date                                         │
+│  3. Evaluates WHERE clause against partition values                         │
+│  4. Matches: order_date=2025-01-15                                          │
+│  5. Gets S3 location for ONLY that partition                                │
+│  6. Scans files in: s3://bucket/.../order_date=2025-01-15/                  │
+│  7. SKIPS all other 29 partition folders entirely                            │
+│  8. Result: 7 MB scanned instead of 200 MB                                 │
+│                                                                             │
+│  ADDING NEW PARTITIONS:                                                     │
+│  → New data arrives for 2025-01-31                                          │
+│  → File written to: s3://bucket/.../order_date=2025-01-31/file.parquet      │
+│  → BUT: Athena doesn't know about it yet (not in catalog)                   │
+│  → Must register partition via:                                             │
+│     a) MSCK REPAIR TABLE (scans S3, finds new folders)                      │
+│     b) ALTER TABLE ADD PARTITION (manual, explicit)                          │
+│     c) Glue Crawler (scheduled, automatic)                                  │
+│     d) Partition Projection (no registration needed!) ← BEST                │
+│                                                                             │
+│                                                                             │
+│  METHOD 2: PARTITION PROJECTION (Modern — Recommended)                      │
+│  ─────────────────────────────────────────────────────                       │
+│                                                                             │
+│  CONCEPT: Athena COMPUTES partitions instead of looking them up             │
+│                                                                             │
+│  TABLE PROPERTIES:                                                          │
+│  ┌──────────────────────────────────────────────────────────────┐           │
+│  │ 'projection.enabled' = 'true'                                │           │
+│  │ 'projection.order_date.type' = 'date'                        │           │
+│  │ 'projection.order_date.range' = '2025-01-01,NOW'             │           │
+│  │ 'projection.order_date.format' = 'yyyy-MM-dd'                │           │
+│  │ 'projection.order_date.interval' = '1'                       │           │
+│  │ 'projection.order_date.interval.unit' = 'DAYS'               │           │
+│  │ 'storage.location.template' =                                │           │
+│  │   's3://bucket/silver_partitioned/orders/order_date=${order_  │           │
+│  │   date}/'                                                    │           │
+│  └──────────────────────────────────────────────────────────────┘           │
+│                                                                             │
+│  QUERY EXECUTION WITH PROJECTION:                                           │
+│  SELECT * FROM silver_orders_projected                                      │
+│  WHERE order_date = DATE '2025-01-15'                                       │
+│                                                                             │
+│  1. Athena reads table properties (NOT partition list)                       │
+│  2. Sees projection.enabled = true                                          │
+│  3. Evaluates WHERE clause: order_date = 2025-01-15                         │
+│  4. COMPUTES: is 2025-01-15 within range [2025-01-01, NOW]?                 │
+│     → YES → generate S3 path from template                                  │
+│  5. Constructs path: s3://bucket/.../order_date=2025-01-15/                 │
+│  6. Reads files from ONLY that path                                         │
+│  7. NEVER queries Glue Catalog for partition list                           │
+│  8. Result: same 7 MB scan, but FASTER query planning                       │
+│                                                                             │
+│  KEY ADVANTAGES OF PROJECTION:                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │ Feature              │ Hive + Catalog    │ Projection           │        │
+│  ├──────────────────────┼───────────────────┼──────────────────────┤        │
+│  │ New partition setup   │ MSCK/Crawler/DDL  │ Automatic            │        │
+│  │ Catalog entries       │ 1 per partition   │ ZERO                 │        │
+│  │ Query planning speed  │ Lookup all parts  │ Compute matching     │        │
+│  │ 100K partitions       │ Slow catalog read │ Instant              │        │
+│  │ Date range queries    │ Scans catalog     │ Math computation     │        │
+│  │ Missing partition     │ Returns 0 rows    │ Returns 0 rows       │        │
+│  │ Works with crawler    │ Yes (creates)     │ No (not needed)      │        │
+│  │ Works with MSCK       │ Yes (discovers)   │ No (not needed)      │        │
+│  └──────────────────────┴───────────────────┴──────────────────────┘        │
+│                                                                             │
+│                                                                             │
+│  RANGE QUERY OPTIMIZATION:                                                  │
+│  ─────────────────────────                                                  │
+│  WHERE order_date BETWEEN DATE '2025-01-10' AND DATE '2025-01-20'           │
+│                                                                             │
+│  Hive partitions:                                                           │
+│  → Catalog lookup: find all partitions in range                             │
+│  → Returns: 11 partition locations                                          │
+│  → Scans: 11 × 7 MB = 77 MB                                               │
+│                                                                             │
+│  Partition Projection:                                                      │
+│  → Math: generate dates from 2025-01-10 to 2025-01-20 (step 1 day)         │
+│  → Generates: 11 S3 paths                                                  │
+│  → Scans: 11 × 7 MB = 77 MB                                               │
+│  → Same scan, but FASTER planning (no catalog lookup)                       │
+│                                                                             │
+│  FULL TABLE SCAN (no WHERE on partition key):                               │
+│  SELECT COUNT(*) FROM silver_orders_projected                               │
+│  → No partition filter → scans ALL partitions                               │
+│  → Same cost as unpartitioned (200 MB)                                      │
+│  → Partitioning ONLY helps when WHERE matches partition key                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Query scans all partitions despite WHERE clause"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: WHERE uses function on partition key
+   WHERE YEAR(order_date) = 2025  → NO pruning (function wraps column)
+   WHERE order_date &gt;= '2025-01-01' AND order_date &lt; '2026-01-01' → PRUNING ✅
+→ Cause B: data type mismatch
+   Partition key is STRING, WHERE uses DATE literal → no match
+→ Cause C: partition column not declared in table definition
+→ Fix: check table properties, use direct comparison, match types
+
+PITFALL 2: "MSCK REPAIR TABLE takes 10 minutes"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: MSCK scans EVERY S3 prefix under table location
+→ 1,000 partitions = 1,000 S3 LIST calls
+→ Fix: switch to Partition Projection (zero scanning)
+→ Or: use ALTER TABLE ADD PARTITION for specific new partitions only
+
+PITFALL 3: "New data arrived but Athena returns 0 rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause (Hive): new partition folder exists but not registered in catalog
+→ Fix: run MSCK REPAIR TABLE or ALTER TABLE ADD PARTITION
+→ Cause (Projection): S3 folder name doesn't match template pattern
+→ Fix: verify folder name format matches projection.order_date.format
+
+PITFALL 4: "Partition Projection returns data for dates that don't exist"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: projection generates ALL dates in range, including future dates
+→ Query WHERE order_date = '2025-12-31' → Athena tries to read that folder
+→ Folder doesn't exist → returns 0 rows (not an error)
+→ No cost impact (S3 returns empty listing)
+→ Not a bug — expected behavior
+
+PITFALL 5: "Partitioned table is SLOWER than unpartitioned for full scans"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: 365 partitions = 365 S3 LIST calls + 365 file opens
+→ Unpartitioned: 4 files = 4 S3 LIST calls + 4 file opens
+→ Overhead per partition: ~10-50ms for S3 operations
+→ 365 partitions × 30ms = ~11 seconds just for S3 operations
+→ Fix: for full-table queries, use unpartitioned copy (or accept overhead)
+→ Trade-off: partition-filtered queries are 30x faster but full scans slightly slower
+
+PITFALL 6: "Glue job creates wrong partition folder structure"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: partitionKeys not matching column name exactly
+→ Job writes: order_dt=2025-01-15/ but table expects: order_date=2025-01-15/
+→ Fix: ensure partitionKeys value matches catalog partition column name EXACTLY
+→ Case-sensitive!
+
+PITFALL 7: "Query returns duplicate rows after re-running ETL"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Glue job appends new files to existing partition folders
+→ First run: order_date=2025-01-15/part-00000.parquet
+→ Second run: order_date=2025-01-15/part-00001.parquet (APPENDED)
+→ Now both files read → double the data
+→ Fix: delete existing partition files before writing (mode="overwrite")
+→ Or: use distinct output path per job run</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PARTITION COUNT SCALING:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+→ 30 partitions (1 month daily):      trivial, any method works
+→ 365 partitions (1 year daily):      fine, MSCK takes ~30 seconds
+→ 3,650 partitions (10 years daily):  MSCK slow, use Projection
+→ 8,760 partitions (1 year hourly):   Projection mandatory
+→ 100,000+ partitions:                Projection mandatory, Hive impossible
+
+PARTITION PROJECTION LIMITS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ No hard limit on projected partition count
+→ Athena generates only MATCHING partitions per query
+→ WHERE date = '2025-01-15' → generates 1 path (regardless of total range)
+→ WHERE date BETWEEN '2025-01-01' AND '2025-12-31' → generates 365 paths
+→ Performance: O(matching partitions), not O(total partitions)
+
+DATA GROWTH:
+━━━━━━━━━━━━
+→ Month 1: 30 partitions × 7 MB = 210 MB total
+→ Year 1:  365 partitions × 7 MB = 2.5 GB total
+→ Year 3:  1,095 partitions × 7 MB = 7.5 GB total
+→ Single-date query: ALWAYS 7 MB regardless of total data size
+→ This is the MAGIC of partitioning: query cost is CONSTANT
+
+MULTI-LEVEL PARTITIONING:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Level 1: order_date (365 values/year)
+→ Level 2: status (5 values)
+→ Total: 365 × 5 = 1,825 partitions/year
+→ Query WHERE date='2025-01-15' AND status='completed' → 1 folder
+→ Query WHERE date='2025-01-15' → 5 folders (all statuses)
+→ More levels = more pruning but more folders to manage
+→ Rule: add level only if queries FREQUENTLY filter by it</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY PARTITION PRUNING IS WORKING:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Data scanned metric (most reliable):
+   → Full table: ~200 MB
+   → Single date partition: ~7 MB
+   → If date-filtered query scans 200 MB → pruning NOT working
+
+2. EXPLAIN query:
+   → EXPLAIN SELECT * FROM table WHERE order_date = DATE '2025-01-15';
+   → Look for: "partition filter" or "pushed down filter" in output
+   → If absent: partition pruning not happening
+
+3. Query execution time:
+   → Full scan: 5-15 seconds
+   → Single partition: 1-3 seconds
+   → Significant difference confirms pruning
+
+4. S3 request logs:
+   → Enable S3 server access logging
+   → Check which prefixes were accessed
+   → Should only show the matching partition prefix
+
+5. CloudWatch metrics:
+   → Athena ProcessedBytes metric
+   → Compare partitioned vs unpartitioned queries
+   → 90%+ reduction confirms pruning</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(26)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Modified Glue ETL Job — Write Partitioned Parquet</h3>
+
+<h3>Step 2: Create Partitioned Table with MSCK REPAIR (Method A)</h3>
+
+<h3>Step 3: Create Table with Partition Projection (Method B — Recommended)</h3>
+
+<h3>Step 4: Create and Run Partitioned Glue Job</h3>
+
+<h3>Step 5: Verify Partitioned Output in S3</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+============================================================
+📂 VERIFYING PARTITIONED S3 STRUCTURE
+   Prefix: s3://quickcart-raw-data-prod/silver_partitioned/orders/
+============================================================
+
+   Found 30 partitions, 30 files total
+
+   Partition                      Files   Size (MB)
+   ────────────────────────────── ────── ──────────
+   order_date=2025-01-01              1       6.82
+   order_date=2025-01-02              1       6.79
+   order_date=2025-01-03              1       6.85
+   order_date=2025-01-04              1       6.80
+   order_date=2025-01-05              1       6.83
+   order_date=2025-01-06              1       6.81
+   order_date=2025-01-07              1       6.84
+   order_date=2025-01-08              1       6.78
+   order_date=2025-01-09              1       6.82
+   order_date=2025-01-10              1       6.80
+   order_date=2025-01-11              1       6.83
+   order_date=2025-01-12              1       6.81
+   order_date=2025-01-13              1       6.79
+   order_date=2025-01-14              1       6.84
+   order_date=2025-01-15              1       6.82
+   order_date=2025-01-16              1       6.80
+   order_date=2025-01-17              1       6.83
+   order_date=2025-01-18              1       6.81
+   order_date=2025-01-19              1       6.79
+   order_date=2025-01-20              1       6.84
+   order_date=2025-01-21              1       6.82
+   order_date=2025-01-22              1       6.80
+   order_date=2025-01-23              1       6.83
+   order_date=2025-01-24              1       6.81
+   order_date=2025-01-25              1       6.79
+   order_date=2025-01-26              1       6.84
+   order_date=2025-01-27              1       6.82
+   order_date=2025-01-28              1       6.80
+   order_date=2025-01-29              1       6.83
+   order_date=2025-01-30              1       6.81
+   ────────────────────────────── ────── ──────────
+   TOTAL                             30     204.43
+
+📊 PARTITION HEALTH CHECK:
+   Partition count:    30
+   Avg partition size: 6.81 MB
+   Min partition size: 6.78 MB
+   Max partition size: 6.85 MB
+   ✅ Partition sizes are balanced
+   ✅ No empty partitions
+   ✅ File count per partition is reasonable (max: 1)
+
+============================================================
+💾 STORAGE COMPARISON: Unpartitioned vs Partitioned
+============================================================
+   Layout                    Files   Size (MB)
+   ───────────────────────── ────── ──────────
+   Unpartitioned (silver/)       4     198.70
+   Partitioned (silver_p/)      30     204.43
+
+   Storage overhead from partitioning: +2.9%
+
+   💡 Partitioning adds ~5-15% storage but saves 90%+ on queries</code></pre></div>
+<h3>Step 6: Comprehensive Cost Comparison — All Three Formats</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+==========================================================================================
+💰 COMPLETE COST COMPARISON: CSV vs PARQUET vs PARTITIONED PARQUET
+==========================================================================================
+
+──────────────────────────────────────────────────────────────────────────────────────────
+📊 Query: Full table COUNT(*)
+──────────────────────────────────────────────────────────────────────────────────────────
+   Format                         Data Scanned         Cost       Time
+   ────────────────────────────── ──────────── ──────────── ──────────
+   CSV (raw)                        1502.438 MB $0.00751219    8432ms
+   Parquet (silver)                  198.700 MB $0.00099350    3215ms
+   Parquet+Partition (proj)          204.430 MB $0.00102215    4187ms
+
+──────────────────────────────────────────────────────────────────────────────────────────
+📊 Query: Single date filter
+──────────────────────────────────────────────────────────────────────────────────────────
+   Format                         Data Scanned         Cost       Time
+   ────────────────────────────── ──────────── ──────────── ──────────
+   CSV (raw)                        1502.438 MB $0.00751219   12847ms
+   Parquet (silver)                  198.700 MB $0.00099350    4523ms
+   Parquet+Partition (proj)            6.820 MB $0.00003410    1842ms
+
+──────────────────────────────────────────────────────────────────────────────────────────
+📊 Query: 7-day range filter
+──────────────────────────────────────────────────────────────────────────────────────────
+   Format                         Data Scanned         Cost       Time
+   ────────────────────────────── ──────────── ──────────── ──────────
+   CSV (raw)                        1502.438 MB $0.00751219   13102ms
+   Parquet (silver)                  198.700 MB $0.00099350    4891ms
+   Parquet+Partition (proj)           47.740 MB $0.00023870    2456ms
+
+==========================================================================================
+📋 SUMMARY: DATA SCANNED PER QUERY (MB)
+==========================================================================================
+
+   Query                                  CSV    Parquet    Part.PQ    Savings
+   ─────────────────────────────────── ────────── ────────── ────────── ──────────
+   Full table COUNT(*)                    1502.4      198.7      204.4     86.4%
+   Single date filter                     1502.4      198.7        6.8     99.5%
+   7-day range filter                     1502.4      198.7       47.7     96.8%
+   Aggregation (all dates)                1502.4       49.3       51.2     96.6%
+   Aggregation (single date)              1502.4       49.3        1.7     99.9%
+   2-column select (single date)          1502.4       14.8        1.2     99.9%
+
+==========================================================================================
+💰 MONTHLY COST PROJECTION (9,000 queries/month)
+==========================================================================================
+   CSV (raw)                       $   67.6100/month
+   Parquet (silver)                $    8.5870/month
+   Parquet+Partition (proj)        $    2.0380/month
+
+==========================================================================================</code></pre></div>
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Raw CSV data in S3 (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Glue Catalog with raw_* tables (Project 23)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Unpartitioned Parquet in silver/ (Project 25)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Athena workgroups configured (Project 24)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Upload and run partitioned Glue ETL job</span><span>
+</span>python 04_run_partitioned_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create Hive-style partitioned table (Method A)</span><span>
+</span>python 02_create_hive_partitioned_table.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create Partition Projection table (Method B — recommended)</span><span>
+</span>python 03_create_projection_table.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Verify partition structure in S3</span><span>
+</span>python 05_verify_partitions.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run full cost comparison</span><span>
+</span>python 06_full_cost_comparison.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Tell analysts: use silver_orders_projected for cheapest queries</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Partitioning = organizing data into S3 folders by column value
+→ Athena reads ONLY folders matching WHERE clause → massive cost savings
+→ Hive-style: key=value/ folders (order_date=2025-01-15/)
+→ Two methods to register partitions:
+   1. MSCK REPAIR TABLE (scans S3, registers in catalog — simple but slow)
+   2. Partition Projection (computes paths mathematically — fast, zero management)
+→ Partition Projection is RECOMMENDED for date-based keys
+→ Choose partition key matching most common WHERE clause filters
+→ Sweet spot: 100-10,000 partitions (not too few, not too many)
+→ Partitioning ONLY helps queries that filter by partition key
+→ Full table scans: slightly SLOWER with partitioning (more S3 LIST calls)
+
+COMPLETE OPTIMIZATION CHAIN (Projects 1 → 25 → 26):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CSV unpartitioned:           1,502 MB scanned  → $0.00751 per query
+  Parquet unpartitioned:         199 MB scanned  → $0.00099 per query  (7.5x cheaper)
+  Parquet PARTITIONED:             7 MB scanned  → $0.00003 per query  (214x cheaper)
+
+  Monthly (9,000 queries):
+  CSV:                    $67.61/month
+  Parquet:                 $8.59/month  (88% savings)
+  Parquet+Partition:       $2.04/month  (97% savings)
+
+  From $67.61 → $2.04 = 97% total cost reduction
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:   S3 where data originates
+→ Project 22:  UNLOAD with PARTITION BY (same concept, Redshift side)
+→ Project 23:  Crawlers that discover partitions
+→ Project 24:  Athena queries that now cost 214x less
+→ Project 25:  CSV → Parquet conversion (this adds partitioning on top)
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 33: Job Bookmarks for incremental partition processing
+→ Project 36: CTAS to materialize queries as new partitioned tables
+→ Project 38: Redshift Spectrum with partition pruning on S3
+→ Project 44: Full Bronze → Silver → Gold with partitioning at each layer
+→ Project 62: Small file compaction within partitions
+→ Project 69: Cost optimization combining all techniques</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart data platform now has:
+</span>→ Bronze layer: raw CSVs (daily_exports/) ✅
+→ Silver layer: partitioned Parquet (silver_partitioned/) ✅
+→ Athena queries: 214x cheaper than original CSV ✅
+→ Partition Projection: zero-maintenance partition management ✅
+
+BUT: the Glue ETL job (Project 25) reprocesses ALL files every run
+→ Day 1: processes 30 CSV files → writes 30 partitions (5 minutes)
+→ Day 31: processes 60 CSV files → writes 60 partitions (10 minutes)
+→ Day 365: processes 395 CSV files → writes 395 partitions (45 minutes)
+→ Job time and cost GROW LINEARLY with data accumulation
+→ Each day only adds ONE new file — why reprocess the other 394?
+
+Data engineer asks: "Can Glue remember which files it already processed?"
+CTO: "We're spending $0.15/day on a job that should cost $0.02/day"
+YOU: "Glue Job Bookmarks. They track which files were already processed.
+      Next run: only processes NEW files since last run.
+      Day 365: processes 1 new file (2 minutes) instead of 395 files (45 minutes).
+      Cost drops from $0.15 to $0.02 per run."
+
+→ Project 33: "Only Process NEW Files — Don't Re-Process Old Ones"
+→ Introduces: Glue Job Bookmarks → Stateful Cursor → S3 Timestamp Tracking
+→ Makes our Glue jobs INCREMENTAL instead of full-reload</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-25.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 26 of 80</span>
+    <span class="nav-project-title">SLASH ATHENA QUERY COST BY 90% WITH PARTITIONING</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-27.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-27.html") window.location = "project-27.html";
+  if (e.key === 'ArrowLeft' && "project-25.html") window.location = "project-25.html";
+});
+</script>
+</body>
+</html>

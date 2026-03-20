@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 14: ONE EVENT MUST REACH MULTIPLE CONSUMERS — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:18%"></div></div>
+<div id="progress-label">18%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 14 of 80</div>
+  <div class="project-title">ONE EVENT MUST REACH MULTIPLE CONSUMERS</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — SNS (Project 12) + SQS (Project 13) operational
+</span>Situation:
+→ Data platform is growing — multiple teams consume the same events
+→ A single event now needs to trigger MULTIPLE downstream actions
+
+SCENARIO — FILE ARRIVAL EVENT:
+→ Marketing uploads campaign_results_20250715.csv to S3
+→ This ONE event must trigger:
+
+CONSUMER 1 — ETL Processor (Data Engineering):
+"Load this file into Redshift staging table.
+ I need an SQS queue so I can process at my own pace."
+
+CONSUMER 2 — Data Quality Checker (QA Team):
+"Validate this file: row count, schema, null percentages.
+ If quality fails, block the ETL load.
+ I need my OWN SQS queue — independent of ETL."
+
+CONSUMER 3 — Audit Logger (Compliance):
+"Record: who uploaded, when, what file, what size.
+ Write to audit table in MariaDB.
+ I need my OWN SQS queue — compliance has different SLA."
+
+CONSUMER 4 — Email Notification (Data Team):
+"Send email: 'New file arrived: campaign_results_20250715.csv'
+ I'm a human — I need email, not a queue."
+
+THE PROBLEM:
+→ If we publish to SQS directly: only ONE consumer gets the message
+→ If we publish to SNS email: machines can't process it
+→ We need: ONE publish → FOUR consumers receive simultaneously
+→ Each consumer processes independently (different speed, different logic)
+→ If Consumer 2 is slow, it shouldn't block Consumer 1
+
+CTO:
+"This is the FAN-OUT pattern. Every event-driven architecture uses it.
+ Master this and you can build any pipeline."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the fan-out problem
+</span>→ ONE producer generates an event
+→ MULTIPLE consumers need that same event
+→ Each consumer has different processing needs
+→ Consumers must be INDEPENDENT (one's failure doesn't affect others)
+
+Step 2: Why direct SQS doesn't work
+→ SQS: one queue, one consumer reads and deletes
+→ If Consumer 1 deletes the message, Consumer 2 never sees it
+→ Could create 4 queues and publish to all 4 — but producer 
+  must know about every consumer (tight coupling)
+→ Adding Consumer 5 requires changing the producer code
+
+Step 3: Why SNS alone doesn't work
+→ SNS email: great for humans, useless for machines
+→ SNS HTTP: machines can receive, but no buffering
+   → If machine is down when SNS delivers → message lost
+→ SNS doesn't PERSIST messages — delivers and forgets
+
+Step 4: The solution — SNS → SQS fan-out
+→ Producer publishes to ONE SNS topic
+→ SNS has MULTIPLE SQS queue subscriptions
+→ SNS COPIES the message to EVERY subscribed queue
+→ Each queue is independent — own retention, own consumer
+→ Adding new consumer = subscribe new queue (no producer change)
+→ Email subscribers also work alongside SQS subscribers
+
+Step 5: This pattern is EVERYWHERE
+→ AWS EventBridge uses this pattern internally
+→ Microservices use this for event-driven communication
+→ Every data platform uses this for pipeline orchestration
+→ Projects 17, 18, 28, 41, 66 all build on this foundation</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FAN-OUT ARCHITECTURE:
+</span>
+  ┌──────────────────────────────────────┐
+  │          PRODUCER                     │
+  │  (S3 Event / Pipeline Script / API)  │
+  │                                       │
+  │  sns.publish(                         │
+  │    TopicArn="file-events",           │
+  │    Message={"s3_key": "campaign.csv"} │
+  │  )                                    │
+  └──────────────────┬───────────────────┘
+                     │
+                     │ ONE publish
+                     ▼
+  ┌──────────────────────────────────────┐
+  │         SNS TOPIC                     │
+  │    quickcart-file-events             │
+  │                                       │
+  │    Subscriptions:                     │
+  │    ├── SQS: etl-processing-queue     │
+  │    ├── SQS: quality-check-queue      │
+  │    ├── SQS: audit-log-queue          │
+  │    └── Email: data-team@quickcart    │
+  └──┬──────────┬──────────┬─────────┬──┘
+     │          │          │         │
+     │ COPY     │ COPY     │ COPY    │ EMAIL
+     ▼          ▼          ▼         ▼
+  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+  │ SQS    │ │ SQS    │ │ SQS    │ │ Email  │
+  │ ETL    │ │ Quality│ │ Audit  │ │ Inbox  │
+  │ Queue  │ │ Queue  │ │ Queue  │ │        │
+  └───┬────┘ └───┬────┘ └───┬────┘ └────────┘
+      │          │          │
+      ▼          ▼          ▼
+  ┌────────┐ ┌────────┐ ┌────────┐
+  │ EC2    │ │ Lambda │ │ EC2    │
+  │ ETL    │ │ QA     │ │ Audit  │
+  │ Worker │ │ Checker│ │ Logger │
+  └────────┘ └────────┘ └────────┘
+
+  KEY PROPERTIES:
+  → Producer knows ONLY the topic ARN (not individual queues)
+  → Adding Consumer 5: subscribe new queue — zero producer changes
+  → Consumer 2 crashes: Consumers 1, 3, 4 unaffected
+  → Each queue has own DLQ, visibility timeout, retention
+  → Messages persist in each queue independently</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Producer publishes to multiple SQS queues directly
+</span>→ Pros: simple, no SNS dependency
+→ Cons: producer must know every queue URL
+→ Cons: adding new consumer = modify producer code
+→ Cons: producer must handle per-queue errors
+→ TIGHT COUPLING — violates event-driven principles
+
+Option B: SNS → SQS fan-out (RECOMMENDED)
+→ Pros: decoupled — producer knows only topic
+→ Pros: adding consumers = subscribe (no code change)
+→ Pros: mixed protocols (SQS + email + Lambda + HTTP)
+→ Pros: SNS handles delivery to all subscribers
+→ Cons: slight latency (~50-100ms for SNS routing)
+→ LOOSE COUPLING — industry standard pattern
+
+Option C: EventBridge → multiple targets
+→ Pros: content-based routing, scheduling
+→ Pros: native AWS service integration
+→ Cons: more complex setup for simple fan-out
+→ Best for: complex routing rules (Project 66)
+
+Option D: Kinesis → multiple consumers
+→ Pros: multiple consumers read same stream
+→ Pros: replay capability
+→ Cons: shard management, more expensive
+→ Best for: real-time streaming (Project 72)
+
+DECISION: Option B — SNS → SQS fan-out
+→ Industry standard for event-driven architectures
+→ Perfect for QuickCart's batch-oriented needs
+→ Foundation for all future pipeline projects</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Grant SNS permission to write to each SQS queue
+</span>   → SQS queue POLICY must allow sns:SendMessage from topic ARN
+   → Without this: SNS publish succeeds but SQS never receives
+   → This is the #1 setup mistake in fan-out patterns
+
+2. Enable RAW MESSAGE DELIVERY for SQS subscribers
+   → Default: SNS wraps message in SNS envelope JSON
+   → Raw delivery: SQS receives EXACTLY what producer published
+   → Why raw: consumer doesn't need to unwrap SNS envelope
+   → When NOT raw: consumer needs SNS metadata (TopicArn, MessageId)
+
+3. Use message attributes consistently
+   → Attributes set by producer flow through to ALL subscribers
+   → Enable filter policies (Project 51) for selective delivery
+   → Attributes: event_type, source, priority, file_type
+
+4. Create DLQ for EVERY fan-out SQS queue
+   → Each queue processes independently — each can fail independently
+   → DLQ per queue catches failures specific to that consumer
+   → Don't share DLQs across queues — makes debugging impossible
+
+5. Test fan-out with all consumers BEFORE production
+   → Publish one test message
+   → Verify ALL queues received it
+   → Verify email subscribers received it
+   → Check message content matches in each queue
+
+6. Monitor each queue independently
+   → CloudWatch alarms per queue: backlog, age, DLQ depth
+   → One slow consumer shouldn't trigger alerts for others
+   → Dashboard showing all fan-out queues side by side
+
+7. Document the fan-out topology
+   → Which topic fans out to which queues
+   → Who owns each queue (team, service)
+   → What each consumer does with the message
+   → This documentation prevents "who is consuming this?" confusion</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT have producer publish to SQS queues directly
+</span>   → Adding Consumer 5 requires modifying producer code
+   → Producer handles errors for each queue separately
+   → Use SNS as the decoupling layer
+
+2. DO NOT forget the SQS queue policy
+   → SNS cannot write to SQS without explicit permission
+   → publish() succeeds (SNS accepted the message)
+   → But SQS never receives it (permission denied at delivery)
+   → SILENT FAILURE — no error returned to publisher
+
+3. DO NOT share one SQS queue among multiple consumers
+   → SQS: once Consumer A reads and deletes, Consumer B never sees it
+   → Each consumer needs its OWN queue
+   → Exception: competing consumers (same logic, load balancing)
+
+4. DO NOT enable raw delivery for ALL subscribers blindly
+   → Email subscribers: raw delivery means they get raw JSON
+   → Email subscribers usually want the SNS-formatted version
+   → SQS subscribers: raw delivery is usually better
+   → Decision per subscriber, not per topic
+
+5. DO NOT set different message retention across fan-out queues
+   → If ETL queue retains 7 days but audit queue retains 1 day
+   → Audit messages expire before investigation
+   → Use consistent retention (7 days) unless specific reason
+
+6. DO NOT publish to SNS synchronously in tight loops
+   → 1000 files arrive → 1000 SNS publishes → each ~50ms
+   → Total: ~50 seconds just for publishing
+   → Better: batch processing or async publish
+
+7. DO NOT create circular fan-out
+   → Topic A → Queue B → Lambda → publishes to Topic A
+   → Infinite loop of messages
+   → Always ensure events flow in one direction</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use                  │ Why                              │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ One event → multiple consumers   │ SNS → SQS Fan-out   │ Decoupled, each consumer gets    │
+│ (different processing logic)     │ (This Project)       │ own copy, independent processing │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ One event → one consumer         │ Direct SQS           │ No fan-out needed, simpler       │
+│ (single processing pipeline)     │ (Project 13)         │                                  │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ One event → humans only          │ SNS Email/SMS        │ No queue needed for humans       │
+│ (notification only)              │ (Project 12)         │                                  │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Different events → different     │ SNS + Filter Policy  │ Subscribers filter by attributes │
+│ consumers based on content       │ (Project 51)         │ Only receive matching messages   │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Complex routing rules            │ EventBridge          │ Content-based rules, transforms  │
+│ based on message content         │ (Project 66)         │                                  │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Multiple consumers read same     │ Kinesis Streams      │ Multiple consumers, replay       │
+│ stream with replay               │ (Project 72)         │ capability, ordered              │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────┤
+│ Load balancing among identical   │ Single SQS +         │ Multiple workers compete for     │
+│ workers                          │ Multiple Consumers   │ messages from same queue         │
+└──────────────────────────────────┴──────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE SNS → SQS FAN-OUT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When there's truly only ONE consumer
+</span>   → Fan-out with one queue = unnecessary SNS layer
+   → Publish directly to SQS — simpler, one less service
+   → Add SNS later when second consumer appears
+
+2. When consumers need real-time streaming
+   → SNS → SQS adds ~100-200ms latency
+   → For sub-second requirements: Kinesis Data Streams
+   → QuickCart's batch ETL: 200ms is negligible
+
+3. When message replay is required
+   → SNS doesn't store messages — delivers and forgets
+   → SQS: once consumed and deleted, gone forever
+   → Use: Kinesis (replay from any point in retention window)
+
+4. When you need request/response pattern
+   → Fan-out is fire-and-forget (one-way)
+   → No response channel from consumers to producer
+   → Use: API Gateway + Lambda for synchronous request/response
+
+5. When total fan-out exceeds 12.5 million subscriptions per topic
+   → SNS hard limit: 12.5M subscriptions per topic
+   → If you hit this: architectural review needed
+   → QuickCart: 4 subscriptions — nowhere close</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                SNS → SQS FAN-OUT INTERNAL MECHANICS                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  1. PUBLISH FLOW — WHAT HAPPENS INSIDE SNS                                  │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Producer calls:                                                            │
+│  sns.publish(TopicArn="...", Message="...", MessageAttributes={...})        │
+│                                                                             │
+│  SNS Internal Process:                                                      │
+│  ┌─────────────────────────────────────────────────────┐                   │
+│  │ 1. ACCEPT: validate message, check permissions      │                   │
+│  │    → Return MessageId to producer IMMEDIATELY       │                   │
+│  │    → Producer's job is DONE at this point           │                   │
+│  │                                                      │                   │
+│  │ 2. ENUMERATE: list all confirmed subscriptions       │                   │
+│  │    → Filter: apply filter policies per subscription │                   │
+│  │    → Result: list of subscriptions that match       │                   │
+│  │                                                      │                   │
+│  │ 3. DELIVER: for each matching subscription:          │                   │
+│  │                                                      │                   │
+│  │    SQS subscription:                                 │                   │
+│  │    → SNS calls sqs:SendMessage on queue              │                   │
+│  │    → Uses queue's resource policy for authorization  │                   │
+│  │    → Message written directly into SQS queue         │                   │
+│  │    → If raw delivery: exact message body             │                   │
+│  │    → If not raw: wrapped in SNS envelope JSON        │                   │
+│  │                                                      │                   │
+│  │    Email subscription:                               │                   │
+│  │    → SNS sends via SES infrastructure                │                   │
+│  │    → Subject = publish Subject parameter             │                   │
+│  │    → Body = publish Message parameter                │                   │
+│  │                                                      │                   │
+│  │    Lambda subscription:                              │                   │
+│  │    → SNS invokes Lambda synchronously                │                   │
+│  │    → Waits for Lambda response                       │                   │
+│  │    → Retries 3 times on failure                      │                   │
+│  │                                                      │                   │
+│  │ 4. COMPLETE: all deliveries attempted                │                   │
+│  │    → Failed deliveries retried per protocol policy   │                   │
+│  │    → SNS does NOT notify producer of delivery status │                   │
+│  └─────────────────────────────────────────────────────┘                   │
+│                                                                             │
+│  TIMELINE:                                                                  │
+│  T=0ms    Producer calls publish()                                          │
+│  T=50ms   SNS returns MessageId to producer                                │
+│  T=50ms   Producer continues (doesn't wait for delivery)                   │
+│  T=100ms  SNS delivers to SQS Queue 1 (sqs:SendMessage)                   │
+│  T=120ms  SNS delivers to SQS Queue 2 (sqs:SendMessage)                   │
+│  T=140ms  SNS delivers to SQS Queue 3 (sqs:SendMessage)                   │
+│  T=200ms  SNS sends email to subscriber                                    │
+│  → All deliveries happen in PARALLEL (not sequential)                      │
+│  → Total fan-out latency: ~100-200ms                                       │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  2. SQS QUEUE POLICY — THE PERMISSION HANDSHAKE                             │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  WITHOUT queue policy:                                                      │
+│  SNS → "I want to send message to queue" → SQS: "Access Denied" ❌        │
+│  → publish() returns SUCCESS (SNS accepted it)                             │
+│  → But SQS never receives the message                                      │
+│  → SILENT FAILURE — hardest bug to debug in fan-out                        │
+│                                                                             │
+│  WITH queue policy:                                                         │
+│  {                                                                          │
+│    "Statement": [{                                                          │
+│      "Effect": "Allow",                                                     │
+│      "Principal": {"Service": "sns.amazonaws.com"},                        │
+│      "Action": "sqs:SendMessage",                                          │
+│      "Resource": "arn:aws:sqs:...:etl-processing-queue",                   │
+│      "Condition": {                                                         │
+│        "ArnEquals": {                                                       │
+│          "aws:SourceArn": "arn:aws:sns:...:file-events"                    │
+│        }                                                                    │
+│      }                                                                      │
+│    }]                                                                       │
+│  }                                                                          │
+│                                                                             │
+│  → Allows SNS service to send messages to this specific queue              │
+│  → Condition: only from this specific SNS topic (not any topic)            │
+│  → Without Condition: ANY SNS topic could write to your queue              │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  3. RAW MESSAGE DELIVERY — WHAT CONSUMER RECEIVES                           │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Producer publishes:                                                        │
+│  Message = '{"s3_key": "campaign.csv", "size_mb": 52.3}'                   │
+│                                                                             │
+│  WITHOUT Raw Delivery (default):                                            │
+│  SQS message body = {                                                       │
+│    "Type": "Notification",                                                  │
+│    "MessageId": "abc-123",                                                  │
+│    "TopicArn": "arn:aws:sns:...:file-events",                              │
+│    "Subject": "New file arrived",                                           │
+│    "Message": "{\"s3_key\": \"campaign.csv\", \"size_mb\": 52.3}",        │
+│    "Timestamp": "2025-07-15T02:01:00.000Z",                               │
+│    "SignatureVersion": "1",                                                 │
+│    "Signature": "...",                                                      │
+│    "SigningCertUrl": "...",                                                  │
+│    "UnsubscribeUrl": "...",                                                 │
+│    "MessageAttributes": {                                                   │
+│      "event_type": {"Type": "String", "Value": "file_arrived"}             │
+│    }                                                                        │
+│  }                                                                          │
+│  → Consumer must: parse outer JSON → extract "Message" → parse inner JSON  │
+│  → TWO levels of JSON parsing                                              │
+│                                                                             │
+│  WITH Raw Delivery (RawMessageDelivery = true):                             │
+│  SQS message body = {"s3_key": "campaign.csv", "size_mb": 52.3}           │
+│  → Consumer parses ONE level of JSON                                       │
+│  → Message attributes still available as SQS message attributes            │
+│  → SIMPLER consumer code                                                   │
+│  → RECOMMENDED for SQS subscribers                                         │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  4. DELIVERY GUARANTEES                                                     │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  SNS → SQS delivery:                                                        │
+│  → At-least-once: SNS may deliver duplicate to SQS                         │
+│  → SQS also delivers at-least-once to consumer                             │
+│  → Net effect: consumer may see same message 2+ times                      │
+│  → CONSUMER MUST BE IDEMPOTENT                                             │
+│                                                                             │
+│  What "idempotent" means:                                                   │
+│  → Processing same message twice produces same result                      │
+│  → Example: INSERT with UPSERT logic (insert or update if exists)          │
+│  → Example: check "already processed" flag before processing               │
+│  → Example: use message ID as idempotency key in database                  │
+│                                                                             │
+│  Failure scenarios:                                                         │
+│  → SNS → SQS delivery fails: SNS retries for up to 23 days               │
+│  → SQS message expires (retention): message permanently lost              │
+│  → Consumer crashes: message reappears after visibility timeout            │
+│  → Consumer fails 3 times: message moves to DLQ                           │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  5. FAN-OUT INDEPENDENCE                                                    │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Each SQS queue is COMPLETELY independent:                                  │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────┐                  │
+│  │ Queue: etl-processing                                 │                  │
+│  │   Visibility: 300s (ETL takes 5 minutes)              │                  │
+│  │   Retention: 7 days                                    │                  │
+│  │   DLQ: etl-processing-dlq (maxReceiveCount: 3)        │                  │
+│  │   Consumer: EC2 ETL worker                             │                  │
+│  │   Status: 5 messages backlog ← SLOW but independent   │                  │
+│  └──────────────────────────────────────────────────────┘                  │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────┐                  │
+│  │ Queue: quality-check                                   │                  │
+│  │   Visibility: 60s (QA check takes 10 seconds)         │                  │
+│  │   Retention: 3 days                                    │                  │
+│  │   DLQ: quality-check-dlq (maxReceiveCount: 5)         │                  │
+│  │   Consumer: Lambda function                            │                  │
+│  │   Status: 0 messages ← FAST, fully caught up          │                  │
+│  └──────────────────────────────────────────────────────┘                  │
+│                                                                             │
+│  → ETL being slow does NOT affect quality check                            │
+│  → Quality check DLQ filling up does NOT affect ETL                        │
+│  → Each consumer scales independently                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Published to SNS successfully but SQS queue is empty"
+</span>→ Cause: SQS queue policy doesn't allow sns:SendMessage
+→ THIS IS THE #1 FAN-OUT BUG — silent failure
+→ SNS returns success (it accepted the message)
+→ But delivery to SQS fails (permission denied)
+→ Fix: add queue policy allowing SNS topic to send
+→ Debug: check SNS delivery status logs (if enabled)
+
+PITFALL 2: "Consumer receives double-wrapped JSON"
+→ Cause: raw delivery not enabled + consumer parsing message body as JSON
+→ Message body contains SNS envelope with "Message" field inside
+→ Consumer parses outer JSON but not inner "Message" string
+→ Fix: enable raw delivery on SQS subscription
+→ Or: parse two levels: outer SNS envelope → inner Message JSON
+
+PITFALL 3: "Adding new SQS subscription doesn't receive messages"
+→ Cause: SQS subscription is auto-confirmed (good)
+→ But queue policy not updated to allow the SNS topic
+→ Fix: update queue policy BEFORE subscribing
+
+PITFALL 4: "Fan-out works for some queues but not others"
+→ Cause: queue policy only allows specific topic ARN
+→ Using wrong topic ARN in condition
+→ Fix: verify SourceArn condition matches exactly
+
+PITFALL 5: "Message attributes missing in SQS consumer"
+→ Cause: raw delivery changes how attributes are delivered
+→ With raw: attributes become SQS message attributes
+→ Without raw: attributes are in SNS envelope JSON
+→ Fix: consistent raw delivery setting + matching consumer code
+
+PITFALL 6: "Cross-account fan-out fails silently"
+→ Cause: SQS queue in Account B needs both:
+   → SQS queue policy allowing SNS from Account A
+   → SNS topic policy allowing subscribe from Account B
+→ Missing either = silent failure
+→ Covered in detail in Project 59
+
+PITFALL 7: "Duplicate messages in SQS after fan-out"
+→ Cause: SNS delivers at-least-once to SQS
+→ Under high load or retries: duplicate delivery possible
+→ Fix: consumer must be idempotent
+→ Pattern: track processed MessageId in database</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FAN-OUT LIMITS:
+</span>→ Subscriptions per topic: 12,500,000 (soft limit)
+→ SNS publishes per second: 30,000 (per topic)
+→ SQS receives per second: unlimited (Standard)
+→ QuickCart: 4 subscriptions, ~200 messages/day = trivial
+
+FAN-OUT LATENCY:
+→ SNS processing: ~50ms
+→ SNS → SQS delivery: ~50-100ms per subscription
+→ Parallel delivery: all subscriptions delivered simultaneously
+→ Total: ~100-200ms from publish to all queues populated
+→ For QuickCart batch ETL: negligible
+
+COST AT SCALE:
+→ SNS publish: $0.50 per million requests
+→ SNS → SQS delivery: free (same account)
+→ SQS receive: $0.40 per million requests (per queue)
+→ 4 queues × 200 msg/day = 800 SQS requests/day
+→ Monthly: 24,000 requests = $0.00 (free tier covers 1M)
+
+SCALING FAN-OUT:
+→ 1-5 consumers: simple SNS → SQS setup (this project)
+→ 5-20 consumers: same pattern, consider filter policies (Project 51)
+→ 20-100 consumers: consider EventBridge for complex routing (Project 66)
+→ 100+ consumers: architectural review — probably need event mesh</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY FAN-OUT IS WORKING:
+</span>
+1. Publish test message to topic
+   → aws sns publish --topic-arn &lt;arn&gt; --message '{"test": true}'
+
+2. Check EACH queue received the message
+   → For each queue:
+     aws sqs get-queue-attributes --queue-url &lt;url&gt; 
+       --attribute-names ApproximateNumberOfMessages
+   → All should show +1
+
+3. Verify message content in each queue
+   → aws sqs receive-message --queue-url &lt;url&gt; --max-number-of-messages 1
+   → Compare message body across queues — should be identical
+   → If raw delivery: exact match
+   → If not raw: wrapped in SNS envelope
+
+4. Check SNS delivery status
+   → Enable delivery status logging on topic
+   → CloudWatch Logs: successful/failed deliveries per subscription
+   → Shows exactly which subscriptions received/failed
+
+5. Monitor queue depths after production publish
+   → All fan-out queues should have same message count
+   → If one queue has fewer: delivery failure to that queue
+   → If one queue has more: that consumer is slower (backlog)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(14)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Fan-Out Infrastructure</h3>
+
+<h3>Step 2: Fan-Out Publisher</h3>
+
+<h3>Step 3: Verify Fan-Out Delivery</h3>
+
+<h3>Step 4: Independent Consumers for Each Queue</h3>
+
+<h3>Step 5: End-to-End Fan-Out Integration Test</h3>
+
+<h3>Step 6: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Prerequisites:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS operational (Project 12)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SQS operational (Project 13)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → boto3 installed</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create complete fan-out infrastructure</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    (topic + 3 queues + 3 DLQs + policies + subscriptions)</span><span>
+</span>python3 01_create_fanout.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Publish test events (fan-out to all queues)</span><span>
+</span>python3 02_fanout_publisher.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Verify all queues received messages</span><span>
+</span>python3 03_verify_fanout.py
+<span>python3 03_verify_fanout.py peek         </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># See message content</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run all consumers (process from each queue)</span><span>
+</span>python3 04_fanout_consumers.py all
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run individual consumers (production pattern)</span><span>
+</span><span>python3 04_fanout_consumers.py etl       </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ETL only</span><span>
+</span><span>python3 04_fanout_consumers.py quality   </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># QA only  </span><span>
+</span><span>python3 04_fanout_consumers.py audit     </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Audit only</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Run full integration test</span><span>
+</span>python3 05_integration_test.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Monitor queue health</span><span>
+</span><span>python3 </span><span class="token" style="color: rgb(57, 58, 52);">..</span><span>/project_13/05_queue_monitor.py   </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Reuse from Project 13</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED INTEGRATION TEST OUTPUT:
+</span>
+=================================================================
+🧪 FAN-OUT INTEGRATION TEST
+   Time: 2025-07-15 10:45:23
+=================================================================
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 1: Publish event to SNS topic
+─────────────────────────────────────────────────────────────────
+   ✅ Published: abc123-def456-ghi789
+   Event ID: 550e8400-e29b-41d4-a716-446655440000
+
+   ⏳ Waiting 3 seconds for fan-out delivery...
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 2: Verify all queues received the message
+─────────────────────────────────────────────────────────────────
+   ✅ etl_processing: 1 message(s) — received
+   ✅ quality_check: 1 message(s) — received
+   ✅ audit_log: 1 message(s) — received
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 3: Consume and verify message content
+─────────────────────────────────────────────────────────────────
+   ✅ etl_processing: event_id matches (raw delivery)
+      ✅ Message attributes preserved
+      🗑️  Message deleted from etl_processing
+   ✅ quality_check: event_id matches (raw delivery)
+      ✅ Message attributes preserved
+      🗑️  Message deleted from quality_check
+   ✅ audit_log: event_id matches (raw delivery)
+      ✅ Message attributes preserved
+      🗑️  Message deleted from audit_log
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 4: Verify all DLQs are empty
+─────────────────────────────────────────────────────────────────
+   ✅ etl_processing DLQ: empty (no failures)
+   ✅ quality_check DLQ: empty (no failures)
+   ✅ audit_log DLQ: empty (no failures)
+
+─────────────────────────────────────────────────────────────────
+🧪 TEST 5: Verify all queues empty after consumption
+─────────────────────────────────────────────────────────────────
+   ✅ etl_processing: empty (all consumed)
+   ✅ quality_check: empty (all consumed)
+   ✅ audit_log: empty (all consumed)
+
+=================================================================
+📊 INTEGRATION TEST RESULTS
+=================================================================
+   Passed: 14/14
+   Failed: 0/14
+   🟢 ALL TESTS PASSED — fan-out verified end-to-end
+=================================================================</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED CONSUMER OUTPUT:
+</span>
+=================================================================
+🔀 FAN-OUT CONSUMERS — SEQUENTIAL DEMO
+   (In production, these run in PARALLEL on separate instances)
+=================================================================
+
+─────────────────────────────────────────────────────────────────
+🔄 CONSUMER: etl_processing
+─────────────────────────────────────────────────────────────────
+
+   Iteration 1/2: 3 messages
+
+      🔄 ETL: Loading daily_exports/orders/orders_20250715.csv (52.3 MB)
+         Step 1: Download from S3...
+         Step 2: Validate schema...
+         Step 3: COPY to Redshift staging...
+         ✅ ETL complete for orders_20250715.csv
+
+      🔄 ETL: Loading daily_exports/customers/customers_20250715.csv (10.1 MB)
+         Step 1: Download from S3...
+         Step 2: Validate schema...
+         Step 3: COPY to Redshift staging...
+         ✅ ETL complete for customers_20250715.csv
+
+      🔄 ETL: Loading campaign_uploads/summer_promo_results.csv (5.7 MB)
+         Step 1: Download from S3...
+         Step 2: Validate schema...
+         Step 3: COPY to Redshift staging...
+         ✅ ETL complete for summer_promo_results.csv
+
+   📊 Consumer 'etl_processing' summary:
+      Processed: 3
+      Failed:    0
+
+─────────────────────────────────────────────────────────────────
+🔄 CONSUMER: quality_check
+─────────────────────────────────────────────────────────────────
+
+   Iteration 1/2: 3 messages
+
+      🔍 QA: Checking quality of orders_20250715.csv
+         ✅ row_count: 12,500 rows
+         ✅ null_check: 0 fully null columns
+         ✅ schema_match: 8/8 columns match
+         ✅ Quality check PASSED
+
+      (... similar for other files ...)
+
+📊 FAN-OUT CONSUMER SUMMARY
+─────────────────────────────────────────────────────────────────
+
+   Consumer             Processed     Failed Status
+   ───────────────────────────────────────────────────────
+   etl_processing               3          0 🟢
+   quality_check                3          0 🟢
+   audit_log                    3          0 🟢
+   ───────────────────────────────────────────────────────
+   TOTAL                        9          0
+
+💡 KEY INSIGHT:
+   Each consumer processed the SAME events independently.
+   If ETL processed 3 events, quality checker also processed 3.
+   If quality checker was slow, ETL was NOT affected.</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ FAN-OUT PATTERN: ONE publish → MULTIPLE independent consumers
+→ SNS topic: the central routing hub (producer publishes here)
+→ SQS queues: independent buffers (one per consumer)
+→ DECOUPLING: producer knows ONLY the topic, not the consumers
+   → Adding Consumer 5 = subscribe new queue (zero code change)
+   → Removing Consumer 2 = unsubscribe (zero code change)
+
+→ CRITICAL SETUP: SQS queue policy MUST allow SNS to send messages
+   → Without this: silent failure — publish succeeds, delivery fails
+   → #1 debugging issue in fan-out architectures
+
+→ RAW MESSAGE DELIVERY: SQS receives exact published message
+   → Without raw: double-wrapped JSON (SNS envelope + message)
+   → With raw: clean JSON — consumer parses one level
+
+→ INDEPENDENCE: each consumer has own queue, DLQ, visibility, retention
+   → Slow consumer doesn't block others
+   → Failed consumer doesn't affect others
+   → Each scales independently
+
+→ IDEMPOTENCY: consumers MUST handle duplicate messages
+   → SNS delivers at-least-once to SQS
+   → SQS delivers at-least-once to consumer
+   → Net: duplicates are possible — consumer must handle gracefully
+
+THE PATTERN IN ONE SENTENCE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"Publish once to SNS, subscribe N SQS queues,
+ each consumer processes independently."
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): files land in S3, triggering events
+→ Project 12 (SNS): topic creation, email subscriptions — reused here
+→ Project 13 (SQS): queue creation, DLQ, consumer patterns — reused here
+→ All three combined: S3 → SNS → multiple SQS → multiple consumers
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 15 (Glue Catalog): catalog data so other tools know the schema
+→ Project 17 (S3 → SNS): S3 native event notifications trigger fan-out
+→ Project 18 (S3 → SQS): direct S3 → SQS for single-consumer patterns
+→ Project 28 (End-to-end): complete S3 → SNS → SQS → EC2 → Notify pipeline
+→ Project 51 (Filter Policies): route different events to different queues
+→ Project 59 (Cross-account): Account A's SNS → Account B's SQS fan-out</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a complete event-driven messaging infrastructure:
+</span>→ SNS for notifications (Project 12)
+→ SQS for buffering (Project 13)
+→ SNS → SQS fan-out for multi-consumer patterns (This Project)
+
+The data platform has:
+→ S3 for storage (Project 1-4)
+→ EC2 for compute (Project 5-6)
+→ MariaDB for OLTP (Projects 8-9)
+→ Redshift for OLAP (Projects 10-11)
+→ SNS/SQS for messaging (Projects 12-14)
+
+BUT there's a gap — the data analyst says:
+"I have CSV files in S3. I have tables in MariaDB. I have tables
+ in Redshift. But there's no CATALOG — no central place that says
+ 'these are the datasets we have, here are their schemas,
+ here is where they live.'
+
+ When I want to query S3 files with Athena, I have to manually
+ define the schema. When Glue wants to read a table, it needs
+ to know the structure. We need a DATA CATALOG."
+
+→ Project 15: "Catalog Our Data So Other Tools Know the Schema"
+→ Introduces: AWS Glue Data Catalog → Database → Table → 
+   Manual Definition → Schema Management
+→ The Glue Catalog becomes the CENTRAL METADATA STORE
+→ Athena (Project 16), Glue ETL (Project 25), Spectrum (Project 38)
+   ALL read from this catalog</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="33" ========== -->
+<div class="chat-message" data-index="33"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-13.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 14 of 80</span>
+    <span class="nav-project-title">ONE EVENT MUST REACH MULTIPLE CONSUMERS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-15.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-15.html") window.location = "project-15.html";
+  if (e.key === 'ArrowLeft' && "project-13.html") window.location = "project-13.html";
+});
+</script>
+</body>
+</html>

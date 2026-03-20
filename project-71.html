@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 71: BUILD A MULTI-ACCOUNT DATA MESH — PRODUCERS PUBLISH, CONSUME — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:89%"></div></div>
+<div id="progress-label">89%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 71 of 80</div>
+  <div class="project-title">BUILD A MULTI-ACCOUNT DATA MESH — PRODUCERS PUBLISH, CONSUMERS SUBSCRIBE</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" has grown from a 3-person startup (Project 1)
+</span>         to a 400-person company with 5 engineering teams
+
+CURRENT STATE:
+→ Single AWS account (111111111111) holds EVERYTHING
+→ 50+ Glue jobs, 200+ Glue Catalog tables, 15 TB in S3
+→ One Redshift cluster shared by all teams
+→ 3 MariaDB instances on EC2 for different domains
+→ IAM has 120 policies — nobody knows who can access what
+→ Team A accidentally dropped Team B's Redshift schema last month
+→ Billing is one giant blob — no cost attribution per team
+
+TEAMS &amp; THEIR DATA:
+┌──────────────────┬─────────────────────────┬──────────────────────────┐
+│ Team             │ Data They Own           │ Data They Need           │
+├──────────────────┼─────────────────────────┼──────────────────────────┤
+│ Orders Domain    │ orders, order_items,    │ customers, products      │
+│                  │ payments, refunds       │                          │
+├──────────────────┼─────────────────────────┼──────────────────────────┤
+│ Customer Domain  │ customers, addresses,   │ orders (aggregated)      │
+│                  │ preferences, segments   │                          │
+├──────────────────┼─────────────────────────┼──────────────────────────┤
+│ Product Domain   │ products, categories,   │ order_items (for demand) │
+│                  │ inventory, pricing      │                          │
+├──────────────────┼─────────────────────────┼──────────────────────────┤
+│ Analytics Domain │ reports, dashboards,    │ ALL domain data          │
+│                  │ ML features             │                          │
+├──────────────────┼─────────────────────────┼──────────────────────────┤
+│ Platform / Gov.  │ Catalog, permissions,   │ Metadata from all        │
+│                  │ audit logs, monitoring  │                          │
+└──────────────────┴─────────────────────────┴──────────────────────────┘
+
+CTO MANDATE:
+"Each team must OWN their data end-to-end.
+ They produce it, they quality-check it, they publish it.
+ Other teams SUBSCRIBE — they don't copy-paste pipelines.
+ Central platform team governs access, not data."
+
+THIS IS A DATA MESH.</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Data Mesh Principles (Zhamak Dehghani, 2019)
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ PRINCIPLE 1: Domain Ownership
+  Each team owns the full lifecycle of their data
+  → Not "central data team does everything"
+
+→ PRINCIPLE 2: Data as a Product
+  Each domain publishes curated, documented, SLA-backed datasets
+  → Not raw dumps — polished, versioned, discoverable
+
+→ PRINCIPLE 3: Self-Serve Data Platform
+  Central team provides tools, not transforms
+  → Shared infra (accounts, catalog, IAM) — not shared pipelines
+
+→ PRINCIPLE 4: Federated Computational Governance
+  Global standards (encryption, naming, quality) — local execution
+  → Central sets rules, domains enforce them
+
+Step 2: Map Principles to AWS Services
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Domain Ownership      = Separate AWS Account per domain
+→ Data as Product       = S3 (Bronze/Silver/Gold) + Glue Catalog per account
+→ Self-Serve Platform   = Central Governance Account with Lake Formation
+→ Cross-Domain Access   = Cross-Account S3 + Glue Catalog + Redshift Data Sharing
+→ Event Notification    = Cross-Account SNS → SQS (data product published)
+→ Federated Governance  = Lake Formation tags + Resource Policies
+
+Step 3: Define Account Structure
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Account A —[REDACTED:BANK_ACCOUNT_NUMBER]1 — "Orders Domain"
+Account B —[REDACTED:BANK_ACCOUNT_NUMBER]2 — "Customer Domain"
+Account C —[REDACTED:BANK_ACCOUNT_NUMBER]3 — "Analytics Domain" (Consumer)
+Account G — 444444444444 — "Central Governance / Platform"
+
+Step 4: Define Data Product Contract
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Every data product MUST have:
+→ S3 location (Gold layer Parquet)
+→ Glue Catalog table (schema registered)
+→ Data quality score (from Glue DQ — Project 68)
+→ SLA (freshness guarantee)
+→ Owner contact
+→ SNS notification on publish</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE MULTI-ACCOUNT DATA MESH ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    ACCOUNT G: CENTRAL GOVERNANCE[REDACTED:BANK_ACCOUNT_NUMBER]44)              │
+│                                                                              │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────────────────┐ │
+│  │  Lake Formation   │  │  Central Glue    │  │  SNS: data-product-events  │ │
+│  │  (Permissions)    │  │  Catalog (Ref)   │  │  (Fan-out to consumers)    │ │
+│  └────────┬─────────┘  └────────┬─────────┘  └─────────┬──────────────────┘ │
+│           │ Grants                │ Resource Policy       │ Cross-Acct Pub    │
+└───────────┼───────────────────────┼───────────────────────┼──────────────────┘
+            │                       │                       │
+    ┌───────┴────────┬──────────────┴──────┬────────────────┴──────────┐
+    │                │                     │                           │
+    ▼                ▼                     ▼                           ▼
+┌──────────────┐ ┌──────────────┐  ┌──────────────┐          ┌──────────────┐
+│ ACCOUNT A    │ │ ACCOUNT B    │  │ ACCOUNT C    │          │ ALL ACCOUNTS │
+│ Orders Domain│ │ Cust. Domain │  │ Analytics    │          │ SQS Queues   │
+│              │ │              │  │ (Consumer)   │          │ (Subscribed) │
+│ ┌──────────┐ │ │ ┌──────────┐ │  │              │          └──────────────┘
+│ │ MariaDB  │ │ │ │ MariaDB  │ │  │ ┌──────────┐ │
+│ │ (Source)  │ │ │ │ (Source)  │ │  │ │ Redshift │ │
+│ └────┬─────┘ │ │ └────┬─────┘ │  │ │ Serverless│ │
+│      │       │ │      │       │  │ └────┬─────┘ │
+│      ▼       │ │      ▼       │  │      │       │
+│ ┌──────────┐ │ │ ┌──────────┐ │  │      │ Spectrum
+│ │ Glue ETL │ │ │ │ Glue ETL │ │  │      │ + Athena │
+│ │ (CDC)    │ │ │ │ (CDC)    │ │  │      ▼       │
+│ └────┬─────┘ │ │ └────┬─────┘ │  │ ┌──────────┐ │
+│      │       │ │      │       │  │ │Cross-Acct │ │
+│      ▼       │ │      ▼       │  │ │ S3 Read   │ │
+│ S3 Bucket    │ │ S3 Bucket    │  │ │ Glue Cat  │ │
+│ ┌──────────┐ │ │ ┌──────────┐ │  │ └──────────┘ │
+│ │ Bronze   │ │ │ │ Bronze   │ │  │              │
+│ │ Silver   │ │ │ │ Silver   │ │  │              │
+│ │ Gold ════╪═╪═╪═╪══════════╪═╪══╪══► READS     │
+│ └──────────┘ │ │ └──────────┘ │  │              │
+│              │ │              │  │              │
+│ Glue Catalog │ │ Glue Catalog │  │ Ext. Schema  │
+│ (Registered) │ │ (Registered) │  │ (References) │
+└──────────────┘ └──────────────┘  └──────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>OPTION A: Centralized Data Lake (Traditional)
+</span>→ One account, one S3 bucket, one Glue Catalog
+→ Central team does all ETL
+→ Problem: bottleneck, no ownership, no accountability
+→ ❌ REJECTED — this is what they're escaping
+
+OPTION B: Copy-Based Sharing
+→ Each domain copies data to consumer accounts
+→ Problem: data duplication, staleness, storage cost explosion
+→ Problem: 4 domains × 3 consumers = 12 copies of same data
+→ ❌ REJECTED — doesn't scale
+
+OPTION C: Cross-Account Access-Based Sharing (Data Mesh) ✅
+→ Data stays in producer's account
+→ Consumers READ from producer's S3 + Glue Catalog
+→ No copies, always fresh, single source of truth
+→ Governance account controls who reads what
+→ ✅ SELECTED
+
+OPTION D: Redshift Data Sharing Only
+→ Works for Redshift-to-Redshift
+→ Doesn't cover S3/Athena/Glue consumers
+→ Partial solution — used WITHIN Option C for Redshift consumers
+→ ✅ INCLUDED as component
+
+DECISION: Option C + Option D component
+→ S3 cross-account for data lake layer
+→ Glue Catalog cross-account for schema discovery
+→ Redshift Data Sharing for warehouse consumers
+→ SNS→SQS cross-account for event notifications
+→ Lake Formation for centralized permission governance</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ONE AWS ACCOUNT PER DOMAIN — strict blast radius isolation
+</span>   → Orders Domain cannot accidentally affect Customer Domain
+   → Billing separated per account automatically
+
+2. STANDARDIZE data product structure across ALL domains
+   → s3://{domain}-data-{env}/{layer}/{entity}/year=YYYY/month=MM/day=DD/
+   → Glue Catalog: database = {domain}_{layer} → table = {entity}
+   → Parquet + Snappy compression for Gold layer
+
+3. CENTRAL GOVERNANCE ACCOUNT manages:
+   → AWS Organizations (SCPs)
+   → Lake Formation permissions
+   → Cross-account IAM roles (trust policies)
+   → SNS topic for data product events
+
+4. PUBLISH-SUBSCRIBE pattern for data product availability:
+   → Producer finishes ETL → publishes to SNS
+   → Consumer SQS queues receive notification
+   → Consumer triggers their downstream pipeline
+
+5. TAG everything:
+   → domain=orders, layer=gold, data_product=daily_orders, version=v2
+   → Tags drive Lake Formation access control (Project 74)
+
+6. DATA PRODUCT REGISTRY:
+   → DynamoDB table in Governance account
+   → Tracks: product name, owner, S3 path, SLA, quality score, version
+
+7. EACH PRODUCER runs their own:
+   → Glue Crawlers (schema detection)
+   → Glue ETL (Bronze → Silver → Gold) — Project 44
+   → Glue Data Quality (validation) — Project 68
+   → Only AFTER quality passes → publish event</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT create a "shared services" account that does all ETL
+</span>   → This recreates the central bottleneck
+   → Domains must own their pipelines
+
+2. DO NOT give consumers WRITE access to producer S3
+   → Read-only cross-account access
+   → Consumers write to THEIR OWN account only
+
+3. DO NOT skip the Governance account
+   → Without central permission control = chaos
+   → "Everyone can read everything" is NOT a data mesh
+
+4. DO NOT copy data between accounts for sharing
+   → Cross-account S3 reads are free (same region)
+   → Copying doubles storage cost AND introduces staleness
+
+5. DO NOT let each domain invent their own folder structure
+   → Central platform team defines the standard
+   → Domains execute it in their accounts
+
+6. DO NOT use cross-account IAM users
+   → Always use cross-account IAM ROLES with AssumeRole
+   → Never share access keys between accounts (Project 56)
+
+7. DO NOT skip SNS notification on data product publish
+   → Without events, consumers resort to polling or guessing
+   → Event-driven = reliable, immediate, auditable
+
+8. DO NOT expose raw Bronze/Silver layers as data products
+   → Only Gold layer is a data product
+   → Bronze/Silver are internal to the domain</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────┬─────────────────────┬──────────────────────────────────────┐
+</span>│ Cross-Domain Sharing Need         │ Use                 │ Why                                  │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Consumer queries S3 with Athena   │ Cross-Acct S3       │ S3 bucket policy grants read         │
+│                                   │ + Cross-Acct Glue   │ Glue resource policy shares catalog  │
+│                                   │ Catalog             │ (Projects 56, 57)                    │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Consumer queries from Redshift    │ Redshift Data       │ Zero-copy, live, no ETL              │
+│                                   │ Sharing             │ (Project 58)                         │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Consumer queries S3 from Redshift │ Redshift Spectrum   │ External schema pointing to          │
+│ (without loading)                 │ + Cross-Acct S3     │ producer's S3 (Project 38)           │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Consumer needs event: "new data   │ Cross-Acct SNS →    │ Pub/Sub, decoupled, reliable         │
+│ product published"                │ SQS                 │ (Project 59)                         │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Fine-grained column-level         │ Lake Formation      │ Tag-based, column-level, cross-acct  │
+│ access control                    │ (Governance Acct)   │ (Project 74)                         │
+├───────────────────────────────────┼─────────────────────┼──────────────────────────────────────┤
+│ Consumer needs to query MULTIPLE  │ Athena Federated    │ Lambda connectors per source         │
+│ producer catalogs in one query    │ Query               │ account (Project 64)                 │
+└───────────────────────────────────┴─────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE DATA MESH</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. SMALL TEAM (&lt; 15 engineers)
+</span>   → Overhead of multi-account &gt; benefit
+   → Stick with single account + proper IAM
+   → Data Mesh is an organizational pattern, not just technical
+
+2. SINGLE DOMAIN
+   → If all data is "e-commerce" with no clear boundaries
+   → Mesh needs domain decomposition to be meaningful
+
+3. NO PLATFORM TEAM CAPACITY
+   → Data Mesh requires a platform team to build self-serve tooling
+   → Without it, each domain reinvents the wheel
+
+4. COMPLIANCE REQUIRES SINGLE ACCOUNT
+   → Some regulated industries mandate single-account control
+   → Data Mesh CAN work in single account (IAM-isolated)
+   → But loses blast radius benefit
+
+5. REAL-TIME STREAMING PRIMARY USE CASE
+   → Data Mesh is primarily batch/near-real-time oriented
+   → Streaming mesh needs Kafka + Schema Registry (different pattern)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CROSS-ACCOUNT DATA MESH — WHAT HAPPENS UNDER THE HOOD:
+</span>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1: PRODUCER PUBLISHES DATA PRODUCT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Account A (Orders Domain):
+  ┌─────────────────────────────────────────────────────┐
+  │ 1. Glue ETL runs: MariaDB → Bronze → Silver → Gold  │
+  │ 2. Gold Parquet written to:                          │
+  │    s3://orders-data-prod/gold/daily_orders/          │
+  │       year=2025/month=01/day=15/                     │
+  │       part-00000.snappy.parquet                      │
+  │ 3. Glue Crawler updates catalog:                     │
+  │    Database: orders_gold                             │
+  │    Table: daily_orders                               │
+  │ 4. Glue DQ validates (Project 68):                   │
+  │    → Completeness &gt; 99%                              │
+  │    → Uniqueness on order_id = 100%                   │
+  │    → Freshness &lt; 2 hours                             │
+  │ 5. IF quality passes:                                │
+  │    → Publish to SNS: data-product-events             │
+  │    → Register in DynamoDB product registry            │
+  └─────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2: CROSS-ACCOUNT ACCESS CHAIN (HOW READ ACTUALLY WORKS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  When Account C (Analytics) runs Athena query on Account A's data:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │  1. Athena (Account C) receives SQL:                            │
+  │     SELECT * FROM orders_domain.daily_orders                    │
+  │     WHERE year='2025' AND month='01'                            │
+  │                                                                 │
+  │  2. Athena looks up "orders_domain" database                    │
+  │     → This is an EXTERNAL catalog reference                     │
+  │     → Points to Account A's Glue Catalog (via Resource Policy)  │
+  │                                                                 │
+  │  3. Glue Catalog (Account A) checks:                            │
+  │     → Does Account C have glue:GetTable permission?             │
+  │     → Resource Policy says: YES for 333333333333                │
+  │     → Returns table schema + S3 location                        │
+  │                                                                 │
+  │  4. Athena now knows data is at:                                │
+  │     s3://orders-data-prod/gold/daily_orders/                    │
+  │                                                                 │
+  │  5. Athena assumes cross-account role in Account A:             │
+  │     → arn:aws:iam::111111111111:role/CrossAcctDataReader        │
+  │     → Trust policy allows 333333333333 to assume it             │
+  │     → Role has s3:GetObject on orders-data-prod bucket          │
+  │                                                                 │
+  │  6. S3 (Account A) checks:                                     │
+  │     → Bucket policy: allows s3:GetObject for this role? YES     │
+  │     → Object returned to Athena                                 │
+  │                                                                 │
+  │  7. Athena processes Parquet, returns results                   │
+  │     → Results written to Account C's own S3 output bucket       │
+  │                                                                 │
+  │  TOTAL CROSS-ACCOUNT HOPS: 3                                    │
+  │  (Glue Catalog → IAM STS → S3)                                  │
+  │                                                                 │
+  │  DATA COPIED: ZERO (read in place)                              │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3: EVENT PROPAGATION (SNS → SQS CROSS-ACCOUNT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Account A publishes to Governance SNS topic:
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  SNS Topic (Account G: [REDACTED:BANK_ACCOUNT_NUMBER]):                       │
+  │  arn:aws:sns:us-east-2:444444444444:data-product-events     │
+  │                                                             │
+  │  Topic Policy allows:                                       │
+  │  → Account A (111111111111) → sns:Publish                   │
+  │  → Account B ([REDACTED:BANK_ACCOUNT_NUMBER]) → sns:Publish                   │
+  │                                                             │
+  │  Subscriptions:                                              │
+  │  → SQS Queue (Account C) → arn:aws:sqs:...:analytics-queue │
+  │  → SQS Queue (Account B) → arn:aws:sqs:...:customer-queue  │
+  │                                                             │
+  │  Queue Policies allow:                                       │
+  │  → SNS topic ARN → sqs:SendMessage                          │
+  │                                                             │
+  │  FLOW:                                                       │
+  │  Account A publishes → SNS fans out → SQS in B and C        │
+  │  → Account C polls SQS → sees "daily_orders v2 published"   │
+  │  → Triggers downstream Glue job / Step Function              │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4: IAM TRUST CHAIN — THE FULL PICTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  For Account C's Glue job to read Account A's S3:
+
+  Account A creates:
+  ┌─────────────────────────────────────────────────────┐
+  │ Role: CrossAcctDataReader                            │
+  │ Trust Policy:                                        │
+  │   Principal: arn:aws:iam::333333333333:root          │
+  │   Action: sts:AssumeRole                             │
+  │   Condition: ExternalId = "mesh-analytics-2025"      │
+  │                                                      │
+  │ Permission Policy:                                   │
+  │   s3:GetObject → orders-data-prod/gold/*             │
+  │   s3:ListBucket → orders-data-prod (prefix: gold/)   │
+  │   glue:GetTable → orders_gold.*                      │
+  │   glue:GetDatabase → orders_gold                     │
+  └─────────────────────────────────────────────────────┘
+
+  Account C creates:
+  ┌─────────────────────────────────────────────────────┐
+  │ Role: GlueETLRole (attached to Glue job)             │
+  │ Permission Policy:                                   │
+  │   sts:AssumeRole →                                   │
+  │     arn:aws:iam::111111111111:role/CrossAcctReader    │
+  │   s3:PutObject → analytics-data-prod/* (own bucket)  │
+  └─────────────────────────────────────────────────────┘
+
+  Runtime flow:
+  Glue job (Acct C) → STS AssumeRole (Acct A) → gets temp creds
+  → reads S3 (Acct A) → writes results to S3 (Acct C)</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Access Denied" — but policies LOOK correct
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cross-account S3 requires BOTH:
+  a) Bucket policy in producer account (resource-based)
+  b) IAM role in consumer account (identity-based)
+→ Missing EITHER one = Access Denied
+→ Debug: use CloudTrail in BOTH accounts to see which check failed
+
+PITFALL 2: Glue Catalog cross-account — "Database not found"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Must specify CatalogId (account ID) when referencing external catalog
+→ Without CatalogId, Glue looks in LOCAL catalog only
+→ Resource Policy on producer's Glue Catalog must explicitly allow consumer
+
+PITFALL 3: SNS cross-account publish — "AuthorizationError"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Topic Policy must allow sns:Publish from producer account
+→ Producer's IAM role must have sns:Publish on the topic ARN
+→ BOTH policies checked — like S3 cross-account (Project 56 pattern)
+
+PITFALL 4: Data Product published but consumers don't see it
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Glue Crawler in producer account hasn't run yet
+→ Catalog table not updated with new partitions
+→ Fix: run MSCK REPAIR or explicit add_partition after ETL (Project 26)
+
+PITFALL 5: "Confused Deputy" attack — one consumer impersonates another
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ ALWAYS use ExternalId in trust policies
+→ Without ExternalId, any service in consumer account can assume the role
+→ With ExternalId, only the service that knows the secret string can
+
+PITFALL 6: Circular dependencies between domains
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Orders needs Customers, Customers needs Orders
+→ Fix: define clear data product contracts with SLAs
+→ Use Gold layer snapshots, not live cross-queries
+→ Accept T+1 latency for cross-domain references
+
+PITFALL 7: Lake Formation + IAM policy conflict
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ When Lake Formation is enabled, IAM policies for Glue are IGNORED
+→ Only Lake Formation grants apply
+→ Mixing both = unpredictable access denials
+→ Rule: if using Lake Formation, manage ALL Glue permissions there</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCALING DIMENSION 1: Number of Domains
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 5 domains: manageable manually
+→ 20 domains: need automation (Terraform/CDK for account setup)
+→ 50+ domains: need self-service portal for domain onboarding
+→ Each new domain = new account + standard IAM roles + Glue Catalog + S3
+
+SCALING DIMENSION 2: Number of Data Products
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 10 products: DynamoDB registry works fine
+→ 100 products: need searchable catalog UI (AWS DataZone or custom)
+→ 500+ products: need automated lineage tracking (Project 77)
+
+SCALING DIMENSION 3: Cross-Account IAM Roles
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ N producers × M consumers = N×M role pairs
+→ 5×5 = 25 roles — manageable
+→ 20×20 = 400 roles — MUST automate with Terraform
+→ Alternative: use Lake Formation cross-account grants (reduces IAM complexity)
+
+SCALING DIMENSION 4: Event Volume
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 10 products published daily: single SNS topic fine
+→ 1000 products/hour: need SNS message filtering (Project 51)
+→ Consumer SQS queues need DLQ (Project 50) for failed processing
+
+SCALING DIMENSION 5: Query Volume
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Athena cross-account: scales infinitely (serverless)
+→ Redshift Spectrum: scales with cluster size
+→ Redshift Data Sharing: consumer needs own Redshift (cost per consumer)
+
+COST MODEL:
+→ S3 storage: paid by producer (they own the bucket)
+→ S3 reads: paid by REQUESTER if requester-pays enabled
+→ Athena scans: paid by consumer (their workgroup)
+→ Glue ETL: paid by the account running the job
+→ SNS/SQS: negligible at this volume
+→ IAM/STS: free</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY THE MESH IS WORKING:
+</span>
+1. DATA PRODUCT REGISTRY (Single pane of glass)
+   → Query DynamoDB: "Show me all Gold data products published today"
+   → Each record shows: domain, product, S3 path, quality score, SLA status
+
+2. CROSS-ACCOUNT ACCESS AUDIT
+   → CloudTrail in each account
+   → Filter: AssumeRole events from external accounts
+   → Verify: only authorized accounts assuming roles
+
+3. DATA FRESHNESS MONITORING
+   → CloudWatch custom metric per data product
+   → Metric: hours_since_last_publish
+   → Alarm: if &gt; SLA threshold → SNS → PagerDuty (Project 78)
+
+4. LINEAGE VERIFICATION
+   → For any Gold table, trace: which Silver → which Bronze → which source
+   → Glue Catalog metadata + custom tags provide this
+   → Full lineage graph = Project 77
+
+5. COST ATTRIBUTION
+   → AWS Cost Explorer: filter by account (= domain)
+   → Each domain sees their own bill
+   → Central governance account sees cross-charge for shared services
+
+6. CONSUMER ACTIVITY
+   → Athena query logs: who queried what, when, how much scanned
+   → S3 server access logs: which cross-account role read which objects
+   → SQS metrics: messages received per consumer queue</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(71)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Infrastructure: Account Structure &amp; IAM (Account A — Orders Producer)</h3>
+
+<h3>Consumer Account Setup (Account C — Analytics Consumer)</h3>
+
+<hr>
+<h3>Governance Account Setup (Account G — Central Platform)</h3>
+
+<hr>
+<h3>Producer Publishes Data Product Event</h3>
+
+<hr>
+<h3>Consumer Processes Events &amp; Queries Cross-Account</h3>
+
+<hr>
+<h3>Discovery: Query the Data Product Registry</h3>
+
+<hr>
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># === SETUP (Run once per account) ===</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Producer Account A — Orders Domain</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Account A credentials)</span><span>
+</span>python 71_01_producer_account_setup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Consumer Account C — Analytics Domain</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Account C credentials)</span><span>
+</span>python 71_02_consumer_account_setup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Governance Account G — Central Platform</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Account G credentials)</span><span>
+</span>python 71_03_governance_account_setup.py
+
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># === DAILY OPERATIONS ===</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: After Glue ETL completes in Account A</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Account A credentials)</span><span>
+</span>python 71_04_producer_publish_event.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 5: Consumer polls and processes</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Account C credentials)</span><span>
+</span>python 71_05_consumer_event_processor.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 6: Anyone discovers products</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (Run with Governance credentials)</span><span>
+</span>python 71_06_discover_data_products.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED END-TO-END FLOW:
+</span>
+Account A (Orders):
+  Glue ETL finishes → Gold Parquet written → Quality checked ✅
+  → SNS event published to Governance topic
+  → Registry updated: orders#daily_orders v2 — 99.7% quality
+
+Account G (Governance):
+  SNS receives event → fans out to:
+    → Account C SQS (analytics-data-events)
+    → Account B SQS (customers-data-events) — filtered: orders only
+
+Account C (Analytics):
+  SQS receives message → Consumer processes:
+    → Runs Athena query against Account A's Gold layer (cross-account)
+    → Creates derived dataset joining Account A + Account B data
+    → Results in Account C's own S3 bucket
+    → Message acknowledged, removed from queue
+
+Dashboard (Governance):
+  → Shows: 3 events published today
+  → Shows: 0 stale products
+  → Shows: All SQS queues at depth 0 (all processed)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Data Mesh is an ORGANIZATIONAL pattern mapped to AWS services
+→ Each domain = separate AWS account (blast radius + cost isolation)
+→ Data stays with the producer — consumers read cross-account
+→ Zero-copy sharing via S3 bucket policies + Glue Catalog resource policies
+→ Central Governance account controls permissions, not data
+→ SNS→SQS cross-account enables publish/subscribe for data product events
+→ DynamoDB registry = "catalog of catalogs" for discoverability
+→ Only Gold layer is exposed as a data product — Bronze/Silver are internal
+
+HOW THIS BUILDS ON PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket creation and structure
+→ Project 3:  Bucket policies for access control
+→ Project 7:  IAM deep dive — policy evaluation logic
+→ Project 14: SNS→SQS fan-out pattern
+→ Project 15: Glue Data Catalog fundamentals
+→ Project 26: Partitioned Parquet for Athena
+→ Project 36: Athena CTAS for derived datasets
+→ Project 44: Medallion architecture (Bronze/Silver/Gold)
+→ Project 50: SQS Dead Letter Queues
+→ Project 51: SNS message filtering
+→ Project 56: Cross-account S3 access
+→ Project 57: Cross-account Glue Catalog
+→ Project 58: Redshift Data Sharing
+→ Project 59: Cross-account SNS→SQS
+→ Project 60: Cross-account Glue ETL
+→ Project 68: Glue Data Quality for validation
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 72: Add REAL-TIME ingestion (Kinesis) to the mesh
+   "Orders domain needs sub-15-minute clickstream data"
+→ Project 73: Full Data Lake Platform combining all services
+→ Project 74: Fine-grained COLUMN-LEVEL security via Lake Formation
+   "Analytics can see order_total but NOT customer_email"</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The Data Mesh is running — 3 domains producing, consumers subscribing
+</span>Everything is batch: Glue ETL runs nightly, data products published daily
+
+THEN: Marketing VP says:
+"I need clickstream data — which products users are browsing RIGHT NOW.
+ Not tomorrow. Not in 6 hours. Within 15 minutes.
+ Our competitors personalize in real-time. We're losing customers."
+
+Orders domain says:
+"Our website generates 50,000 click events per minute.
+ CSVs won't work. Nightly batches won't work.
+ We need STREAMING into the mesh."
+
+YOU: "We need Kinesis Data Streams → Firehose → S3 micro-batches
+      → Glue picks them up → Gold layer updated every 15 minutes
+      → SNS event fires → consumers react immediately"
+
+→ Project 72: "Real-Time Clickstream: Kinesis → S3 → Glue → Redshift
+               with &lt; 15 Min Latency"
+→ Introduces: Kinesis Data Streams, Firehose, micro-batch pattern,
+              streaming into the Data Mesh architecture</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-70.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 71 of 80</span>
+    <span class="nav-project-title">BUILD A MULTI-ACCOUNT DATA MESH — PRODUCERS PUBLISH, CONSUMERS SUBSCRIBE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-72.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-72.html") window.location = "project-72.html";
+  if (e.key === 'ArrowLeft' && "project-70.html") window.location = "project-70.html";
+});
+</script>
+</body>
+</html>

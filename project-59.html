@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 59: ACCOUNT A&#x27;S SNS MUST DELIVER TO ACCOUNT B&#x27;S SQS — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:74%"></div></div>
+<div id="progress-label">74%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 59 of 80</div>
+  <div class="project-title">ACCOUNT A&#x27;S SNS MUST DELIVER TO ACCOUNT B&#x27;S SQS</div>
+  <div class="project-tags"><span class="project-tag">SNS</span><span class="project-tag">SQS</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multi-account AWS setup
+</span>Team: 15 engineers, 5 data engineers, 4 analysts
+
+CURRENT STATE (after Projects 56-58):
+→ Account A (111111111111): Production Data
+  - S3 data: shared cross-account ✅ (Project 56)
+  - Glue Catalog: shared cross-account ✅ (Project 57)
+  - Redshift tables: shared cross-account ✅ (Project 58)
+  - Pipeline events: published to SNS topic (Project 54)
+    → "quickcart-pipeline-events" topic
+    → Events: pipeline_started, etl_completed, dq_passed, pipeline_failed
+
+→ Account B (222222222222): Analytics
+  - Can READ Account A's data ✅
+  - Has its OWN pipeline that depends on Account A's data freshness
+  - Needs to KNOW when Account A's pipeline completes
+  - Currently: POLLS Account A's S3 every 30 minutes (wasteful, slow)
+
+THE POLLING PROBLEM:
+┌──────────────────────────────────────────────────────────────────────┐
+│ Account B's current approach (polling — bad):                        │
+│                                                                      │
+│ Every 30 minutes:                                                    │
+│   1. Check S3: aws s3 ls s3://acct-a-bucket/gold/orders/            │
+│   2. Compare last-modified timestamp with previous check             │
+│   3. If changed → trigger Account B's pipeline                      │
+│   4. If unchanged → wait another 30 minutes                         │
+│                                                                      │
+│ PROBLEMS:                                                            │
+│ → 30-minute delay (worst case) between Account A finishing           │
+│   and Account B starting                                             │
+│ → 48 S3 LIST calls/day × 365 = 17,520 unnecessary API calls/year    │
+│ → Can't distinguish: "ETL completed" vs "partial upload in progress" │
+│ → Doesn't know IF Account A failed (just sees no new data)          │
+│ → No context: which tables updated? How many rows? Any DQ issues?   │
+└──────────────────────────────────────────────────────────────────────┘
+
+WHAT ACCOUNT B ACTUALLY NEEDS:
+→ Real-time notification: "Account A's pipeline completed at 4:15 AM"
+→ Rich context: which tables, row counts, DQ results, duration
+→ Failure notification: "Account A's pipeline FAILED at 2:03 AM"
+→ Selective: only certain event types (completed, failed — not started)
+→ Decoupled: Account A publishes without knowing who subscribes
+
+THE SOLUTION:
+→ Account A already publishes events to SNS (from Project 54)
+→ Account B creates SQS queue to receive those events
+→ Cross-account SNS → SQS subscription connects them
+→ Account B's queue triggers its own pipeline (from Project 52)
+→ Zero polling, real-time, rich context, fully decoupled
+
+ADDITIONAL USE CASES:
+→ Account B's Step Functions triggered by Account A's "etl_completed" event
+→ Account B's monitoring receives Account A's "pipeline_failed" alerts
+→ Account B's DataBrew job triggered by Account A's "data_landed" event
+→ Future Account C can subscribe to same events (fan-out across accounts)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand cross-account SNS → SQS pattern
+</span>→ Same-account (Project 14): topic + queue + subscription — straightforward
+→ Cross-account: TWO additional policies needed
+  a) Account A's SNS Topic Policy: "Allow Account B to subscribe"
+  b) Account B's SQS Queue Policy: "Allow Account A's SNS to deliver"
+→ Both policies must be in place BEFORE the subscription is created
+
+Step 2: Understand the permission chain
+→ SUBSCRIBE: Account B's role calls sns:Subscribe on Account A's topic
+  → Account A's topic policy must allow sns:Subscribe from Account B
+→ DELIVER: Account A's SNS pushes messages to Account B's SQS
+  → Account B's queue policy must allow sqs:SendMessage from Account A's SNS
+→ Both directions must be authorized
+
+Step 3: Understand who creates the subscription
+→ Option A: Account A creates subscription (knows consumer's queue ARN)
+→ Option B: Account B creates subscription (knows producer's topic ARN)
+→ Cross-account: either side can create it
+→ If Account B creates: requires sns:Subscribe permission on Account A's topic
+→ If Account A creates: requires knowing Account B's queue ARN
+→ BEST PRACTICE: Account B creates (consumer controls what it subscribes to)
+
+Step 4: Understand message filtering (from Project 51)
+→ Filter policies work the SAME way cross-account
+→ Account B can subscribe with filter: event_type = ["etl_completed", "pipeline_failed"]
+→ Account B's queue only receives events it cares about
+→ Filtering happens at SNS level (Account A) before delivery
+
+Step 5: Design the event flow
+→ Account A's pipeline (Step Functions — Project 55) publishes:
+  - "pipeline_started" → severity=info
+  - "etl_completed" → severity=info, tables=[orders, customers]
+  - "dq_passed" → severity=info, quality_score=94.5
+  - "pipeline_failed" → severity=critical, error=...
+→ Account B subscribes to: etl_completed + pipeline_failed
+→ Account B's queue receives only relevant events
+→ Account B's consumer (Project 52) processes and triggers next steps</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+Account A [REDACTED:BANK_ACCOUNT_NUMBER]1)                    Account B [REDACTED:BANK_ACCOUNT_NUMBER]2)
+PRODUCER                                    CONSUMER
+┌────────────────────────────┐             ┌────────────────────────────┐
+│                            │             │                            │
+│  Step Functions Pipeline   │             │  SQS Queues:               │
+│  (Project 55)              │             │                            │
+│       │                    │             │  ┌────────────────────┐    │
+│       │ publishes events   │             │  │ acct-a-pipeline-   │    │
+│       ▼                    │             │  │ events-queue       │    │
+│  SNS Topic:                │  subscribe  │  │                    │    │
+│  "quickcart-pipeline-      │─────────────│─→│ Filter: event_type │    │
+│   events"                  │             │  │ = [etl_completed,  │    │
+│                            │  deliver    │  │    pipeline_failed]│    │
+│  Topic Policy:             │─────────────│─→│                    │    │
+│  "Allow Account B to       │             │  │ Queue Policy:      │    │
+│   sns:Subscribe"           │             │  │ "Allow Account A's │    │
+│  "Allow Account B's SQS    │             │  │  SNS to deliver"   │    │
+│   to receive messages"     │             │  └────────┬───────────┘    │
+│                            │             │           │                │
+│  Events published:         │             │           ▼                │
+│  → pipeline_started        │             │  EC2 Consumer / Lambda     │
+│  → etl_completed    ───────│─────────────│─→ Triggers Account B's     │
+│  → dq_passed               │             │  pipeline (Step Functions) │
+│  → pipeline_failed  ───────│─────────────│─→ OR alerts Account B's    │
+│                            │             │  monitoring (Project 54)   │
+│                            │             │                            │
+│  Also: same-account subs   │             │  Also:                     │
+│  → pipeline-critical topic │             │  ┌────────────────────┐    │
+│  → pipeline-warnings topic │             │  │ acct-a-alerts-queue│    │
+│  (from Project 54)         │             │  │ Filter: severity   │    │
+│                            │             │  │ = [critical]       │    │
+│                            │             │  └────────────────────┘    │
+└────────────────────────────┘             └────────────────────────────┘
+
+FLOW:
+1. Account A's Step Functions publishes "etl_completed" to SNS
+2. SNS evaluates subscriptions (same-account + cross-account)
+3. Cross-account subscription has filter: event_type = ["etl_completed"]
+4. Filter matches → SNS delivers to Account B's SQS queue
+5. Account B's consumer polls queue → receives event
+6. Consumer triggers Account B's pipeline → processes fresh data
+7. Total latency: &lt; 5 seconds from publish to consumer receive</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: S3 polling from Account B (current — wasteful)
+</span>→ Check every 30 minutes for new data
+→ Problems: delay, cost, no context, can't detect failures
+→ Already discussed above — this is what we're replacing
+
+Option B: EventBridge cross-account event bus
+→ Account A sends events to Account B's event bus
+→ More powerful: content-based routing, transforms, 200+ targets
+→ But: requires EventBridge setup in both accounts
+→ More complex than SNS → SQS for simple event delivery
+→ Better for: complex routing rules, many consumers, event transformation
+→ Covered conceptually in Project 66
+
+Option C: SQS cross-account direct (Account B polls Account A's queue)
+→ Account A puts messages in its own SQS queue
+→ Account B's consumer polls Account A's queue directly
+→ Problems: tight coupling, Account A manages queue for Account B
+→ Doesn't scale to multiple consumers (messages consumed once)
+→ No fan-out capability
+
+Option D: Cross-account SNS → SQS (this project) ✅
+→ Account A publishes to its existing SNS topic (no changes needed)
+→ Account B subscribes its SQS queue to Account A's topic
+→ Fan-out: multiple Account B queues (or Account C) can subscribe
+→ Filtering: each subscriber gets only relevant events
+→ Decoupled: Account A doesn't know or care who subscribes
+→ Builds directly on Projects 12, 13, 14, 51
+
+Option E: Lambda cross-account invocation
+→ Account A invokes Account B's Lambda directly
+→ Problems: tight coupling (Account A must know Account B's Lambda ARN)
+→ No buffering (Lambda must be available at invocation time)
+→ No retry (if Lambda fails, message lost unless coded)
+→ Better: SNS → SQS → Lambda (buffered, retryable)
+
+DECISION: Option D — Cross-account SNS → SQS
+→ Reason: decoupled, fan-out capable, filterable, builds on existing patterns
+→ Account A's pipeline code: zero changes (already publishes to SNS)
+→ Account B: adds queue + subscription + consumer</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Set BOTH policies before creating subscription
+</span>   → Account A: SNS Topic Policy (allow Account B to subscribe + receive)
+   → Account B: SQS Queue Policy (allow Account A's SNS to send)
+   → Order matters: policies first, then subscription
+   → If subscription created before policies → messages silently dropped
+
+2. Use sns:Subscribe permission carefully
+   → Allow Account B to subscribe: specific protocol (sqs) only
+   → Don't allow: sns:Subscribe with protocol=email (Account B could add emails)
+   → Condition: "sns:Protocol": "sqs" restricts to SQS subscriptions only
+
+3. Use aws:SourceArn condition in SQS queue policy
+   → Queue policy: "Allow sqs:SendMessage IF source is Account A's SNS topic ARN"
+   → Prevents: other SNS topics (from any account) delivering to this queue
+   → Without condition: any SNS topic could deliver → security risk
+
+4. Enable RawMessageDelivery for cross-account
+   → Same as Project 14: raw delivery = message body directly to SQS
+   → Without raw: SQS receives SNS envelope (harder to parse)
+   → With raw: message body + message attributes forwarded cleanly
+
+5. Apply filter policy on subscription (from Project 51)
+   → Account B only needs: etl_completed + pipeline_failed
+   → Filter out: pipeline_started, dq_passed (noisy, not actionable)
+   → Filtering happens in Account A's SNS → saves SQS cost in Account B
+
+6. Add DLQ to Account B's queue (from Project 50)
+   → Failed message processing → DLQ
+   → Monitor DLQ depth with CloudWatch alarm (from Project 54)
+   → Cross-account events are CRITICAL — don't lose them
+
+7. Use unique subscription filter per queue
+   → Queue 1: event_type = [etl_completed] → triggers pipeline
+   → Queue 2: event_type = [pipeline_failed], severity = [critical] → alerts
+   → Same topic, different filters, different queues, different actions
+
+8. Test the FULL chain end-to-end
+   → Publish test event in Account A → verify arrives in Account B's queue
+   → Test with filter match → should arrive
+   → Test with filter mismatch → should NOT arrive
+   → Test with wrong account → should NOT arrive</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT allow sns:* in topic policy (overly broad)
+</span>   → sns:* includes: sns:DeleteTopic, sns:SetTopicAttributes
+   → Account B could DELETE Account A's topic!
+   → Only allow: sns:Subscribe (to subscribe) + delivery happens automatically
+
+2. DO NOT use Principal: "*" in SQS queue policy
+   → Allows ANY AWS service/account to send to the queue
+   → Massive security risk — anyone can inject messages
+   → Always scope: Principal: {"Service": "sns.amazonaws.com"}
+   → Plus Condition: {"ArnEquals": {"aws:SourceArn": "&lt;topic-arn&gt;"}}
+
+3. DO NOT forget to confirm cross-account subscriptions
+   → SQS subscriptions from same account: auto-confirmed
+   → SQS subscriptions cross-account: also auto-confirmed IF queue policy allows
+   → Email/HTTPS subscriptions cross-account: require manual confirmation
+   → For SQS: auto-confirms if queue policy is correct
+
+4. DO NOT create subscriptions without filter policies
+   → Account A publishes 200K events/day (from Project 51)
+   → Without filter: Account B receives ALL 200K events
+   → Account B only needs ~5K events (etl_completed + pipeline_failed)
+   → 195K unnecessary SQS messages/day = wasted cost + processing
+
+5. DO NOT hardcode topic ARNs in application code
+   → Use SSM Parameter Store or environment variables
+   → Account A's topic ARN may change (recreation, region change)
+   → Hardcoded ARN → Account B's subscription breaks silently
+
+6. DO NOT assume message ordering cross-account
+   → Standard SNS + Standard SQS: no ordering guarantee
+   → Cross-account adds additional routing → even less ordering
+   → If order matters: use SNS FIFO → SQS FIFO (but cross-account FIFO is limited)
+   → For data pipelines: ordering usually doesn't matter (events are independent)
+
+7. DO NOT create circular event flows
+   → Account A → SNS → Account B's SQS → triggers Account B's pipeline
+   → Account B → SNS → Account A's SQS → triggers Account A's pipeline
+   → If both trigger each other: infinite loop → massive cost
+   → Design: unidirectional event flow (producer → consumer)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬─────────────────────────┬────────────────────────────────────────────┐
+</span>│ Scenario                           │ Use                     │ Why                                        │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ Simple event notification across   │ Cross-account SNS→SQS   │ Decoupled, fan-out, filtered, cheap        │
+│ accounts (this project)            │                         │                                            │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ Complex event routing with         │ EventBridge cross-      │ Content-based routing, transforms,         │
+│ transformation across accounts     │ account event bus       │ 200+ targets, schema registry              │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ Exactly-once ordered delivery      │ SNS FIFO → SQS FIFO    │ Message groups, deduplication              │
+│ across accounts                    │ (limited cross-account) │ But: FIFO cross-account has restrictions   │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ One-to-one queue sharing           │ Cross-account SQS       │ Account B polls Account A's queue directly │
+│ (single consumer)                  │ (queue policy)          │ Simple but no fan-out                      │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ S3 event triggers cross-account    │ S3 → EventBridge →      │ S3 events natively go to EventBridge       │
+│ pipeline                           │ cross-account target    │ Can route to Account B's Step Functions     │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────────────────┤
+│ Real-time streaming across accounts│ Kinesis cross-account   │ Continuous stream, not discrete events      │
+│                                    │ (Project 72)            │ Different pattern entirely                  │
+└────────────────────────────────────┴─────────────────────────┴────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE CROSS-ACCOUNT SNS → SQS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need guaranteed ordering across accounts
+</span>   → Standard SNS/SQS: best-effort ordering (usually FIFO but not guaranteed)
+   → FIFO SNS → FIFO SQS: ordered but cross-account support is limited
+   → Use: Kinesis Data Streams for ordered cross-account streaming
+
+2. When events need transformation before delivery
+   → SNS delivers message AS-IS (no transformation)
+   → If Account B needs different format: add Lambda between SQS and consumer
+   → Or: use EventBridge (has input transformer built-in)
+
+3. When consumer is not an AWS service
+   → SNS → SQS works great for AWS consumers
+   → External system (on-prem, other cloud): use SNS → HTTPS endpoint
+   → Or: API Gateway → Lambda → external system
+
+4. When event volume exceeds SNS limits
+   → SNS: 30,000 publishes/second (adjustable)
+   → For 100K+ events/second: use Kinesis Data Streams
+   → SNS is for event notification, not high-volume streaming
+
+5. When you need bidirectional communication
+   → SNS → SQS is one-way (producer → consumer)
+   → If consumer needs to respond: separate return channel needed
+   → Use: Step Functions with callback pattern, or separate SNS topic</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│         CROSS-ACCOUNT SNS → SQS — INTERNAL MECHANICS                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  STEP 1: POLICY SETUP (prerequisites)                                        │
+│  ════════════════════════════════════                                         │
+│                                                                              │
+│  Account A — SNS Topic Policy:                                               │
+│  {                                                                           │
+│    "Statement": [{                                                           │
+│      "Effect": "Allow",                                                      │
+│      "Principal": {"AWS": "arn:aws:iam::222222222222:root"},                │
+│      "Action": "sns:Subscribe",                                              │
+│      "Resource": "arn:aws:sns:...:quickcart-pipeline-events",               │
+│      "Condition": {                                                          │
+│        "StringEquals": {"sns:Protocol": "sqs"}                               │
+│      }                                                                       │
+│    }]                                                                        │
+│  }                                                                           │
+│  → Allows Account B to create SQS subscriptions on this topic               │
+│  → Restricts to SQS protocol only (can't subscribe email/https)             │
+│                                                                              │
+│  Account B — SQS Queue Policy:                                               │
+│  {                                                                           │
+│    "Statement": [{                                                           │
+│      "Effect": "Allow",                                                      │
+│      "Principal": {"Service": "sns.amazonaws.com"},                          │
+│      "Action": "sqs:SendMessage",                                            │
+│      "Resource": "arn:aws:sqs:...:acct-a-pipeline-events-queue",            │
+│      "Condition": {                                                          │
+│        "ArnEquals": {                                                        │
+│          "aws:SourceArn": "arn:aws:sns:...:quickcart-pipeline-events"       │
+│        }                                                                     │
+│      }                                                                       │
+│    }]                                                                        │
+│  }                                                                           │
+│  → Allows SNS service to deliver messages to this queue                      │
+│  → ONLY from Account A's specific topic (SourceArn condition)                │
+│                                                                              │
+│                                                                              │
+│  STEP 2: SUBSCRIPTION CREATION                                               │
+│  ═════════════════════════════                                                │
+│                                                                              │
+│  Account B calls:                                                            │
+│  sns.subscribe(                                                              │
+│    TopicArn="arn:aws:sns:us-east-2:111111111111:quickcart-pipeline-events", │
+│    Protocol="sqs",                                                           │
+│    Endpoint="arn:aws:sqs:us-east-2:222222222222:acct-a-events-queue",       │
+│    Attributes={                                                              │
+│      "FilterPolicy": '{"event_type":["etl_completed","pipeline_failed"]}',  │
+│      "RawMessageDelivery": "true"                                            │
+│    }                                                                         │
+│  )                                                                           │
+│                                                                              │
+│  SNS processes subscription request:                                         │
+│  1. Check topic policy: does it allow Account B to subscribe? YES            │
+│  2. Check protocol: is it allowed? (Condition: sns:Protocol = sqs) YES       │
+│  3. Subscription created with status: confirmed (SQS auto-confirms)          │
+│  4. Filter policy attached to subscription                                   │
+│                                                                              │
+│  WHY SQS AUTO-CONFIRMS:                                                      │
+│  → Email/HTTPS subscriptions: require human clicking confirmation link       │
+│  → SQS subscriptions: SNS verifies queue exists + queue policy allows        │
+│  → If queue policy allows SNS → subscription auto-confirmed                  │
+│  → If queue policy missing → subscription stays "PendingConfirmation"        │
+│                                                                              │
+│                                                                              │
+│  STEP 3: MESSAGE DELIVERY FLOW                                               │
+│  ═════════════════════════════                                                │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────┐            │
+│  │ T+0.000s  Account A publishes to SNS:                        │            │
+│  │           sns.publish(                                        │            │
+│  │             TopicArn="...quickcart-pipeline-events",          │            │
+│  │             Message='{"event":"etl_completed",...}',          │            │
+│  │             MessageAttributes={                                │            │
+│  │               "event_type": {"DataType":"String",             │            │
+│  │                              "StringValue":"etl_completed"}   │            │
+│  │             }                                                  │            │
+│  │           )                                                    │            │
+│  │                                                                │            │
+│  │ T+0.001s  SNS receives message                                │            │
+│  │                                                                │            │
+│  │ T+0.002s  SNS evaluates ALL subscriptions on this topic:      │            │
+│  │           → Same-account sub 1 (critical-queue): filter check │            │
+│  │           → Same-account sub 2 (warning-queue): filter check  │            │
+│  │           → Cross-account sub 3 (Account B queue): filter ✅  │            │
+│  │             event_type="etl_completed" matches filter          │            │
+│  │                                                                │            │
+│  │ T+0.003s  SNS delivers to Account B's SQS queue:              │            │
+│  │           → Crosses account boundary via internal AWS routing  │            │
+│  │           → SQS queue policy checked: allows this SNS topic?  │            │
+│  │           → YES → message accepted into queue                 │            │
+│  │                                                                │            │
+│  │ T+0.010s  Message visible in Account B's SQS queue            │            │
+│  │           → Account B's consumer can receive it                │            │
+│  │                                                                │            │
+│  │ TOTAL LATENCY: ~10-50 milliseconds                            │            │
+│  │ (vs 30 minutes with polling!)                                  │            │
+│  └──────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│                                                                              │
+│  STEP 4: CROSS-ACCOUNT FILTER EVALUATION                                    │
+│  ════════════════════════════════════════                                     │
+│  → Filter policy is stored WITH the subscription (on Account A's SNS)        │
+│  → Evaluation happens in Account A's SNS (before delivery)                   │
+│  → Same mechanics as Project 51 (no difference for cross-account)            │
+│  → Unmatched messages: NOT delivered (saved SQS cost in Account B)           │
+│  → No additional latency for filtering                                       │
+│                                                                              │
+│                                                                              │
+│  STEP 5: CLOUDTRAIL AUDIT                                                    │
+│  ════════════════════════                                                     │
+│  Account A CloudTrail:                                                       │
+│  → sns:Subscribe event (Account B created subscription)                      │
+│  → sns:Publish events (pipeline publishes events)                            │
+│                                                                              │
+│  Account B CloudTrail:                                                       │
+│  → sns:Subscribe call (Account B initiated)                                  │
+│  → sqs:ReceiveMessage (consumer polling)                                     │
+│  → sqs:DeleteMessage (consumer acknowledging)                                │
+│                                                                              │
+│  SNS Delivery Logs (if enabled):                                             │
+│  → Shows: which subscription received which message                          │
+│  → Shows: filtered-out messages and why                                      │
+│  → Shows: delivery failures and retries                                      │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Subscription created but messages never arrive"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: SQS queue policy missing → SNS can't deliver
+→ Cause 2: SQS queue policy has wrong SourceArn → SNS delivery denied
+→ Cause 3: Subscription is "PendingConfirmation" → not active
+→ Debug: aws sns list-subscriptions-by-topic --topic-arn &lt;arn&gt;
+→ Check: SubscriptionArn should be full ARN (not "PendingConfirmation")
+→ Fix: set queue policy BEFORE creating subscription
+
+PITFALL 2: "Subscription confirmed but filter blocks everything"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: publisher doesn't set MessageAttributes
+→ Filter: {"event_type": ["etl_completed"]}
+→ Publisher: sends body only, no MessageAttributes
+→ Filter can't match → message silently not delivered (from Project 51)
+→ Fix: ensure Account A's publisher ALWAYS sets MessageAttributes
+
+PITFALL 3: "Messages arrive in SQS but can't be parsed"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: RawMessageDelivery not enabled
+→ Without raw: SQS message body = SNS envelope JSON wrapping the actual message
+→ Consumer expects raw JSON but gets: {"Type":"Notification","Message":"...escaped..."}
+→ Must parse envelope → extract Message field → parse again
+→ Fix: set RawMessageDelivery=true on subscription (from Project 14)
+
+PITFALL 4: "Account A topic policy too restrictive — can't subscribe"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: topic policy allows Account B's root but not specific role
+→ Or: topic policy missing entirely (default: only topic owner can subscribe)
+→ Or: topic policy has Condition that doesn't match
+→ Fix: add explicit Allow for Account B's specific role ARN
+→ Or: use "AWS": "222222222222" to allow any role in Account B
+
+PITFALL 5: "Circular dependency — policies reference each other"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Topic policy references queue ARN → queue must exist first
+→ Queue policy references topic ARN → topic must exist first
+→ In practice: this isn't circular — ARNs are predictable
+→ Create queue → set queue policy → set topic policy → create subscription
+→ ARNs can be constructed without the resource existing
+
+PITFALL 6: "Cross-account subscription counts against Account A's limits"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ SNS subscription limit: 12,500,000 per topic (soft)
+→ Each cross-account SQS queue = 1 subscription
+→ 5 accounts × 3 queues each = 15 subscriptions → trivial
+→ Only a concern at massive scale (10,000+ consumers)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MESSAGE VOLUME:
+</span>→ Account A publishes 200K events/day to SNS
+→ After filtering: Account B receives ~5K events/day
+→ SNS throughput: 30,000 publishes/second → 200K/day is trivial
+→ SQS throughput: unlimited (standard queue)
+
+CONSUMER SCALING:
+→ Account B's SQS queue: unlimited messages
+→ Account B can have multiple consumers (from Project 52 ASG)
+→ Each consumer processes independently
+→ Scale consumers based on queue depth (Project 52 pattern)
+
+MULTI-ACCOUNT FAN-OUT:
+→ Account A's topic → Account B's queue (pipeline events)
+→ Account A's topic → Account C's queue (compliance audit)
+→ Account A's topic → Account D's queue (ML training triggers)
+→ Each subscription independent → each has own filter
+→ Account A: zero code changes (just publishes to its topic)
+
+COST:
+→ SNS: first 1M requests free, then $0.50/million
+→ SQS: first 1M requests free, then $0.40/million
+→ Cross-account: no additional charge (same as same-account)
+→ 5K messages/day × 30 days = 150K → well within free tier
+→ Data transfer same-region: $0
+→ Data transfer cross-region: $0.01/GB (SNS message payload is tiny)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CROSS-ACCOUNT SNS → SQS:
+</span>
+1. Verify subscription status:
+   → aws sns list-subscriptions-by-topic --topic-arn &lt;account-a-topic&gt;
+   → Check: SubscriptionArn = full ARN (not "PendingConfirmation")
+   → Check: Protocol = "sqs", Endpoint = Account B's queue ARN
+
+2. Publish test message from Account A:
+   → aws sns publish --topic-arn &lt;topic&gt; --message '{"test":true}'
+     --message-attributes '{"event_type":{"DataType":"String","StringValue":"etl_completed"}}'
+   → Check Account B's queue: aws sqs receive-message --queue-url &lt;url&gt;
+   → Message should appear within seconds
+
+3. Test filter match/mismatch:
+   → Publish with event_type="etl_completed" → should arrive
+   → Publish with event_type="pipeline_started" → should NOT arrive
+   → Verify: queue shows 1 message (not 2)
+
+4. CloudWatch metrics:
+   → Account A SNS: NumberOfMessagesPublished, NumberOfNotificationsDelivered
+   → Account B SQS: ApproximateNumberOfMessagesVisible
+   → Compare: published vs delivered (difference = filtered out)
+
+5. End-to-end test:
+   → Trigger Account A's pipeline → publishes events
+   → Account B's queue receives events → consumer processes
+   → Account B's pipeline starts → verify data freshness</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(59)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Account A — Update SNS Topic Policy</h3>
+
+<h3>Step 2: Account B — Create SQS Queues with Policies</h3>
+
+<h3>Step 3: Create Cross-Account Subscriptions</h3>
+
+<h3>Step 4: End-to-End Test — Publish and Verify</h3>
+
+<h3>Step 5: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account A has SNS topic "quickcart-pipeline-events" (from Project 54)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account A publishes pipeline events (from Project 55)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account B has IAM roles (from Project 56)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Account A: Update topic policy to allow Account B</span><span>
+</span>python 59_01_account_a_topic_policy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Account B: Create SQS queues with policies allowing Account A's SNS</span><span>
+</span>python 59_02_account_b_sqs_setup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create cross-account subscriptions (with filters)</span><span>
+</span>python 59_03_create_cross_account_subscriptions.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Test end-to-end: publish from Account A → verify in Account B</span><span>
+</span>python 59_04_test_cross_account_delivery.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Cleanup</span><span>
+</span>python 59_05_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED TEST OUTPUT:
+</span>
+======================================================================
+🧪 CROSS-ACCOUNT SNS → SQS DELIVERY TEST
+======================================================================
+
+📤 PUBLISHING 4 TEST EVENTS...
+
+  Event 1: ETL Completed (should → pipeline queue)
+    SNS MessageId: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+    Expected in: acct-a-pipeline-events-queue
+
+  Event 2: DQ Passed (should → pipeline queue)
+    SNS MessageId: b2c3d4e5-f6a7-8901-bcde-f12345678901
+    Expected in: acct-a-pipeline-events-queue
+
+  Event 3: Pipeline Failed (should → alert queue)
+    SNS MessageId: c3d4e5f6-a7b8-9012-cdef-012345678912
+    Expected in: acct-a-alert-events-queue
+
+  Event 4: Pipeline Started (should → NEITHER queue — filtered out)
+    SNS MessageId: d4e5f6a7-b8c9-0123-defa-123456789123
+    Expected in: NONE (filtered out)
+
+⏳ Waiting 5 seconds for cross-account delivery...
+
+======================================================================
+📥 CHECKING QUEUE CONTENTS
+======================================================================
+
+📬 Queue: acct-a-pipeline-events-queue
+   Filter: {"event_type": ["etl_completed", "dq_passed"]}
+   Received: 2 messages
+   Event types: ['etl_completed', 'dq_passed']
+   → etl_completed: a1b2c3d4-e5f...
+   → dq_passed: b2c3d4e5-f6a7...
+
+📬 Queue: acct-a-alert-events-queue
+   Filter: {"event_type": ["pipeline_failed"], "severity": ["critical"]}
+   Received: 1 messages
+   Event types: ['pipeline_failed']
+   → pipeline_failed: c3d4e5f6-a7b8...
+
+======================================================================
+📊 DELIVERY VERIFICATION
+======================================================================
+  ✅ acct-a-pipeline-events-queue: PASS
+     Expected: 2 events ['dq_passed', 'etl_completed']
+     Actual:   2 events ['dq_passed', 'etl_completed']
+
+  ✅ acct-a-alert-events-queue: PASS
+     Expected: 1 events ['pipeline_failed']
+     Actual:   1 events ['pipeline_failed']
+
+  📊 Total messages received across all queues: 3
+     Total published: 4
+     Filtered out: 1
+     (pipeline_started should be filtered out → ✅)
+
+======================================================================
+🎉 ALL TESTS PASSED — Cross-account SNS → SQS working correctly!
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Cross-account SNS → SQS requires TWO policies:
+  1. Account A's SNS Topic Policy: allow Account B to subscribe
+  2. Account B's SQS Queue Policy: allow Account A's SNS to deliver
+→ Both policies must be set BEFORE creating the subscription
+→ SQS subscriptions auto-confirm (unlike email/HTTPS)
+→ Filter policies work identically cross-account (from Project 51)
+→ RawMessageDelivery works cross-account (from Project 14)
+→ DLQ on consumer queue protects against processing failures (from Project 50)
+→ aws:SourceArn condition in queue policy prevents unauthorized delivery
+→ sns:Protocol condition in topic policy restricts subscription types
+→ Delivery latency: ~10-50ms (vs 30-minute polling)
+→ Zero code changes on producer (Account A just publishes to its topic)
+→ Fan-out: multiple accounts can subscribe to same topic independently
+→ CloudTrail: both accounts log their side of the interaction
+
+CROSS-ACCOUNT COMMUNICATION COMPLETE PICTURE (Projects 56-59):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 56: S3 DATA access cross-account ✅
+→ Project 57: Glue CATALOG metadata cross-account ✅
+→ Project 58: Redshift TABLE access cross-account ✅
+→ Project 59: SNS/SQS EVENT flow cross-account ✅
+
+Account B can now:
+┌──────────────────────┬──────────────────────────┬─────────────┐
+│ Capability           │ Mechanism                │ Project     │
+├──────────────────────┼──────────────────────────┼─────────────┤
+│ Read S3 files        │ Bucket Policy/AssumeRole │ 56          │
+│ Read Catalog tables  │ Glue Resource Policy     │ 57          │
+│ Query Redshift data  │ Data Sharing             │ 58          │
+│ Receive pipeline     │ Cross-account SNS→SQS    │ 59          │
+│ events               │                          │             │
+│ Run ETL on A's data  │ All of the above         │ 56+57       │
+│ Query A via Athena   │ Catalog + S3 access      │ 56+57       │
+│ Query A via Spectrum │ Catalog + S3 + Redshift  │ 56+57+58    │
+│ Trigger pipeline     │ Event notification       │ 59          │
+│ on A's completion    │                          │             │
+└──────────────────────┴──────────────────────────┴─────────────┘
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 12: SNS basics (single account)
+→ Project 13: SQS basics (single account)
+→ Project 14: SNS → SQS fan-out (single account)
+→ Project 50: SQS DLQ (applied to cross-account queues)
+→ Project 51: SNS message filtering (works identically cross-account)
+→ Project 52: SQS-based auto scaling (Account B's consumer can auto-scale)
+→ Project 54: Pipeline monitoring (Account B monitors its own cross-account pipeline)
+→ Project 55: Step Functions (Account A publishes events, Account B triggers on them)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 60: "Glue in Account B Extracts from Account A's S3, Loads Account B's Redshift"
+  - ALL cross-account access patterns now established (Projects 56-59)
+  - Time to BUILD a complete cross-account ETL pipeline
+  - Glue job in Account B:
+    → Reads Account A's Catalog (Project 57) for schema
+    → Reads Account A's S3 (Project 56) for data
+    → Transforms in Account B's compute
+    → Writes to Account B's Redshift
+    → Triggered by Account A's event (Project 59)
+  - This is the CULMINATION of Phase 4 cross-account patterns
+  - Uses AssumeRole chain: Account B's Glue → Account A's cross-account role</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has ALL cross-account access patterns:
+</span>→ Data access (S3) ✅ — Project 56
+→ Metadata access (Catalog) ✅ — Project 57
+→ Warehouse access (Redshift) ✅ — Project 58
+→ Event flow (SNS → SQS) ✅ — Project 59
+
+NOW: Build the COMPLETE cross-account ETL pipeline
+
+SCENARIO:
+→ Account A's pipeline finishes at 4:15 AM
+→ SNS event delivered to Account B's SQS (Project 59)
+→ Account B's consumer receives "etl_completed" event
+→ Triggers Account B's Glue ETL job
+→ Glue job:
+  1. Assumes Account A's cross-account role (Project 56)
+  2. Reads schema from Account A's Catalog (Project 57)
+  3. Reads data from Account A's S3 (Project 56)
+  4. Transforms in Account B's Glue compute
+  5. Writes results to Account B's OWN Redshift
+→ Account B's dashboards now have fresh data
+
+This is the REAL production pattern:
+→ Data stays in Account A (producer owns it)
+→ Compute runs in Account B (consumer owns it)
+→ Events trigger automatically (no polling, no cron)
+→ Complete separation of concerns
+
+→ Project 60: "Glue in Account B Extracts from Account A's S3, Loads Account B's Redshift"
+→ Introduces: Multi-account Glue ETL, AssumeRole in Glue job,
+   cross-account IAM chain, writing to local Redshift,
+   end-to-end cross-account pipeline orchestration</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="41" ========== -->
+<div class="chat-message" data-index="41"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-58.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 59 of 80</span>
+    <span class="nav-project-title">ACCOUNT A&#x27;S SNS MUST DELIVER TO ACCOUNT B&#x27;S SQS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-60.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-60.html") window.location = "project-60.html";
+  if (e.key === 'ArrowLeft' && "project-58.html") window.location = "project-58.html";
+});
+</script>
+</body>
+</html>

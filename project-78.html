@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 78: PRODUCTION SLA — 99.9% PIPELINE UPTIME WITH AUTO-RECOVERY — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:98%"></div></div>
+<div id="progress-label">98%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 78 of 80</div>
+  <div class="project-title">PRODUCTION SLA — 99.9% PIPELINE UPTIME WITH AUTO-RECOVERY</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now public, reporting to a board of directors
+</span>Platform: Full Data Mesh across 4 accounts (Project 71)
+          Lineage system live (Project 77)
+          380+ Glue ETL jobs, 120+ Redshift tables, 90+ Athena views
+
+Board Commitment: 99.9% pipeline uptime SLA
+→ That means: MAX 8 hours 45 minutes downtime per YEAR
+→ Or: MAX 43 minutes downtime per MONTH
+
+LAST MONTH'S REALITY:
+┌──────────────────────────────────────────────────────────────────┐
+│ Date       │ Failure                           │ Downtime       │
+├────────────┼───────────────────────────────────┼────────────────┤
+│ Jan 3      │ Glue job_clean_orders OOM          │ 3h 20m         │
+│            │ (nobody noticed until 8 AM standup)│                │
+│ Jan 9      │ Redshift disk full — COPY failed   │ 2h 45m         │
+│            │ (on-call paged, manual fix)         │                │
+│ Jan 15     │ S3 bucket policy changed — Access   │ 4h 10m         │
+│            │ Denied (detected by end user)        │                │
+│ Jan 22     │ MariaDB connection timeout           │ 1h 50m         │
+│            │ (transient — self-healed but no one  │                │
+│            │  knew it happened)                    │                │
+│ Jan 28     │ Athena query timeout on huge table   │ 2h 05m         │
+│            │ (workaround: manual partition add)    │                │
+├────────────┼───────────────────────────────────┼────────────────┤
+│ TOTAL      │ 5 incidents                        │ 14h 10m        │
+│ UPTIME     │                                    │ 98.1%          │
+│ SLA TARGET │                                    │ 99.9%          │
+│ GAP        │                                    │ -1.8%          │
+└──────────────────────────────────────────────────────────────────┘
+
+ROOT CAUSES OF EXCESS DOWNTIME:
+1. DETECTION: Average 2.5 hours to NOTICE a failure
+   → No automated alerting on most pipelines
+   → Failures discovered by downstream consumers (dashboards showing stale data)
+
+2. RECOVERY: Average 1.5 hours to FIX after detection
+   → Manual intervention required for every failure
+   → No auto-retry, no self-healing
+   → On-call engineer must SSH, diagnose, fix, re-run
+
+3. ESCALATION: No tiered alerting
+   → Either nobody is paged, or the CTO is paged directly
+   → No runbook — every incident is "figure it out from scratch"
+
+CTO: "Build a system that:
+      → Detects failures within 2 minutes
+      → Auto-recovers without humans for 80% of cases
+      → Escalates with context when auto-recovery fails
+      → Proves to the board we're hitting 99.9%"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Define what "uptime" means for a data pipeline
+</span>
+  UPTIME ≠ "servers are running"
+  UPTIME = "fresh data is available within SLA window"
+
+  For QuickCart:
+  → Gold layer tables must be refreshed by 6:00 AM daily
+  → Dashboard queries must return in &lt; 5 seconds
+  → Data must be &lt; 2 hours stale at any point
+
+  PIPELINE IS "DOWN" WHEN:
+  → A scheduled job fails AND is not recovered within SLA window
+  → Data staleness exceeds 2-hour threshold
+  → Dashboard queries fail or timeout
+
+Step 2: Decompose the problem into 4 subsystems
+
+  SUBSYSTEM 1: DETECTION (know it's broken)
+  → CloudWatch Alarms on every Glue job, Redshift query, S3 event
+  → Composite Alarms that combine multiple signals
+  → Data freshness checks (is gold layer stale?)
+
+  SUBSYSTEM 2: AUTO-RECOVERY (fix it without humans)
+  → Step Functions with retry/catch/fallback patterns
+  → Exponential backoff for transient failures
+  → Alternative execution paths for persistent failures
+
+  SUBSYSTEM 3: ESCALATION (page the right person)
+  → Tiered SNS topics: Info → Warning → Critical → Emergency
+  → Time-based escalation: if not recovered in 15 min → page on-call
+  → Context-rich alerts: include lineage impact (Project 77)
+
+  SUBSYSTEM 4: MEASUREMENT (prove SLA compliance)
+  → SLA metrics dashboard
+  → Uptime percentage calculation
+  → Incident tracking and MTTR (Mean Time To Recovery)
+
+Step 3: Map failure modes to recovery strategies
+
+  ┌────────────────────────┬──────────────────────────┬──────────────────┐
+  │ Failure Mode           │ Auto-Recovery Strategy   │ Escalation If    │
+  ├────────────────────────┼──────────────────────────┼──────────────────┤
+  │ Glue job OOM           │ Retry with 2x DPU        │ 3rd retry fails  │
+  │ Glue job timeout       │ Retry with longer timeout │ 3rd retry fails  │
+  │ Redshift disk full     │ Run VACUUM, resize temp   │ VACUUM fails     │
+  │ S3 Access Denied       │ Cannot auto-fix           │ Immediate page   │
+  │ MariaDB conn timeout   │ Retry 3x with backoff     │ 3rd retry fails  │
+  │ Athena query timeout   │ Retry with limit/partition │ 3rd retry fails  │
+  │ Data staleness &gt; 2hr   │ Trigger re-run of pipeline │ Re-run fails    │
+  │ Network transient      │ Retry with exponential     │ 5th retry fails  │
+  └────────────────────────┴──────────────────────────┴──────────────────┘
+
+Step 4: Build incrementally
+
+  Layer 1: Basic alarms (detect failures)
+  Layer 2: Step Function with retry (auto-recover)
+  Layer 3: Composite alarms + escalation (tiered alerting)
+  Layer 4: SLA dashboard (prove compliance)
+  Layer 5: Runbook automation (guided human intervention)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SLA MONITORING &amp; AUTO-RECOVERY SYSTEM                    │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                      DETECTION LAYER                                 │   │
+│  │                                                                      │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │   │
+│  │  │ Glue Job     │  │ Redshift     │  │ Custom Metric:           │   │   │
+│  │  │ CloudWatch   │  │ CloudWatch   │  │ DataFreshness            │   │   │
+│  │  │ Metrics      │  │ Metrics      │  │ (Lambda checks S3 mtime) │   │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └────────────┬─────────────┘   │   │
+│  │         │                 │                        │                  │   │
+│  │         ▼                 ▼                        ▼                  │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐    │   │
+│  │  │              CLOUDWATCH ALARMS (Individual)                   │    │   │
+│  │  │  alarm_glue_clean_orders_failed                               │    │   │
+│  │  │  alarm_glue_extract_refunds_failed                            │    │   │
+│  │  │  alarm_redshift_disk_90pct                                    │    │   │
+│  │  │  alarm_gold_data_stale_2hr                                    │    │   │
+│  │  └──────────────────────────┬───────────────────────────────────┘    │   │
+│  │                             │                                        │   │
+│  │                             ▼                                        │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐    │   │
+│  │  │           COMPOSITE ALARMS (Combined Signals)                │    │   │
+│  │  │  composite_gold_layer_unhealthy                               │    │   │
+│  │  │    = glue_failed OR data_stale OR redshift_unhealthy          │    │   │
+│  │  │  composite_ingestion_unhealthy                                │    │   │
+│  │  │    = extract_failed AND mariadb_conn_failed                   │    │   │
+│  │  └──────────────────────────┬───────────────────────────────────┘    │   │
+│  └─────────────────────────────┼────────────────────────────────────────┘   │
+│                                │                                            │
+│  ┌─────────────────────────────▼────────────────────────────────────────┐   │
+│  │                     AUTO-RECOVERY LAYER                              │   │
+│  │                                                                      │   │
+│  │  CloudWatch Alarm ──→ EventBridge Rule ──→ Step Functions            │   │
+│  │                                              │                       │   │
+│  │                          ┌────────────────────┼──────────────────┐   │   │
+│  │                          │                    │                  │   │   │
+│  │                          ▼                    ▼                  ▼   │   │
+│  │                    ┌──────────┐        ┌──────────┐      ┌────────┐ │   │
+│  │                    │ Retry    │        │ Retry    │      │ Scale  │ │   │
+│  │                    │ Glue Job │        │ with     │      │ DPU &amp;  │ │   │
+│  │                    │ (same    │        │ more DPU │      │ Retry  │ │   │
+│  │                    │  config) │        │          │      │        │ │   │
+│  │                    └────┬─────┘        └────┬─────┘      └───┬────┘ │   │
+│  │                         │                   │                │      │   │
+│  │                    ┌────▼───────────────────▼────────────────▼────┐ │   │
+│  │                    │           SUCCESS?                           │ │   │
+│  │                    │     YES ──→ Log + Clear Alarm                │ │   │
+│  │                    │     NO  ──→ ESCALATION LAYER                 │ │   │
+│  │                    └─────────────────────────────────────────────┘ │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                │                                            │
+│  ┌─────────────────────────────▼────────────────────────────────────────┐   │
+│  │                     ESCALATION LAYER                                 │   │
+│  │                                                                      │   │
+│  │  T+0 min:   SNS → info-alerts (Slack #data-pipeline-status)         │   │
+│  │  T+5 min:   SNS → warning-alerts (Slack #data-oncall)               │   │
+│  │  T+15 min:  SNS → critical-alerts (PagerDuty → on-call engineer)    │   │
+│  │  T+30 min:  SNS → emergency-alerts (PagerDuty → engineering manager)│   │
+│  │                                                                      │   │
+│  │  Every alert includes:                                               │   │
+│  │  → What failed (job name, error message)                             │   │
+│  │  → What was tried (retry attempts, configs)                          │   │
+│  │  → What is affected (lineage downstream — Project 77)                │   │
+│  │  → Runbook link (step-by-step recovery guide)                        │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                │                                            │
+│  ┌─────────────────────────────▼────────────────────────────────────────┐   │
+│  │                     MEASUREMENT LAYER                                │   │
+│  │                                                                      │   │
+│  │  ┌──────────────────┐  ┌───────────────────┐  ┌──────────────────┐  │   │
+│  │  │ DynamoDB:        │  │ CloudWatch:        │  │ Athena:          │  │   │
+│  │  │ IncidentTracker  │  │ SLA Dashboard      │  │ Historical SLA   │  │   │
+│  │  │ (each incident)  │  │ (real-time %)      │  │ (monthly report) │  │   │
+│  │  └──────────────────┘  └───────────────────┘  └──────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: CloudWatch Alarms only (detect + alert)
+</span>→ Detects failures, pages on-call
+→ No auto-recovery — humans fix everything
+→ MTTR remains high (1-3 hours)
+
+Option B: Step Functions retry only (auto-recover)
+→ Retries failed jobs automatically
+→ No detection of SILENT failures (stale data)
+→ No escalation if retries exhaust
+
+Option C: Full 4-layer system (detect + recover + escalate + measure)
+→ Comprehensive SLA management
+→ More infrastructure to maintain
+→ Covers 95% of failure modes automatically
+
+Option D: Third-party tool (PagerDuty + Datadog)
+→ Excellent UI and escalation
+→ $500-2000/month additional cost
+→ Still need custom detection for data freshness
+
+DECISION: Option C with Option D for escalation only
+→ Build detection + recovery + measurement in AWS-native
+→ Use PagerDuty (or SNS→SMS/Email) for human escalation
+→ Reason: full control, cost-effective, interview-demonstrable</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Define SLA in MEASURABLE terms
+</span>   → Not "pipelines should work" but "gold.finance_summary refreshed by 6AM UTC"
+   → Each pipeline has its own SLA window and staleness threshold
+   → Document in a machine-readable config (not a wiki page)
+
+2. Alarm on ABSENCE of success, not just presence of failure
+   → A job that never runs produces no failure metric
+   → "Expected job_clean_orders to complete by 4AM — no completion event seen"
+   → This catches scheduler failures, permission changes, deleted triggers
+
+3. Make auto-recovery IDEMPOTENT
+   → Retrying a Glue job must not produce duplicate data
+   → Use Job Bookmarks (Project 33) or deduplication logic
+   → If COPY to Redshift retries, use staging table + MERGE (Project 65)
+
+4. Include LINEAGE IMPACT in every alert (Project 77)
+   → "job_clean_orders failed — affects 12 downstream tables including CFO dashboard"
+   → On-call engineer instantly knows severity
+   → Prevents: "I'll fix it tomorrow" for critical pipelines
+
+5. Separate TRANSIENT from PERSISTENT failures
+   → Transient: network timeout, throttling, temporary OOM
+   → Strategy: retry 3x with exponential backoff
+   → Persistent: wrong IAM policy, schema change, disk full
+   → Strategy: escalate immediately — retrying won't help
+
+6. Track every incident in a structured store
+   → DynamoDB table: incident_id, pipeline, start_time, end_time, resolution
+   → Enables: MTTR calculation, trend analysis, board reporting
+   → Historical data feeds SLA dashboard
+
+7. Test the recovery system regularly
+   → "Chaos engineering" for data pipelines
+   → Deliberately fail a Glue job monthly — verify auto-recovery works
+   → Verify escalation reaches on-call within 2 minutes</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT alarm on every single metric
+</span>   → "Alarm fatigue" — when everything alarms, nothing alarms
+   → 50 alarms firing simultaneously = on-call ignores all of them
+   → Use COMPOSITE alarms to reduce noise
+
+2. DO NOT retry indefinitely
+   → Infinite retries on a persistent failure = wasted DPU cost
+   → Max 3 retries for Glue jobs, then escalate
+   → Each retry should change something (more DPU, longer timeout)
+
+3. DO NOT put recovery logic INSIDE the Glue job
+   → Glue job should do ONE thing: transform data
+   → Recovery orchestration belongs in Step Functions
+   → Separation of concerns: job = data logic, Step Function = flow logic
+
+4. DO NOT use CloudWatch Logs as the primary detection mechanism
+   → Parsing log lines for "ERROR" is fragile and slow
+   → Use STRUCTURED metrics: Glue job state, row counts, timestamps
+   → Logs are for DEBUGGING after detection, not for detection itself
+
+5. DO NOT send raw error messages in alerts
+   → "java.lang.OutOfMemoryError: GC overhead limit exceeded" means nothing to a manager
+   → Translate: "Glue job ran out of memory processing 50M rows. Auto-retry with 2x capacity initiated."
+   → Include: what happened, what's being done, what's the impact
+
+6. DO NOT measure uptime as "infrastructure uptime"
+   → EC2 running ≠ pipeline healthy
+   → Redshift cluster online ≠ data fresh
+   → Measure DATA AVAILABILITY, not server availability
+
+7. DO NOT build SLA dashboard that updates monthly
+   → Real-time or near-real-time (5-minute granularity)
+   → Board wants to see current status, not last month's number
+   → CloudWatch Dashboard with auto-refresh</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────────┬────────────────────────────────┐
+</span>│ Scenario                         │ Use                      │ Why                            │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Single metric breaches threshold │ CloudWatch Alarm          │ Simple threshold-based trigger │
+│ (e.g., Glue job failed)          │ (Individual)             │ One metric → one alarm         │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Multiple signals indicate        │ CloudWatch Composite     │ Reduces false positives        │
+│ system-level problem             │ Alarm                    │ "A AND B both bad = real issue"│
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Retry failed job with different  │ Step Functions           │ Orchestration with state       │
+│ config each attempt              │ Retry + Catch            │ Built-in retry/backoff/catch   │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Check if expected event happened │ EventBridge + Lambda     │ "Job should complete by 4AM"   │
+│ within time window               │ (absence detection)      │ Detect missing events          │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Alert humans with context        │ SNS → Slack/PagerDuty   │ Rich notification routing      │
+│                                  │                          │ with subscription filters      │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Track SLA metrics over time      │ CloudWatch Custom Metric │ 1-minute granularity, graphable│
+│                                  │ + Dashboard              │ Retention up to 15 months      │
+├──────────────────────────────────┼──────────────────────────┼────────────────────────────────┤
+│ Historical SLA reports for board │ DynamoDB + Athena        │ Structured incident data       │
+│                                  │                          │ Queryable with SQL             │
+└──────────────────────────────────┴──────────────────────────┴────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use Step Functions for sub-second recovery
+</span>   → Step Functions state transitions take 50-200ms
+   → For real-time systems: use SQS retry + Lambda (Project 50 DLQ pattern)
+   → Data pipelines are batch — Step Functions is perfect
+
+2. DO NOT use CloudWatch Composite Alarms for more than 5 child alarms
+   → Maximum 5 child alarms per composite alarm
+   → For more complex logic: use Lambda evaluator
+   → Composite of composites is allowed (nested)
+
+3. DO NOT use SNS for long-running recovery orchestration
+   → SNS delivers a message — that's it
+   → Cannot track: "did the retry succeed? should I escalate?"
+   → Step Functions maintains state across retries
+
+4. DO NOT use CloudWatch Dashboards for incident management
+   → Dashboards show metrics — they don't manage incidents
+   → Use DynamoDB incident tracker for: open/close, assign, resolve
+   → Dashboard = visualization, DynamoDB = state management
+
+5. DO NOT implement SLA monitoring for non-critical pipelines
+   → Not every pipeline needs 99.9% SLA
+   → Classify: Tier 1 (CFO dashboard) = 99.9%, Tier 2 (internal) = 99%
+   → Over-monitoring creates alert fatigue</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────┐
+</span>│                  SLA SYSTEM — INTERNAL MECHANICS                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 1: CLOUDWATCH ALARM MECHANICS                                     │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  HOW AN ALARM EVALUATES:                                                │
+│  → Alarm checks metric every "Period" (e.g., 60 seconds)               │
+│  → Compares value against "Threshold" using "ComparisonOperator"        │
+│  → If breached for "EvaluationPeriods" consecutive periods → ALARM      │
+│  → If recovered for "DatapointsToAlarm" periods → OK                    │
+│                                                                         │
+│  ALARM STATES:                                                          │
+│  ┌──────┐    threshold breached     ┌──────────┐                        │
+│  │  OK  │ ─────────────────────────→│  ALARM   │                        │
+│  └──┬───┘                           └────┬─────┘                        │
+│     │    ▲                                │                              │
+│     │    │ threshold recovered            │                              │
+│     │    └────────────────────────────────┘                              │
+│     │                                                                    │
+│     │    no data received                                                │
+│     └────────────────────────→ INSUFFICIENT_DATA                         │
+│                                                                         │
+│  COMPOSITE ALARM:                                                        │
+│  → Combines up to 5 child alarms with AND / OR / NOT logic              │
+│  → Evaluates IMMEDIATELY when any child changes state                    │
+│  → Does NOT evaluate on a period — it's EVENT-DRIVEN                     │
+│  → Rule: "ALARM when (glue_failed OR data_stale) AND NOT maintenance"   │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 2: STEP FUNCTIONS RETRY/CATCH MECHANICS                           │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  RETRY BEHAVIOR:                                                         │
+│  ┌──────────────────────────────────────────────────┐                   │
+│  │  "Retry": [{                                     │                   │
+│  │    "ErrorEquals": ["Glue.JobRunException"],       │                   │
+│  │    "IntervalSeconds": 60,      ← wait before 1st │                   │
+│  │    "MaxAttempts": 3,           ← total retries   │                   │
+│  │    "BackoffRate": 2.0          ← multiplier      │                   │
+│  │  }]                                               │                   │
+│  │                                                    │                   │
+│  │  Attempt 1: fail → wait 60s                       │                   │
+│  │  Attempt 2: fail → wait 120s (60 × 2.0)          │                   │
+│  │  Attempt 3: fail → wait 240s (120 × 2.0)         │                   │
+│  │  Attempt 4: fail → CATCH handler (all retries     │                   │
+│  │             exhausted)                             │                   │
+│  └──────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  CATCH BEHAVIOR:                                                         │
+│  → After all retries exhausted, CATCH block executes                     │
+│  → Can route to: escalation step, fallback logic, cleanup               │
+│  → Catch preserves: error type, error message, cause                     │
+│  → ResultPath injects error into state for downstream use                │
+│                                                                         │
+│  EXECUTION FLOW:                                                         │
+│  Start → RunGlueJob → [SUCCESS] → UpdateMetrics → End                   │
+│                     → [FAIL] → Retry(3x) → [STILL FAIL]                 │
+│                                           → Catch → ScaleUpAndRetry      │
+│                                                   → [SUCCESS] → End      │
+│                                                   → [FAIL] → Escalate    │
+│                                                              → NotifySNS │
+│                                                              → LogIncident│
+│                                                              → End       │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 3: DATA FRESHNESS DETECTION                                       │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  Problem: Glue job succeeds but writes 0 rows (silent failure)          │
+│  Solution: Check ACTUAL data freshness, not just job status              │
+│                                                                         │
+│  Lambda runs every 15 minutes:                                           │
+│  1. For each gold-tier table, query S3 prefix for latest file           │
+│  2. Compare file timestamp with current time                             │
+│  3. If gap &gt; threshold (2 hours) → publish CloudWatch metric             │
+│  4. CloudWatch alarm triggers on metric &gt; threshold                      │
+│                                                                         │
+│  Metric: DataStalenessMinutes                                            │
+│  Dimensions: {Pipeline: "finance_summary", Layer: "gold"}                │
+│  Alarm: ALARM when DataStalenessMinutes &gt; 120 for 1 period              │
+│                                                                         │
+│  WHY THIS CATCHES WHAT JOB METRICS MISS:                                │
+│  → Job succeeds but writes to wrong partition → stale                    │
+│  → Job succeeds but upstream had no new data → stale                     │
+│  → Scheduler silently stops triggering job → stale                       │
+│  → All these show up as "job succeeded" but data is old                  │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 4: TIERED ESCALATION MECHANICS                                    │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  SNS TOPIC HIERARCHY:                                                    │
+│  ┌───────────────────────────────────────────────────────────────┐      │
+│  │ Tier 0 (T+0):  pipeline-info-alerts                           │      │
+│  │   Subscribers: Slack #data-pipeline-status (all team)         │      │
+│  │   Content: "job_clean_orders failed, auto-retry initiated"    │      │
+│  │                                                                │      │
+│  │ Tier 1 (T+5):  pipeline-warning-alerts                        │      │
+│  │   Subscribers: Slack #data-oncall (on-call channel)           │      │
+│  │   Content: "Retry 1 of 3 failed, retrying with 2x DPU"       │      │
+│  │                                                                │      │
+│  │ Tier 2 (T+15): pipeline-critical-alerts                       │      │
+│  │   Subscribers: PagerDuty → on-call engineer phone             │      │
+│  │   Content: "All auto-recovery failed. Manual intervention     │      │
+│  │            needed. Affects 12 downstream tables.              │      │
+│  │            Runbook: https://wiki/runbook/glue-oom"            │      │
+│  │                                                                │      │
+│  │ Tier 3 (T+30): pipeline-emergency-alerts                      │      │
+│  │   Subscribers: PagerDuty → engineering manager phone          │      │
+│  │   Content: "UNRESOLVED for 30+ minutes. SLA breach imminent. │      │
+│  │            Incident ID: INC-20250115-001"                     │      │
+│  └───────────────────────────────────────────────────────────────┘      │
+│                                                                         │
+│  ESCALATION IS MANAGED BY STEP FUNCTIONS:                                │
+│  → Wait state (5 min) → Check if resolved → If not → next tier          │
+│  → Resolution detected by: alarm returns to OK state                     │
+│  → Step Function checks alarm state via CloudWatch API                   │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 5: SLA CALCULATION                                                │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  FORMULA:                                                                │
+│  Uptime% = (total_minutes - downtime_minutes) / total_minutes × 100     │
+│                                                                         │
+│  WHAT COUNTS AS DOWNTIME:                                                │
+│  → Time between: composite alarm enters ALARM state                      │
+│                  AND: composite alarm returns to OK state                 │
+│  → Stored in DynamoDB: {incident_id, alarm_time, recovery_time, delta}  │
+│                                                                         │
+│  MONTHLY CALCULATION:                                                    │
+│  → January: 31 days × 24 hours × 60 min = 44,640 minutes               │
+│  → Downtime: 14h 10m = 850 minutes                                      │
+│  → Uptime: (44640 - 850) / 44640 × 100 = 98.1%                         │
+│                                                                         │
+│  TARGET: 99.9% = max 44.64 minutes/month downtime                       │
+│                                                                         │
+│  MTTR (Mean Time To Recovery):                                           │
+│  → Sum of all incident durations / number of incidents                   │
+│  → Target MTTR: &lt; 10 minutes (with auto-recovery)                        │
+│  → Current MTTR: 170 minutes (without auto-recovery)                     │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Auto-retry creates duplicate data in Redshift"
+</span>→ Cause: Glue job retries and re-runs COPY to Redshift without cleanup
+→ Fix: use staging table pattern (Project 65)
+→ Step Function must: truncate staging → COPY → MERGE → commit
+→ If retry, staging truncate ensures idempotency
+
+PITFALL 2: "Composite alarm stays in ALARM after individual alarms recover"
+→ Cause: composite alarm evaluates on child state CHANGES
+→ If child transitions OK→ALARM→OK too quickly, composite may miss recovery
+→ Fix: set "TreatMissingData" to "notBreaching" on child alarms
+→ Also: add a periodic re-evaluation Lambda as safety net
+
+PITFALL 3: "Step Function retry with more DPU costs $$$"
+→ Cause: every retry with 2x DPU doubles the Glue cost
+→ 3 retries at 2x, 4x, 8x DPU = 14x normal cost for one failure
+→ Fix: cap max DPU at 4x normal, and add cost alerting
+→ Budget alarm: if daily Glue cost &gt; 2x average → alert
+
+PITFALL 4: "Escalation reaches on-call but they have no context"
+→ Cause: alert says "job failed" but not WHY or WHAT'S AFFECTED
+→ Fix: include in alert:
+   - Error message (first 500 chars)
+   - Retry history (attempt 1: OOM, attempt 2: OOM with 2x DPU)
+   - Lineage impact (12 downstream tables, CFO dashboard)
+   - Runbook URL
+   - Direct link to CloudWatch Logs
+
+PITFALL 5: "Data freshness alarm triggers during maintenance window"
+→ Cause: planned Redshift resize causes 30-min downtime
+→ Data freshness check sees stale data → false alarm
+→ Fix: "maintenance mode" flag in DynamoDB
+→ Freshness Lambda checks flag before alarming
+→ Composite alarm includes NOT(maintenance_mode)
+
+PITFALL 6: "SLA dashboard shows 100% because no incidents were logged"
+→ Cause: incident tracking Lambda had a bug — never wrote to DynamoDB
+→ Actual uptime was 97% but dashboard showed 100%
+→ Fix: DUAL tracking — CloudWatch alarm state history AS WELL AS DynamoDB
+→ Cross-validate monthly: alarm state durations vs incident records
+
+PITFALL 7: "Auto-recovery fixes the symptom but not the root cause"
+→ Cause: Glue job OOMs because upstream data grew 10x overnight
+→ Auto-retry with 2x DPU works TODAY but will fail again tomorrow
+→ Fix: after successful auto-recovery, still create a ticket
+→ "Auto-recovered, but investigate root cause: data volume anomaly"</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT STATE (QuickCart):
+</span>→ 380 Glue jobs → ~50 CloudWatch alarms (not every job is Tier 1)
+→ 10 composite alarms (one per major pipeline)
+→ 1 Step Function per major pipeline (10 state machines)
+→ Cost: ~$15/month (alarms) + ~$5/month (Step Functions) + ~$10/month (Lambda)
+
+AT 1000 JOBS:
+→ ~150 individual alarms, 30 composite alarms
+→ CloudWatch alarm cost: $0.10/alarm/month = $15/month
+→ Step Functions: $0.025 per 1000 state transitions
+→ At 100 failures/month × 10 transitions each = 1000 transitions = $0.025
+→ Total monitoring cost: &lt; $100/month — trivial vs data platform cost
+
+AT 10,000 JOBS (Enterprise):
+→ Alarm management becomes a problem itself
+→ Consider: auto-generating alarms from pipeline registry
+→ Use tags to classify pipelines into SLA tiers
+→ Tier 1 (critical): full 4-layer monitoring
+→ Tier 2 (important): alarm + basic retry
+→ Tier 3 (best-effort): alarm only, no auto-recovery
+
+STEP FUNCTION LIMITS:
+→ Max 25,000 events per execution (plenty for retries)
+→ Max execution duration: 1 year (Standard) / 5 min (Express)
+→ Use Standard for pipeline recovery (minutes to hours)
+→ Max 1,000,000 open executions per account (soft limit)
+
+CLOUDWATCH LIMITS:
+→ Max 5,000 alarms per account per region (soft limit)
+→ Max 5 child alarms per composite alarm
+→ Composite of composites: unlimited nesting depth
+→ Custom metric: $0.30 per metric per month</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FOR THE ON-CALL ENGINEER (3 AM page):
+</span>→ Alert must answer in 10 seconds:
+  1. WHAT failed? → "job_clean_orders"
+  2. WHY? → "OutOfMemoryError processing 50M rows"
+  3. WHAT was tried? → "Auto-retry 1/3 with 2x DPU — failed"
+  4. WHAT is affected? → "12 downstream tables, CFO dashboard"
+  5. WHAT should I do? → "Runbook: https://wiki/runbook/glue-oom"
+
+FOR THE ENGINEERING MANAGER (morning standup):
+→ Dashboard must show:
+  1. Current uptime: 99.94% (month-to-date)
+  2. Open incidents: 0
+  3. Resolved last 24h: 1 (auto-recovered in 4 minutes)
+  4. Trend: improving (99.94% vs 98.1% last month)
+
+FOR THE BOARD (quarterly report):
+→ SLA report must show:
+  1. Committed: 99.9%
+  2. Achieved: 99.94%
+  3. Total incidents: 8
+  4. Auto-recovered: 7 (87.5%)
+  5. Manual intervention: 1 (12.5%)
+  6. Average MTTR: 6.2 minutes (down from 170 minutes)
+  7. Trend chart: 12-month uptime percentage</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(78)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Module 1: Pipeline SLA Configuration Registry</h3>
+
+<hr>
+<h3>Module 2: CloudWatch Alarms — Detection Layer</h3>
+
+<hr>
+<h3>Module 3: Data Freshness Checker Lambda</h3>
+
+<hr>
+<h3>Module 4: Step Functions — Auto-Recovery State Machine</h3>
+
+<hr>
+<h3>Module 5: Supporting Lambda Functions</h3>
+
+<hr>
+<h3>Module 6: EventBridge Trigger — Glue Failure → Step Functions</h3>
+
+<hr>
+<h3>Module 7: Incident Tracker DynamoDB + SLA Calculator</h3>
+
+<hr>
+<h3>Module 8: CloudWatch Dashboard — Real-Time SLA Visibility</h3>
+
+<hr>
+<h3>Module 9: SNS Topics — Tiered Escalation Setup</h3>
+
+<hr>
+<h3>Module 10: Execution Flow &amp; Full System Test</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE SETUP &amp; TEST EXECUTION FLOW</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 1: Create infrastructure ---</span><span>
+</span><span>python sla/07_incident_tracker.py          </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DynamoDB incident table</span><span>
+</span><span>python sla/09_escalation_setup.py          </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SNS topics (4 tiers)</span><span>
+</span><span>python sla/02_create_alarms.py             </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CloudWatch alarms</span><span>
+</span><span>python sla/04_recovery_state_machine.py    </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step Functions</span><span>
+</span><span>python sla/06_eventbridge_trigger.py       </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EventBridge → Step Functions</span><span>
+</span><span>python sla/08_sla_dashboard.py             </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CloudWatch Dashboard</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Deploy Lambda functions (via CLI or CloudFormation):</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-log-incident (from Module 5 handler_log_incident)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-scale-and-retry (from Module 5 handler_scale_and_retry)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-check-alarm-state (from Module 5 handler_check_alarm_state)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-publish-metric (from Module 5 handler_publish_sla_metric)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-freshness-checker (from Module 3 lambda_handler)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → sla-event-router (from Module 6 create_event_router_lambda)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 2: Schedule freshness checker ---</span><span>
+</span><span>aws events put-rule </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --name </span><span class="token" style="color: rgb(163, 21, 21);">"sla-freshness-check-schedule"</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --schedule-expression </span><span class="token" style="color: rgb(163, 21, 21);">"rate(15 minutes)"</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --state ENABLED </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --description </span><span class="token" style="color: rgb(163, 21, 21);">"Check data freshness every 15 minutes"</span><span>
+</span>
+<span>aws events put-targets </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --rule </span><span class="token" style="color: rgb(163, 21, 21);">"sla-freshness-check-schedule"</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span><span>  --targets </span><span class="token" style="color: rgb(163, 21, 21);">"Id=FreshnessLambda,Arn=arn:aws:lambda:us-east-2:222222222222:function:sla-freshness-checker"</span><span>
+</span>
+<span></span><span class="token builtin" style="color: rgb(43, 145, 175);">echo</span><span> </span><span class="token" style="color: rgb(163, 21, 21);">"✅ Freshness checker scheduled every 15 minutes"</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 3: Simulate a Glue job failure to test end-to-end ---</span><span>
+</span>python sla/10_simulate_failure.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 4: View dashboard ---</span><span>
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">echo</span><span> </span><span class="token" style="color: rgb(163, 21, 21);">"View dashboard at:"</span><span>
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">echo</span><span> </span><span class="token" style="color: rgb(163, 21, 21);">"https://us-east-2.console.aws.amazon.com/cloudwatch/home?region=us-east-2#dashboards:name=DataPlatform-SLA-Dashboard"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- STEP 5: Generate SLA report ---</span><span>
+</span>python sla/07_incident_tracker.py</code></pre></div>
+<hr>
+<h3>Module 11: End-to-End Simulation &amp; Verification</h3>
+
+<hr>
+<h3>Expected Simulation Output</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>======================================================================
+</span>🧪 FULL SLA SYSTEM END-TO-END TEST
+   Time: 2025-01-15T03:00:00+00:00
+======================================================================
+======================================================================
+🧪 SIMULATING GLUE JOB FAILURE
+======================================================================
+   Job: job_clean_orders
+   Error: OutOfMemoryError
+   Time: 2025-01-15T03:00:00+00:00
+
+✅ Event injected successfully into EventBridge
+
+⏳ Waiting 10 seconds for Step Functions to start...
+✅ Step Functions execution detected:
+   Name: recovery-job_clean_orders-a1b2c3d4
+   Status: RUNNING
+   Started: 2025-01-15T03:00:10+00:00
+
+📊 MONITORING EXECUTION
+----------------------------------------------------------------------
+   [03:00:10] ▶️  Entered: LogIncidentStart
+   [03:00:11] ✅ Exited:  LogIncidentStart
+   [03:00:11] ▶️  Entered: NotifyInfo
+   [03:00:12] ✅ Exited:  NotifyInfo
+   [03:00:12] ▶️  Entered: DetermineFailureType
+   [03:00:12] ✅ Exited:  DetermineFailureType
+   [03:00:12] ▶️  Entered: RetryGlueJob
+   [03:01:15] ❌ Failed:  Glue.JobRunException — OOM with 10 DPU
+   [03:02:15] ❌ Failed:  Glue.JobRunException — OOM with 10 DPU (retry 2)
+   [03:04:15] ❌ Failed:  Glue.JobRunException — OOM with 10 DPU (retry 3)
+   [03:04:16] ▶️  Entered: RetryWithScaledDPU
+   [03:06:30] ✅ Exited:  RetryWithScaledDPU (SUCCESS with 20 DPU)
+   [03:06:30] ▶️  Entered: LogRecoverySuccess
+   [03:06:31] ✅ Exited:  LogRecoverySuccess
+   [03:06:31] ▶️  Entered: NotifyRecovered
+   [03:06:32] ✅ Exited:  NotifyRecovered
+   [03:06:32] ▶️  Entered: PublishSLAMetric
+   [03:06:33] ✅ Exited:  PublishSLAMetric
+   [03:06:33] 🟢 Execution SUCCEEDED
+
+   Final Status: SUCCEEDED
+
+📋 RECENT INCIDENTS:
+----------------------------------------------------------------------
+   ✅ INC-20250115-a1b2c3
+      Pipeline: finance_summary
+      Status: RESOLVED
+      Started: 2025-01-15T03:00:10Z
+      MTTR: 6.3 minutes
+      Resolution: AUTO_RECOVERED
+
+📊 CLOUDWATCH SLA METRICS:
+----------------------------------------------------------------------
+   ✅ QuickCart/SLA/IncidentCount: Sum=1, Avg=1.0, Max=1.0
+   ✅ QuickCart/SLA/MTTRMinutes: Sum=6.3, Avg=6.3, Max=6.3
+   ✅ QuickCart/SLA/AutoRecoverySuccess: Sum=1.0, Avg=1.0, Max=1.0
+   ✅ QuickCart/DataPlatform/DataStalenessMinutes: Sum=45, Avg=45, Max=45
+
+======================================================================
+📊 GENERATING SLA REPORT
+======================================================================
+
+======================================================================
+  📊 SLA REPORT: finance_summary
+======================================================================
+
+  ✅ Uptime: 99.99%
+     SLA Target: 99.9%
+     SLA Margin: 40.3 minutes
+
+     Total Downtime: 6.3 minutes
+     Incidents: 1
+     Auto-Recovered: 1
+     Auto-Recovery Rate: 100.0%
+
+     Avg MTTR: 6.3 minutes
+     Max MTTR: 6.3 minutes
+     Min MTTR: 6.3 minutes
+======================================================================
+
+======================================================================
+🏁 SIMULATION COMPLETE
+======================================================================
+
+    Results:
+    ├── Event Injected:      ✅
+    ├── Step Functions:       ✅ SUCCEEDED
+    ├── Incident Logged:      ✅ (1 found)
+    ├── Metrics Published:    (check CloudWatch dashboard)
+    └── SLA Report:           Generated above
+
+    WHAT TO VERIFY MANUALLY:
+    1. Check Slack channels for tiered notifications
+    2. Check PagerDuty for critical/emergency alerts
+    3. Open CloudWatch Dashboard: DataPlatform-SLA-Dashboard
+    4. Query DynamoDB: SLAIncidentTracker</code></pre></div>
+<hr>
+<h3>Module File Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>sla/
+</span>├── 01_pipeline_registry.py           # SLA config per pipeline (source of truth)
+├── 02_create_alarms.py               # CloudWatch individual + composite alarms
+├── 03_freshness_checker_lambda.py     # Lambda: check data freshness every 15min
+├── 04_recovery_state_machine.py       # Step Functions: retry → scale → escalate
+├── 05_lambda_functions.py             # Supporting Lambdas (incident, scale, check, metric)
+├── 06_eventbridge_trigger.py          # Glue failure → EventBridge → Step Functions
+├── 07_incident_tracker.py             # DynamoDB incident table + SLA calculator
+├── 08_sla_dashboard.py                # CloudWatch Dashboard (real-time visibility)
+├── 09_escalation_setup.py             # SNS topics (4-tier escalation)
+└── 10_simulate_failure.py             # End-to-end simulation &amp; verification</code></pre></div>
+<hr>
+<h3>Before vs After Comparison</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬─────────────────────┬──────────────────────┐
+</span>│ Metric                           │ BEFORE (January)    │ AFTER (with system)  │
+├──────────────────────────────────┼─────────────────────┼──────────────────────┤
+│ Monthly Uptime                   │ 98.1%               │ 99.94%               │
+│ Average Detection Time           │ 2.5 hours           │ &lt; 2 minutes          │
+│ Average Recovery Time (MTTR)     │ 170 minutes         │ 6.3 minutes          │
+│ Total Monthly Downtime           │ 14h 10m (850 min)   │ 6.3 minutes          │
+│ Incidents Requiring Human        │ 5 of 5 (100%)       │ 0 of 1 (0%)         │
+│ Auto-Recovery Rate               │ 0%                  │ 100%                 │
+│ Board SLA Commitment Met         │ ❌ NO               │ ✅ YES               │
+│ Monthly Monitoring Cost          │ $0                  │ ~$30                  │
+│ Savings from Reduced Downtime    │ N/A                 │ ~$15K (lost revenue) │
+└──────────────────────────────────┴─────────────────────┴──────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SLA for data pipelines = DATA FRESHNESS, not server uptime
+→ Detection must be PROACTIVE (alarms) not REACTIVE (user complaints)
+→ 80% of failures are TRANSIENT — auto-retry solves them without humans
+→ Composite alarms reduce alert fatigue — combine signals before paging
+→ Step Functions is the ideal orchestrator for recovery workflows
+   → Built-in retry with exponential backoff
+   → Catch blocks for escalation when retries exhaust
+   → Wait states for time-based escalation tiers
+→ Tiered escalation prevents: "nobody was paged" AND "everyone was paged"
+→ Every incident must be TRACKED (DynamoDB) for SLA calculation
+→ Data freshness checks catch SILENT failures that job metrics miss
+   → Job succeeds but writes 0 rows
+   → Scheduler stops triggering without error
+   → Upstream data missing
+→ The board doesn't want technical details — they want ONE NUMBER: 99.94%
+→ Auto-recovery must be IDEMPOTENT — retrying must not duplicate data
+→ ALWAYS include lineage impact in alerts (Project 77)
+   → "12 downstream tables affected including CFO dashboard"
+   → On-call instantly knows severity without investigating
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 54 (CloudWatch Logs + Alarms + SNS):
+   → Foundation: individual alarms and SNS notifications
+   → THIS project: composite alarms, tiered escalation, auto-recovery
+
+→ Project 55 (Step Functions Orchestration):
+   → Foundation: state machine basics, Glue sync, error handling
+   → THIS project: retry/catch/wait patterns for recovery
+
+→ Project 66 (EventBridge Event-Driven Architecture):
+   → Foundation: EventBridge rules, event patterns, targets
+   → THIS project: Glue state change → EventBridge → Step Functions
+
+→ Project 77 (Data Lineage):
+   → Lineage tells WHAT is affected when something breaks
+   → SLA system tells WHEN it breaks and HOW to fix it
+   → Combined: detect → trace impact → recover → report
+
+→ Project 50 (SQS Dead Letter Queue):
+   → DLQ pattern for message-level failures
+   → THIS project: pipeline-level failure recovery
+   → Same philosophy: don't lose work, quarantine failures, retry
+
+→ Project 33 (Glue Job Bookmarks):
+   → Bookmarks make retries IDEMPOTENT (don't reprocess old files)
+   → Critical for auto-recovery: retry must not duplicate data
+
+→ Project 65 (CDC Merge Pattern):
+   → Staging table pattern makes Redshift loads idempotent
+   → Auto-retry of COPY + MERGE is safe because staging truncates first
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 79: "Full Migration: On-Prem MariaDB → AWS Data Platform"
+   → Everything we've built across 78 projects comes together
+   → DMS for initial data migration
+   → Glue for ongoing CDC (Project 65)
+   → Bronze/Silver/Gold lake (Project 44)
+   → Cross-account architecture (Projects 56-61)
+   → Lineage tracking (Project 77)
+   → SLA monitoring (THIS project)
+   → The COMPLETE platform, migrated from scratch</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's SLA system is live and proving 99.94% uptime to the board
+</span>
+THEN: The CTO announces a massive initiative:
+
+"We've been running a PARALLEL on-premises MariaDB cluster
+ for our legacy order management system — 500GB of data,
+ 45 tables, 12 years of history.
+
+ The board approved the FULL MIGRATION to AWS.
+ We need to:
+ → Migrate 500GB of historical data WITHOUT downtime
+ → Set up ongoing CDC to keep AWS in sync during transition
+ → Build the full Bronze → Silver → Gold lake
+ → Deploy across our 3-account architecture
+ → Enable lineage tracking from Day 1
+ → Ensure 99.9% SLA from Day 1
+ → Complete in 8 weeks
+
+ This is everything we've built — all in one project."
+
+YOU: "This is literally Projects 1-78 assembled into one migration.
+      DMS for initial load + CDC.
+      Glue for transformation.
+      Redshift for serving.
+      Lake Formation for governance.
+      Lineage for traceability.
+      SLA monitoring for reliability.
+      Let's do it."
+
+→ Project 79: "Full Migration: On-Prem MariaDB → AWS Data Platform
+               (Multi-Account, Multi-Layer)"
+→ Uses: DMS → S3 Landing → Glue CDC → Bronze/Silver/Gold
+        → Redshift Serving → Athena Ad-Hoc → Monitoring
+→ References: Projects 31, 44, 56-61, 65, 68, 71, 75, 77, 78</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-77.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 78 of 80</span>
+    <span class="nav-project-title">PRODUCTION SLA — 99.9% PIPELINE UPTIME WITH AUTO-RECOVERY</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-79.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-79.html") window.location = "project-79.html";
+  if (e.key === 'ArrowLeft' && "project-77.html") window.location = "project-77.html";
+});
+</script>
+</body>
+</html>

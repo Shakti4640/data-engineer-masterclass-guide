@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 29: SCHEDULED MARIADB EXPORT TO S3 EVERY NIGHT AT 2 AM — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:36%"></div></div>
+<div id="progress-label">36%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 29 of 80</div>
+  <div class="project-title">SCHEDULED MARIADB EXPORT TO S3 EVERY NIGHT AT 2 AM</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">MariaDB</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — MariaDB has rich operational data
+</span>Situation:
+→ MariaDB holds 18 months of operational data:
+   - orders: 10M+ rows (growing 333K/day)
+   - customers: 50K rows (growing ~100/day)
+   - products: 5K rows (changes weekly)
+   - shipfast_updates: 500K rows (growing ~5K/day from Project 28)
+
+→ Project 20 created a ONE-TIME manual export script:
+   - Connect to MariaDB → SELECT → write CSV → upload to S3
+   - Works but: run manually, no scheduling, no error handling
+   - Data engineer must SSH into EC2 and run it
+
+→ Analytics team needs FRESH data in S3 every morning:
+   - Athena queries (Project 24) on yesterday's data
+   - Glue ETL converts to Parquet (Project 25)
+   - Redshift COPY for dashboard refresh (Project 21)
+   - All downstream systems depend on S3 having current data
+
+→ Current pain:
+   - Engineer forgets to run export → Athena has stale data
+   - Engineer runs it at different times → inconsistent snapshots
+   - Export fails silently → nobody knows until analyst complains
+   - No record of what was exported when
+
+→ Requirements:
+   - Run EVERY night at 2:00 AM UTC (after midnight data cutoff)
+   - Export ALL tables to S3 with date-stamped paths
+   - Log everything: start time, row counts, duration, errors
+   - Alert via SNS on failure (Project 12)
+   - Alert via SNS on success (with metrics)
+   - Idempotent: re-running for same date overwrites cleanly
+   - Track export history for auditing
+
+CTO: "I never want to hear 'the data is stale' again.
+      Automate the export. If it fails, wake someone up."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what needs to be scheduled
+</span>→ Python script that: connects to MariaDB → exports tables → uploads to S3
+→ Already built in Project 20 (manual version)
+→ Needs: scheduling, error handling, logging, notifications
+
+Step 2: Choose the scheduling mechanism
+→ Option A: Linux crontab on EC2 (simplest)
+→ Option B: AWS EventBridge + Lambda (serverless)
+→ Option C: AWS EventBridge + Step Functions (orchestrated)
+→ Option D: Airflow / MWAA (full workflow engine)
+→ For this project: Option A (crontab) — foundational, always works
+→ More advanced scheduling covered in Projects 41, 55, 66
+
+Step 3: Design the S3 output structure
+→ Date-stamped paths enable:
+   - Historical snapshots (what did data look like on Jan 15?)
+   - Partition-compatible paths for Athena (Project 26)
+   - Safe re-runs (overwrite same date, don't append)
+→ Pattern: s3://bucket/mariadb_exports/{table}/export_date=YYYY-MM-DD/
+
+Step 4: Design error handling and recovery
+→ MariaDB connection fails → retry 3 times → alert
+→ S3 upload fails → retry 3 times → alert
+→ Partial export (2 of 4 tables succeed) → alert with details
+→ Export takes &gt; 30 minutes → timeout → alert
+→ Cron doesn't fire (EC2 rebooted) → monitoring catches stale data
+
+Step 5: Design observability
+→ Log file: /var/log/mariadb-export/export_YYYYMMDD.log
+→ Metrics to CloudWatch: rows exported, duration, success/failure
+→ SNS notification: summary email after each run
+→ Export manifest: JSON file in S3 documenting what was exported</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  ┌──────────────────────────────────────────────────────┐
+  │  EC2 INSTANCE                                        │
+  │                                                      │
+  │  CRONTAB:                                            │
+  │  0 2 * * * /opt/scripts/run_mariadb_export.sh        │
+  │  │ │ │ │ │                                           │
+  │  │ │ │ │ └── Every day of week                       │
+  │  │ │ │ └──── Every month                             │
+  │  │ │ └────── Every day of month                      │
+  │  │ └──────── 2nd hour (2 AM)                         │
+  │  └────────── 0th minute                              │
+  │                                                      │
+  │  Wrapper script: run_mariadb_export.sh               │
+  │   ├── Set environment variables                      │
+  │   ├── Activate Python virtualenv                     │
+  │   ├── Run: python mariadb_nightly_export.py          │
+  │   └── Capture exit code                              │
+  │                                                      │
+  │  Python script: mariadb_nightly_export.py            │
+  │   ├── Connect to MariaDB                             │
+  │   ├── For each table:                                │
+  │   │    ├── SELECT * (or incremental WHERE)           │
+  │   │    ├── Write to local CSV                        │
+  │   │    ├── Upload CSV to S3 (date-stamped path)      │
+  │   │    ├── Verify upload (size check)                │
+  │   │    └── Log: table, rows, size, duration          │
+  │   ├── Write export manifest to S3                    │
+  │   ├── Send SNS notification (success or failure)     │
+  │   └── Exit with code 0 (success) or 1 (failure)     │
+  └──────────────────────────────────────────────────────┘
+       │                              │
+       │ pymysql                      │ boto3
+       ▼                              ▼
+  ┌──────────────┐    ┌──────────────────────────────────┐
+  │  MARIADB     │    │  S3                               │
+  │              │    │  mariadb_exports/                  │
+  │  orders      │    │   ├── orders/                     │
+  │  customers   │    │   │    ├── export_date=2025-01-29/│
+  │  products    │    │   │    │    └── orders.csv.gz     │
+  │  shipfast    │    │   │    └── export_date=2025-01-30/│
+  │              │    │   │         └── orders.csv.gz     │
+  │              │    │   ├── customers/                  │
+  │              │    │   │    └── export_date=2025-01-30/│
+  │              │    │   │         └── customers.csv.gz  │
+  │              │    │   ├── products/                   │
+  │              │    │   │    └── ...                    │
+  │              │    │   ├── shipfast_updates/           │
+  │              │    │   │    └── ...                    │
+  │              │    │   └── _manifests/                 │
+  │              │    │        └── export_2025-01-30.json │
+  │              │    │                                   │
+  └──────────────┘    └──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Linux crontab + Python script (selected)
+</span>→ Simplest, most reliable, zero AWS dependencies for scheduling
+→ Works even if AWS APIs are temporarily unavailable
+→ Easy to debug: SSH in, run manually, check logs
+→ Limitation: tied to single EC2 instance
+→ SELECTED ✅ (foundation — upgrade later)
+
+Option B: EventBridge + Lambda
+→ Serverless scheduling — no EC2 needed for scheduler
+→ Lambda runs the export script
+→ BUT: Lambda 15-min timeout — 10M row export may exceed
+→ BUT: Lambda → MariaDB requires VPC config
+→ Better for: lightweight scheduled tasks
+
+Option C: EventBridge + Step Functions + Lambda/ECS
+→ Full orchestration: parallel table exports, retry per table
+→ Best for: complex multi-step workflows
+→ Covered in Project 55 (Step Functions orchestration)
+→ Overkill for simple nightly export
+
+Option D: Managed Airflow (MWAA)
+→ Full DAG-based workflow engine
+→ $0.49/hour minimum (~$360/month)
+→ Overkill for 4-table nightly export
+→ Right choice when: 50+ DAGs, complex dependencies
+
+DECISION: Option A — crontab + Python
+→ Gets the job done reliably
+→ Foundation for understanding scheduling patterns
+→ Easy to migrate to EventBridge/Step Functions later</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. USE date-stamped S3 paths (Hive-style partitions)
+</span>   → export_date=2025-01-30/ not just 2025-01-30/
+   → Athena can query these as partitioned tables (Project 26)
+   → Glue Crawler auto-detects partition structure (Project 23)
+   → Re-running for same date overwrites same folder (idempotent)
+
+2. COMPRESS exports with GZIP before uploading
+   → 10M order rows: ~800 MB CSV → ~120 MB GZIP
+   → Reduces: upload time, S3 storage cost, downstream read time
+   → Athena reads GZIP natively (no decompression needed)
+
+3. WRITE export manifest after each run
+   → JSON file documenting: tables exported, row counts, sizes, timestamps
+   → Stored in S3: _manifests/export_2025-01-30.json
+   → Enables: auditing, debugging, downstream validation
+
+4. USE server-side cursor for large tables
+   → Default pymysql: loads ALL rows into memory
+   → 10M rows × 100 bytes = 1 GB in Python memory
+   → Server-side cursor: streams rows in batches
+   → pymysql.cursors.SSCursor → fetches rows on demand
+
+5. SEND SNS notification after EVERY run (success or failure)
+   → Success: "Exported 4/4 tables, 10.5M rows, 142 MB in 8m 32s"
+   → Failure: "Exported 2/4 tables — orders FAILED: Connection refused"
+   → Enables: team awareness without checking logs
+
+6. LOG everything to both file and stdout
+   → File: /var/log/mariadb-export/export_YYYYMMDD.log
+   → Stdout: captured by cron (mailed to root or redirected)
+   → Include: timestamps, row counts, durations, errors
+
+7. USE wrapper shell script for crontab
+   → Sets PATH, environment variables, virtualenv
+   → Redirects output to log file
+   → Captures exit code for monitoring
+   → Cron environment is MINIMAL — don't rely on .bashrc
+
+8. IMPLEMENT retry logic per table
+   → If orders export fails: retry 3 times with backoff
+   → If still fails: skip orders, continue with customers
+   → Report: which tables succeeded, which failed
+   → Don't let one table failure block all others</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT put the Python script directly in crontab
+</span>   → Cron has minimal PATH — Python may not be found
+   → No environment variables — boto3 can't find credentials
+   → Use wrapper shell script that sets up environment
+
+2. DO NOT export without date-stamping the S3 path
+   → Without dates: each export overwrites previous
+   → Can't answer: "What did data look like last Tuesday?"
+   → Can't use as Athena partitioned table
+   → Always include date in S3 key path
+
+3. DO NOT load entire large table into memory
+   → SELECT * FROM orders → 10M rows → pymysql loads ALL into memory
+   → EC2 with 4 GB RAM → OOM kill
+   → Use: SSCursor (server-side cursor) or LIMIT/OFFSET pagination
+   → Or: export in date chunks (WHERE order_date = ?)
+
+4. DO NOT ignore partial failures
+   → Export 4 tables: 3 succeed, 1 fails
+   → If script exits on first failure → 3 good exports lost
+   → Continue all tables → report which succeeded/failed
+   → Downstream can use partial data (3 of 4 tables refreshed)
+
+5. DO NOT rely on cron email for monitoring
+   → Cron sends email to local root mailbox
+   → Nobody checks EC2 local mail
+   → Use: SNS notification + CloudWatch alarm
+
+6. DO NOT schedule exports during peak database hours
+   → SELECT * on 10M rows → full table scan
+   → Locks may affect application writes
+   → Schedule at 2 AM when traffic is lowest
+   → Consider: read replica for exports (if available)
+
+7. DO NOT forget to handle timezone
+   → Cron runs in EC2's system timezone (usually UTC)
+   → Business dates may be in US/Eastern
+   → Export "yesterday's data" must account for timezone
+   → Always use UTC internally → convert for display
+
+8. DO NOT leave old exports forever
+   → 365 days × 4 tables × 150 MB = ~219 GB/year
+   → Set S3 lifecycle: move to Glacier after 90 days
+   → Delete after 365 days (or per retention policy)
+   → Lifecycle rules from Project 4</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use               │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Simple nightly export            │ Cron + Python     │ Simplest, most reliable          │
+│ (this project)                   │ (EC2)             │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Serverless scheduled task        │ EventBridge +     │ No EC2 needed, auto-retry        │
+│ (&lt; 15 min execution)             │ Lambda            │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Multi-step orchestrated export   │ Step Functions    │ Parallel exports, per-table      │
+│ with complex error handling      │ (Project 55)      │ retry, conditional logic         │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Database → S3 with CDC           │ DMS               │ Continuous replication,          │
+│ (real-time or near-real-time)    │ (Project 79)      │ change capture, no full export   │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ 50+ scheduled jobs with deps     │ Airflow / MWAA    │ DAG dependencies, backfill,     │
+│                                  │                   │ monitoring UI                    │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Database → S3 via AWS managed    │ Glue JDBC         │ Managed Spark, handles large     │
+│ ETL                              │ (Project 31)      │ tables, writes Parquet directly  │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE CRON + SCRIPT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need sub-minute scheduling precision
+</span>   → Cron minimum granularity: 1 minute
+   → For second-level: use EventBridge rate(30 seconds)
+
+2. When the EC2 instance may not be running
+   → EC2 stopped/terminated → cron doesn't fire
+   → Use: EventBridge (runs regardless of EC2 state)
+   → Or: ensure EC2 is always running (costly)
+
+3. When you have 20+ scheduled jobs with dependencies
+   → Crontab becomes unmanageable at scale
+   → Job A must finish before Job B starts
+   → Cron can't express dependencies
+   → Use: Airflow, Step Functions, or Glue Workflows
+
+4. When you need built-in retry with exponential backoff
+   → Cron fires once — if script fails, it's done until next schedule
+   → Must build retry INTO the script (we do this)
+   → EventBridge + Step Functions have native retry policies
+
+5. When export must run even if EC2 is replaced
+   → Auto Scaling Group may terminate/launch new instances
+   → Cron config lost on termination (unless in AMI or user data)
+   → Use: EventBridge + Lambda or ECS task for persistence</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                CRON + MARIADB EXPORT — INTERNAL MECHANICS                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  CRON DAEMON MECHANICS:                                                     │
+│  ──────────────────────                                                     │
+│  1. crond daemon runs continuously on EC2                                   │
+│  2. Every minute: checks all crontab entries                                │
+│  3. Matches current time against schedule patterns                          │
+│  4. If match: forks child process to execute command                        │
+│  5. Child process runs with MINIMAL environment:                            │
+│     → PATH = /usr/bin:/bin (no /usr/local/bin, no custom paths)             │
+│     → HOME = user's home directory                                          │
+│     → No .bashrc, .profile, .bash_profile loaded                            │
+│     → No virtualenv activated                                               │
+│     → No AWS credentials from instance profile (sometimes)                  │
+│  6. This is WHY we need a wrapper shell script                              │
+│                                                                             │
+│  CRON EXPRESSION: 0 2 * * *                                                 │
+│  ┌───────────── minute (0)                                                  │
+│  │ ┌─────────── hour (2)                                                    │
+│  │ │ ┌───────── day of month (* = every)                                    │
+│  │ │ │ ┌─────── month (* = every)                                           │
+│  │ │ │ │ ┌───── day of week (* = every)                                     │
+│  0 2 * * *                                                                  │
+│  → Runs at 02:00 every day                                                  │
+│                                                                             │
+│                                                                             │
+│  MARIADB EXPORT MECHANICS:                                                  │
+│  ─────────────────────────                                                  │
+│                                                                             │
+│  SMALL TABLE (&lt; 100K rows):                                                 │
+│  → Standard cursor: SELECT * → all rows loaded into Python memory           │
+│  → Write to CSV file → upload to S3                                         │
+│  → Memory: ~50 MB for 100K rows                                             │
+│  → Duration: 5-10 seconds                                                   │
+│                                                                             │
+│  LARGE TABLE (10M+ rows):                                                   │
+│  → Server-side cursor (SSCursor):                                           │
+│    1. Python sends: SELECT * FROM orders                                    │
+│    2. MariaDB executes query, holds result on SERVER                        │
+│    3. Python fetches in batches: cursor.fetchmany(10000)                    │
+│    4. Each batch: 10K rows loaded → written to CSV → memory freed           │
+│    5. Next batch fetched from server                                        │
+│    6. Repeat until all rows consumed                                        │
+│  → Memory: ~10 MB constant (regardless of table size)                       │
+│  → Duration: 5-15 minutes for 10M rows                                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  STANDARD CURSOR vs SERVER-SIDE CURSOR:                         │        │
+│  │                                                                 │        │
+│  │  Standard (default pymysql):                                    │        │
+│  │  SELECT * → MariaDB sends ALL rows → Python stores ALL in RAM   │        │
+│  │  10M rows × 100 bytes = 1 GB RAM consumed IMMEDIATELY           │        │
+│  │  ❌ OOM kill on 4 GB EC2 instance                               │        │
+│  │                                                                 │        │
+│  │  Server-side (SSCursor):                                        │        │
+│  │  SELECT * → MariaDB holds results on disk/memory                │        │
+│  │  Python fetches 10K rows at a time → processes → fetches next   │        │
+│  │  Peak memory: ~10 MB (one batch)                                │        │
+│  │  ✅ Works on any EC2 instance size                              │        │
+│  │                                                                 │        │
+│  │  TRADE-OFF:                                                     │        │
+│  │  → SSCursor holds MariaDB connection open longer                │        │
+│  │  → Other queries may wait for locks                             │        │
+│  │  → Run during low-traffic window (2 AM)                         │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  GZIP COMPRESSION DURING WRITE:                                             │
+│  ──────────────────────────────                                             │
+│  → Don't write CSV then compress → doubles disk I/O                         │
+│  → Instead: write directly to gzip.open() stream                            │
+│  → Each row → CSV formatted → GZIP compressed → written to disk            │
+│  → Output: file.csv.gz (compressed as it's written)                         │
+│  → Compression ratio: 5-8x for CSV text                                    │
+│  → 800 MB CSV → 120 MB GZIP                                                │
+│                                                                             │
+│  S3 UPLOAD WITH MULTIPART:                                                  │
+│  ──────────────────────────                                                 │
+│  → Files &gt; 100 MB: use multipart upload                                     │
+│  → boto3 upload_file() handles this automatically                           │
+│  → Splits file into 8 MB chunks → uploads in parallel                       │
+│  → If one chunk fails → retries that chunk only                             │
+│  → All chunks uploaded → S3 assembles into final object                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Cron job runs but Python not found"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: cron's PATH doesn't include /usr/local/bin or virtualenv
+→ Fix: use FULL path to Python in wrapper script
+→ /opt/venv/bin/python /opt/scripts/export.py (not just "python")
+
+PITFALL 2: "boto3 can't find credentials in cron"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: EC2 instance profile works via metadata service
+→ Sometimes cron environment blocks metadata access
+→ Fix: ensure IAM role is attached to EC2 (Project 6)
+→ Fix: set AWS_DEFAULT_REGION in wrapper script
+→ Test: run wrapper script manually first
+
+PITFALL 3: "Export OOM-killed for large table"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: standard cursor loads entire table into Python memory
+→ 10M rows × 100 bytes = 1 GB → exceeds EC2 memory
+→ Fix: use SSCursor (server-side cursor)
+→ Or: export in chunks (WHERE order_date BETWEEN ? AND ?)
+
+PITFALL 4: "Export takes 45 minutes — overlaps with next job"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: table grew larger than expected
+→ Fix: add timeout to script (30-minute max)
+→ Fix: use lock file to prevent concurrent runs
+→ Fix: optimize query (add indexes, use read replica)
+
+PITFALL 5: "S3 upload succeeds but file is corrupt"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: script crashed during GZIP write → partial file
+→ S3 received whatever was uploaded → looks like valid object
+→ Fix: write to temp file → verify → rename → upload
+→ Fix: check uploaded size matches local file size
+
+PITFALL 6: "Cron fires but EC2 was rebooted — missed last night"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: EC2 restarted at 1:55 AM → cron starts at 2:01 AM
+→ But: crond doesn't know it missed the 2:00 AM window
+→ Fix: monitoring script checks S3 for today's export
+→ If missing by 4 AM → SNS alert → manual re-run
+→ Or: add @reboot cron entry to run export on startup</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TABLE SIZE SCALING:
+</span>━━━━━━━━━━━━━━━━━━
+→ 100K rows:    standard cursor, 5 sec export,    ~10 MB CSV
+→ 1M rows:      SSCursor recommended, 30 sec,     ~100 MB CSV
+→ 10M rows:     SSCursor required, 5-10 min,      ~800 MB CSV
+→ 100M rows:    chunk by date, 30-60 min,         ~8 GB CSV
+→ 1B rows:      use DMS or Glue JDBC (Project 31, 79)
+
+EXPORT OPTIMIZATION:
+━━━━━━━━━━━━━━━━━━━━
+→ Level 0: SELECT * (full table scan every night) — simple but slow
+→ Level 1: SELECT WHERE date &gt;= yesterday (incremental) — faster
+→ Level 2: Glue JDBC with Job Bookmarks (Project 31, 33) — managed
+→ Level 3: DMS CDC (Project 79) — real-time, zero export needed
+
+STORAGE GROWTH:
+━━━━━━━━━━━━━━━
+→ 4 tables × 150 MB GZIP/day = 600 MB/day
+→ 600 MB × 365 days = 219 GB/year
+→ S3 Standard: 219 GB × $0.023 = $5.04/month after 1 year
+→ With Glacier lifecycle (90-day transition): ~$1.50/month
+→ Lifecycle rules from Project 4
+
+CONCURRENT EXPORTS:
+━━━━━━━━━━━━━━━━━━━
+→ Export tables sequentially: simple, predictable
+→ Export tables in parallel: faster but more DB load
+→ For 4 tables: sequential is fine (10-15 min total)
+→ For 20+ tables: consider parallel with thread pool</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(29)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Nightly Export Python Script (Core Logic)</h3>
+
+<h3>Step 2: Shell Wrapper for Crontab</h3>
+
+<h3>Step 3: Install Crontab Entry</h3>
+
+<h3>Step 4: Export Monitoring Script</h3>
+
+<h3>Step 5: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → MariaDB running with data (Project 8, 9)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → EC2 with IAM role for S3 + SNS (Project 5, 6)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS topic exists (Project 12)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → pymysql installed: pip install pymysql</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Set up script directory</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">sudo</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">mkdir</span><span> -p /opt/scripts/mariadb-export
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">sudo</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">cp</span><span> 01_mariadb_nightly_export.py /opt/scripts/mariadb-export/
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">sudo</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">cp</span><span> 02_run_mariadb_export.sh /opt/scripts/mariadb-export/
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">sudo</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">chmod</span><span> +x /opt/scripts/mariadb-export/02_run_mariadb_export.sh
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Test the export manually first</span><span>
+</span><span>python 01_mariadb_nightly_export.py </span><span class="token" style="color: rgb(54, 172, 170);">2025</span><span>-01-30
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Verify: S3 files created, manifest written, notification sent</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Install crontab</span><span>
+</span>python 03_install_crontab.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Verify cron is running</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">sudo</span><span> systemctl status crond
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Wait for 2 AM (or test with: </span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    /opt/scripts/mariadb-export/02_run_mariadb_export.sh)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Next morning: check export status</span><span>
+</span>python 04_monitor_exports.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. (Optional) Set up monitoring cron — runs at 4 AM</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 0 4 * * * /opt/venv/bin/python /opt/scripts/mariadb-export/04_monitor_exports.py</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Crontab + Python = simplest reliable scheduling on EC2
+→ Shell wrapper handles: environment setup, lock files, log rotation
+→ Lock file prevents concurrent runs (if export takes longer than 24h)
+→ Server-side cursor (SSCursor) essential for large tables (&gt;1M rows)
+→ GZIP compression: 5-8x smaller CSV → less upload time, less S3 cost
+→ Date-stamped S3 paths enable: historical snapshots + Athena partitions
+→ Export manifest: JSON audit trail of what was exported when
+→ Retry logic per table: one failure doesn't block all others
+→ SNS notification: team knows immediately if export succeeded or failed
+→ Monitoring script: catches missed exports even if notification failed
+→ Cron's minimal environment requires explicit PATH + region setup
+
+SCHEDULED vs EVENT-DRIVEN (Project 28 vs 29):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 28: EVENT-DRIVEN — file arrives → processing starts
+→ Project 29: SCHEDULED — clock hits 2 AM → export runs
+→ Both patterns are essential in data engineering
+→ Event-driven: for unpredictable inputs (partner file drops)
+→ Scheduled: for predictable batch operations (nightly exports)
+→ Production systems use BOTH patterns together
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket where exports land
+→ Project 4:  S3 lifecycle for export retention (Glacier after 90 days)
+→ Project 5:  EC2 where cron runs
+→ Project 8:  MariaDB source database
+→ Project 9:  MariaDB schema (tables being exported)
+→ Project 12: SNS notifications on success/failure
+→ Project 20: Manual MariaDB → S3 export (now automated)
+→ Project 23: Crawlers can discover these exports automatically
+→ Project 24: Athena can query the GZIP CSV exports
+→ Project 25: Glue can convert these exports to Parquet
+→ Project 26: Date-stamped paths enable partition pruning
+→ Project 28: Event-driven pipeline (contrast with this scheduled approach)
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 30: Automated S3 → Redshift COPY triggered by file arrival
+→ Project 31: Glue JDBC connection to MariaDB (managed alternative to this)
+→ Project 33: Glue Job Bookmarks for incremental exports
+→ Project 42: CDC pattern — export only CHANGED rows (not full table)
+→ Project 55: Step Functions orchestration (replace cron with managed workflow)
+
+DATA FLOW SO FAR:
+━━━━━━━━━━━━━━━━━
+  MariaDB (operational)
+    │
+    │ Project 29: nightly cron export
+    ▼
+  S3 Bronze (GZIP CSV, date-stamped)
+    │
+    │ Project 25: Glue ETL conversion
+    ▼
+  S3 Silver (Parquet, partitioned)
+    │
+    ├── Project 24: Athena ad-hoc queries
+    ├── Project 21: Redshift COPY for dashboards
+    └── Project 22: UNLOAD for sharing</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has TWO data flow patterns:
+</span>→ EVENT-DRIVEN: S3 → SNS → SQS → EC2 → MariaDB (Project 28) ✅
+→ SCHEDULED:    MariaDB → S3 (cron at 2 AM) (Project 29) ✅
+
+The nightly export creates date-stamped GZIP CSVs in S3:
+  s3://bucket/mariadb_exports/orders/export_date=2025-01-30/orders.csv.gz
+
+Redshift team says:
+"Great — fresh data lands in S3 every morning at ~2:15 AM.
+ But someone still has to manually run COPY to load it into Redshift.
+ Can't we auto-trigger the COPY when the export file arrives?"
+
+Current manual process:
+  1. Cron exports MariaDB → S3 at 2:00 AM ✅ (Project 29)
+  2. Engineer wakes up at 8:00 AM
+  3. Engineer runs Redshift COPY manually (Project 21)
+  4. Dashboard refreshes at 9:00 AM
+
+Desired automated process:
+  1. Cron exports MariaDB → S3 at 2:00 AM
+  2. S3 file arrival → SQS message (Project 18)
+  3. EC2 worker receives message (Project 27)
+  4. Worker runs Redshift COPY automatically (Project 21)
+  5. Dashboard refreshes at 2:30 AM (6.5 hours earlier!)
+
+CTO: "The export runs automatically. The COPY should too.
+      When a file lands in S3, load it into Redshift. No humans."
+
+YOU: "We already have ALL the pieces:
+      - S3 event → SQS (Project 18)
+      - EC2 worker polling SQS (Project 27)
+      - Redshift COPY from S3 (Project 21)
+      We just need to CONNECT them: worker receives S3 event → runs COPY."
+
+→ Project 30: "Automated S3 CSV → Redshift Load Triggered by File Arrival"
+→ Combines: Project 18 (S3→SQS) + Project 27 (SQS→EC2) + Project 21 (COPY)
+→ Closes the loop: MariaDB → S3 → Redshift (fully automated)</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="39" ========== -->
+<div class="chat-message" data-index="39"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-28.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 29 of 80</span>
+    <span class="nav-project-title">SCHEDULED MARIADB EXPORT TO S3 EVERY NIGHT AT 2 AM</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-30.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-30.html") window.location = "project-30.html";
+  if (e.key === 'ArrowLeft' && "project-28.html") window.location = "project-28.html";
+});
+</script>
+</body>
+</html>

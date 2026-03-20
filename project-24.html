@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 24: ANALYSTS WANT TO SQL-QUERY S3 DATA WITHOUT REDSHIFT COST — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:30%"></div></div>
+<div id="progress-label">30%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 24 of 80</div>
+  <div class="project-title">ANALYSTS WANT TO SQL-QUERY S3 DATA WITHOUT REDSHIFT COST</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Glue Catalog tables now available (Project 23)
+</span>Situation:
+→ 10 analysts across Finance, Marketing, Product teams
+→ Each runs 20-50 ad-hoc SQL queries per day
+→ Current tool: Redshift cluster (2x dc2.large = $0.25/hr × 24 = $6/day = $180/month)
+→ Redshift is ON 24/7 even though analysts work 9 AM – 6 PM
+→ Most queries are simple: SELECT, GROUP BY, COUNT, SUM
+→ 80% of queries scan &lt; 100 MB of data
+→ Redshift cluster also serves dashboards — analyst queries compete for resources
+
+→ CFO reviews AWS bill:
+   "We're paying $180/month for Redshift.
+    Analysts use it 9 hours/day.
+    That means 15 hours/day the cluster sits idle.
+    Is there a cheaper way for ad-hoc queries?"
+
+→ Data engineer (you) realizes:
+   - Crawler already created Glue Catalog tables on S3 data (Project 23)
+   - S3 data is queryable WITHOUT loading into any database
+   - Athena charges $5 per TB SCANNED — no idle cost
+   - 80% of analyst queries scan &lt; 100 MB → cost: $0.0005 per query
+   - 200 queries/day × $0.0005 = $0.10/day = $3/month
+
+→ $3/month (Athena) vs $180/month (Redshift) for ad-hoc queries
+→ Keep Redshift for dashboards and heavy aggregations
+→ Move ad-hoc analyst queries to Athena</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Athena's pricing model
+</span>→ $5.00 per TB of data scanned
+→ No charge for: DDL, failed queries, metadata operations
+→ Minimum charge: 10 MB per query (even if query scans 1 KB)
+→ Cancelled queries: charged for data scanned before cancellation
+→ NO infrastructure cost — no cluster, no instances, no idle cost
+
+Step 2: Understand what makes Athena cheap vs expensive
+→ CHEAP: scan only needed columns from Parquet (columnar)
+→ CHEAP: scan only needed partitions (partition pruning)
+→ CHEAP: use LIMIT on exploratory queries
+→ EXPENSIVE: SELECT * FROM huge_csv_table (full row scan)
+→ EXPENSIVE: scanning uncompressed CSV (no column pruning)
+→ EXPENSIVE: no partitioning (scans everything for every query)
+
+Step 3: Map analyst workflows to Athena patterns
+→ Exploration: "What does this data look like?" → SELECT * LIMIT 10
+→ Aggregation: "Total revenue by status" → SELECT status, SUM(amount)
+→ Filtering: "Orders from last week" → WHERE order_date BETWEEN ...
+→ Joining: "Orders with customer names" → JOIN on customer_id
+→ Export: "Give me results as CSV" → Athena auto-saves results to S3
+
+Step 4: Set up governance and cost control
+→ Workgroups: isolate teams, set per-query data scan limits
+→ Query result location: organized S3 prefix per team
+→ Named queries: save common queries as templates
+→ Cost monitoring: CloudWatch metrics for data scanned</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  Analysts (Finance, Marketing, Product)
+       │
+       │ SQL queries via Athena Console / JDBC / boto3
+       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                    ATHENA ENGINE                      │
+  │                                                      │
+  │  Workgroup: finance_team                             │
+  │   → Data scan limit: 1 GB per query                 │
+  │   → Results: s3://bucket/athena-results/finance/     │
+  │                                                      │
+  │  Workgroup: marketing_team                           │
+  │   → Data scan limit: 5 GB per query                 │
+  │   → Results: s3://bucket/athena-results/marketing/   │
+  │                                                      │
+  │  Workgroup: data_engineering                         │
+  │   → Data scan limit: 50 GB per query                │
+  │   → Results: s3://bucket/athena-results/engineering/ │
+  └──────────────────────────────────────────────────────┘
+       │
+       │ Reads schema from
+       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │              GLUE DATA CATALOG                        │
+  │  (Tables created by crawlers — Project 23)           │
+  │                                                      │
+  │  quickcart_datalake.raw_orders        (CSV)          │
+  │  quickcart_datalake.raw_customers     (CSV)          │
+  │  quickcart_datalake.raw_products      (CSV)          │
+  │  quickcart_datalake.curated_orders_snapshot (Parquet) │
+  └──────────────────────────────────────────────────────┘
+       │
+       │ Scans actual data from
+       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │                        S3                             │
+  │  quickcart-raw-data-prod/                            │
+  │   ├── daily_exports/orders/*.csv       (1.5 GB)     │
+  │   ├── daily_exports/customers/*.csv    (300 MB)     │
+  │   ├── daily_exports/products/*.csv     (60 MB)      │
+  │   └── exports/data_science/*.parquet   (200 MB)     │
+  └──────────────────────────────────────────────────────┘
+
+  COST COMPARISON:
+  ┌──────────────────────────┬──────────────────────────┐
+  │ Redshift (current)       │ Athena (proposed)        │
+  ├──────────────────────────┼──────────────────────────┤
+  │ $180/month (always on)   │ ~$3/month (pay per query)│
+  │ 200 queries/day          │ 200 queries/day          │
+  │ Fixed cost regardless    │ Cost scales with usage   │
+  │ Competes with dashboards │ Independent, no conflict │
+  │ Need DBA for maintenance │ Serverless, zero admin   │
+  └──────────────────────────┴──────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Keep using Redshift for everything
+</span>→ $180/month, cluster maintenance, WLM tuning
+→ Analysts compete with dashboard workloads
+→ Over-provisioned for ad-hoc queries
+→ REJECTED for ad-hoc workloads
+
+Option B: Athena for ad-hoc + Redshift for dashboards
+→ Athena: ~$3/month for analyst queries
+→ Redshift: reserved for scheduled dashboard refreshes
+→ Can potentially downsize Redshift cluster
+→ SELECTED ✅
+
+Option C: Athena for everything (replace Redshift entirely)
+→ Works for small-medium scale
+→ But: Athena has no persistent storage → every query re-scans S3
+→ Dashboard with 10 refreshes/hour × 10 GB scan = expensive
+→ Redshift with materialized views = faster and cheaper for dashboards
+→ PARTIALLY REJECTED — keep Redshift for heavy dashboard loads
+
+Option D: Redshift Spectrum (query S3 from Redshift)
+→ Uses Redshift cluster to query S3 data
+→ Still requires Redshift cluster running
+→ Better than COPY for infrequent queries
+→ Covered in Project 38
+→ NOT the right tool for "zero infrastructure" analyst access
+
+DECISION: Option B — Athena for ad-hoc, Redshift for dashboards</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Set up WORKGROUPS per team
+</span>   → Isolates query costs (who spent what)
+   → Sets per-query scan limits (prevents runaway queries)
+   → Separate query result locations per team
+   → Enables per-team CloudWatch metrics
+
+2. Set PER-QUERY data scan limits
+   → Finance: 1 GB max (small aggregations)
+   → Marketing: 5 GB max (larger cohort analysis)
+   → Engineering: 50 GB max (full table scans allowed)
+   → Prevents accidental SELECT * on 100 GB table
+
+3. ALWAYS select specific columns — never SELECT *
+   → CSV: SELECT * scans ALL bytes (no column pruning)
+   → Parquet: SELECT col1, col2 scans only those columns
+   → Training analysts on this ONE habit saves 80% of cost
+
+4. Use Parquet tables whenever possible
+   → Same query on CSV vs Parquet:
+     CSV:     SELECT status, SUM(amount) → scans 1.5 GB → $0.0075
+     Parquet: SELECT status, SUM(amount) → scans 50 MB  → $0.00025
+   → 30x cheaper for same result
+   → Project 25 converts CSV → Parquet via Glue ETL
+
+5. Configure query result S3 location with lifecycle
+   → Athena saves every result as CSV in S3
+   → 200 queries/day = 200 result files/day = clutter
+   → Set S3 lifecycle: delete results after 7 days
+   → Saves storage cost and keeps bucket clean
+
+6. Save common queries as NAMED QUERIES
+   → Analysts reuse instead of writing from scratch
+   → Prevents typos and wrong table references
+   → Consistent patterns across the team
+
+7. Use EXPLAIN before large queries
+   → Shows estimated data scan BEFORE executing
+   → Catch expensive queries before they run
+   → No cost for EXPLAIN itself
+
+8. Set up CloudWatch alarms on Athena spend
+   → Metric: ProcessedBytes per workgroup
+   → Alarm: if daily scan &gt; 10 GB → notify via SNS (Project 12)
+   → Catches unexpected cost spikes before bill arrives</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT let analysts use the "primary" workgroup
+</span>   → No scan limits, no cost tracking per team
+   → One bad query scans 500 GB = $2.50 surprise
+   → ALWAYS assign analysts to their team's workgroup
+
+2. DO NOT use SELECT * on CSV tables
+   → CSV is ROW-BASED — Athena reads entire row even for 1 column
+   → SELECT * FROM raw_orders → scans 1.5 GB
+   → SELECT order_id, total_amount FROM raw_orders → STILL scans 1.5 GB (CSV!)
+   → This is WHY we convert to Parquet (Project 25)
+
+3. DO NOT query unpartitioned tables with date filters
+   → WHERE order_date = '2025-01-15' on unpartitioned table
+   → Athena scans ALL files → filters AFTER scanning
+   → With partitioning: scans ONLY that date's folder
+   → Project 26 covers partitioning in depth
+
+4. DO NOT forget to set query result encryption
+   → Query results land as plain CSV in S3
+   → If data contains PII → unencrypted results = compliance violation
+   → Set workgroup: ResultConfiguration.EncryptionConfiguration
+
+5. DO NOT run heavy aggregations on raw CSV repeatedly
+   → Same GROUP BY query run 10 times/day = 10x cost
+   → Use CTAS to materialize results as Parquet table (Project 36)
+   → Then query the materialized table (near-zero cost)
+
+6. DO NOT ignore failed queries in cost calculation
+   → Cancelled queries STILL charge for data scanned before cancellation
+   → Query that scans 5 GB then times out: you pay $0.025
+   → Set appropriate timeout in workgroup configuration
+
+7. DO NOT assume Athena is always cheaper than Redshift
+   → Athena cost grows linearly with data scanned
+   → 1 TB scanned/day × 30 days = 30 TB = $150/month
+   → At this scale: Redshift may be cheaper (fixed cost)
+   → Rule of thumb: &lt; 1 TB/day scanned → Athena wins
+   → &gt; 5 TB/day scanned → Redshift wins
+   → 1-5 TB/day → analyze specific workload pattern
+
+8. DO NOT create tables directly in Athena when crawlers exist
+   → Athena CREATE TABLE creates catalog entry
+   → Crawler also creates catalog entry
+   → Running both: duplicate tables, confusion
+   → Rule: ONE source of truth for each table's schema</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use               │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Ad-hoc analyst SQL queries       │ Athena            │ Serverless, pay-per-query,       │
+│ on S3 data                       │                   │ no infrastructure                │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Dashboard with 100+ refreshes/   │ Redshift          │ Fixed cost, cached results,      │
+│ day on same data                 │ (Project 10)      │ materialized views               │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Query S3 data from Redshift      │ Redshift Spectrum  │ When analysts already use        │
+│ without COPY                     │ (Project 38)      │ Redshift and need S3 data too    │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Query across multiple data       │ Athena Federated  │ Lambda connectors query          │
+│ sources (S3 + MariaDB + APIs)    │ (Project 46)      │ non-S3 sources from Athena       │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ One-time data exploration        │ Athena            │ Zero setup, query immediately    │
+│ of new S3 dataset                │                   │ after crawler runs               │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Complex ETL with joins across    │ Glue ETL          │ Spark engine for heavy           │
+│ 10+ tables                       │ (Project 25)      │ transformations                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Sub-second query response        │ Redshift or       │ Athena typical: 2-30 seconds     │
+│                                  │ ElastiCache       │ Not suitable for real-time       │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Materialize query results as     │ Athena CTAS       │ Creates new table from query     │
+│ new optimized table              │ (Project 36)      │ results in Parquet format        │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ATHENA</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need sub-second query response
+</span>   → Athena cold start: 2-5 seconds minimum
+   → Complex queries: 10-60 seconds
+   → Use: Redshift (cached), ElastiCache, DynamoDB
+
+2. When same query runs 100+ times/day on same data
+   → Each run re-scans S3 → re-charges
+   → 100 runs × 1 GB scan = 100 GB/day = $0.50/day
+   → Redshift with materialized view: runs once, serves from cache
+
+3. When you need transactions (INSERT/UPDATE/DELETE)
+   → Athena is READ-ONLY on S3 data (with few exceptions via Iceberg)
+   → CTAS creates NEW tables but doesn't modify existing
+   → For writes: use Redshift, MariaDB, or Glue ETL
+
+4. When data volume per query exceeds 5 TB regularly
+   → $25 per query at 5 TB scan
+   → Redshift with dedicated cluster likely cheaper
+   → Unless queries are very infrequent
+
+5. When concurrent query count exceeds 20-30
+   → Athena has soft limit of 20-30 concurrent queries per account
+   → Can request increase, but not designed for 1000s concurrent
+   → Use: Redshift with concurrency scaling for high concurrency
+
+6. When you need query result caching
+   → Athena re-scans S3 every time (no built-in cache)
+   → Workaround: CTAS to materialize (Project 36)
+   → Redshift: result cache returns instantly for identical queries</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                    ATHENA — INTERNAL EXECUTION FLOW                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHASE 1: QUERY SUBMISSION                                                  │
+│  ─────────────────────────                                                  │
+│  1. User submits SQL via Console, JDBC, CLI, or boto3 API                   │
+│  2. Athena validates SQL syntax                                             │
+│  3. Looks up table metadata in GLUE DATA CATALOG                            │
+│     → Table location (S3 path)                                              │
+│     → Column names and types                                                │
+│     → SerDe (serialization/deserialization library)                          │
+│     → Partition information                                                 │
+│     → File format (CSV, Parquet, JSON, ORC)                                 │
+│  4. Checks workgroup: scan limit, result location, encryption               │
+│                                                                             │
+│  PHASE 2: QUERY PLANNING (Presto/Trino Engine)                              │
+│  ─────────────────────────────────────────────                               │
+│  1. Athena runs on Presto (v2) or Trino (v3) distributed SQL engine         │
+│  2. Query planner generates execution plan:                                  │
+│     → Which S3 files to read (based on partitions and predicates)            │
+│     → Which columns to extract (column pruning for columnar formats)         │
+│     → Join strategy (broadcast vs shuffle)                                   │
+│     → Aggregation strategy                                                   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  COLUMN PRUNING — THE KEY COST OPTIMIZATION:                    │        │
+│  │                                                                 │        │
+│  │  Query: SELECT status, SUM(total_amount) FROM orders GROUP BY 1 │        │
+│  │                                                                 │        │
+│  │  CSV TABLE (row-based):                                         │        │
+│  │  ┌─────────────────────────────────────────────┐                │        │
+│  │  │ order_id │ cust_id │ qty │ amount │ status  │  ← FULL ROW   │        │
+│  │  │ order_id │ cust_id │ qty │ amount │ status  │    SCANNED    │        │
+│  │  │ order_id │ cust_id │ qty │ amount │ status  │    for each   │        │
+│  │  └─────────────────────────────────────────────┘    record     │        │
+│  │  Data scanned: 1,500 MB (all columns, all rows)                │        │
+│  │  Cost: $0.0075                                                  │        │
+│  │                                                                 │        │
+│  │  PARQUET TABLE (columnar):                                      │        │
+│  │  ┌────────┐ ┌─────────┐ ┌─────┐ ┌────────┐ ┌────────┐         │        │
+│  │  │order_id│ │ cust_id │ │ qty │ │ amount │ │ status │         │        │
+│  │  │  skip  │ │  skip   │ │skip │ │ READ ✅│ │ READ ✅│         │        │
+│  │  │        │ │         │ │     │ │        │ │        │         │        │
+│  │  └────────┘ └─────────┘ └─────┘ └────────┘ └────────┘         │        │
+│  │  Data scanned: 50 MB (only amount + status columns)             │        │
+│  │  Cost: $0.00025                                                 │        │
+│  │                                                                 │        │
+│  │  SAME QUERY: 30x cost difference based on file format!          │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 3: S3 FILE SCANNING                                                  │
+│  ─────────────────────────                                                  │
+│  1. Athena spins up SERVERLESS workers (you don't see them)                 │
+│  2. Workers read assigned S3 files in parallel                              │
+│  3. For each file:                                                          │
+│     → CSV: reads entire file, splits by delimiter, applies column types     │
+│     → Parquet: reads only needed column chunks from row groups              │
+│     → JSON: parses each line, extracts needed fields                        │
+│  4. Applies WHERE filters as early as possible                              │
+│     → Parquet with statistics: skips row groups where min/max rules out     │
+│     → CSV: reads everything, filters after parsing                          │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  PARQUET ROW GROUP SKIPPING:                                    │        │
+│  │                                                                 │        │
+│  │  Query: WHERE total_amount &gt; 1000                               │        │
+│  │                                                                 │        │
+│  │  Row Group 1: min=5.99, max=499.99    → SKIP (max &lt; 1000) ✅   │        │
+│  │  Row Group 2: min=10.50, max=2500.00  → READ (range overlaps)  │        │
+│  │  Row Group 3: min=1.99, max=150.00    → SKIP (max &lt; 1000) ✅   │        │
+│  │                                                                 │        │
+│  │  Only 1 out of 3 row groups read → 67% less data scanned       │        │
+│  │  This optimization is FREE with Parquet — CSV cannot do this    │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 4: DISTRIBUTED PROCESSING                                            │
+│  ───────────────────────────────                                             │
+│  1. Workers process data in parallel                                        │
+│  2. Partial aggregations computed per worker                                │
+│  3. Results shuffled for final aggregation                                  │
+│  4. JOIN execution: smaller table broadcast to all workers                  │
+│     → If both tables large: hash-partitioned shuffle join                   │
+│                                                                             │
+│  PHASE 5: RESULT OUTPUT                                                     │
+│  ──────────────────────                                                     │
+│  1. Final results written as CSV to S3 (workgroup output location)          │
+│  2. Result metadata stored in Athena query history                          │
+│  3. Metrics updated: bytes scanned, execution time, state                   │
+│  4. User receives results via API/Console                                   │
+│                                                                             │
+│  ATHENA ENGINE VERSIONS:                                                    │
+│  ──────────────────────                                                     │
+│  → Engine v2: based on Presto 0.217                                         │
+│  → Engine v3: based on Trino (latest) — recommended                         │
+│  → v3 improvements: better performance, more functions, EXPLAIN support     │
+│  → Set engine version per workgroup                                         │
+│                                                                             │
+│  PRICING MECHANICS:                                                         │
+│  ─────────────────                                                          │
+│  → Charged per query based on BYTES SCANNED from S3                         │
+│  → $5.00 per TB scanned ($0.005 per GB)                                     │
+│  → Minimum charge: 10 MB per query                                          │
+│  → DDL queries (CREATE, ALTER, DROP): FREE                                  │
+│  → SHOW queries: FREE                                                       │
+│  → Failed queries: charged for data scanned before failure                  │
+│  → EXPLAIN: FREE (no data scanned)                                          │
+│  → Query results in S3: standard S3 storage charges                         │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  COST EXAMPLES:                                                 │        │
+│  │                                                                 │        │
+│  │  SELECT * FROM csv_table (1.5 GB)    → $0.0075                  │        │
+│  │  SELECT col FROM parquet_table (50 MB) → $0.00025               │        │
+│  │  SELECT * FROM partitioned WHERE date='2025-01-01' (50 MB)      │        │
+│  │                                       → $0.00025                │        │
+│  │  SELECT COUNT(*) FROM tiny_table (1 MB) → $0.00005              │        │
+│  │                         (minimum 10 MB charged)                 │        │
+│  │  CREATE TABLE ... → $0.00                                       │        │
+│  │  EXPLAIN SELECT ... → $0.00                                     │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Query returns HIVE_BAD_DATA error"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: data in S3 doesn't match catalog schema
+→ Example: catalog says column is INT, but CSV has "N/A" in that column
+→ Debug: SELECT column_name FROM table WHERE column_name IS NOT NULL LIMIT 100
+→ Fix A: update catalog type to STRING (Project 23, Step 6)
+→ Fix B: clean source data to remove invalid values
+→ Fix C: use try_cast() in Athena v3: try_cast(col AS INTEGER)
+
+PITFALL 2: "Query scans entire table despite WHERE clause"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: table is NOT partitioned — WHERE is applied AFTER full scan
+→ WHERE order_date = '2025-01-15' still scans ALL 1.5 GB
+→ Athena reads everything → filters in memory → returns matching rows
+→ Fix: partition the table by date (Project 26)
+→ With partitioning: only scans 50 MB (that date's folder)
+
+PITFALL 3: "Athena returns 0 rows but data exists in S3"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: catalog table points to wrong S3 location
+→ Cause B: SerDe mismatch (CSV configured but files are Parquet)
+→ Cause C: partitioned table with no partitions loaded
+→ Debug A: check table location in Glue console
+→ Debug B: verify table classification matches actual file format
+→ Debug C: run MSCK REPAIR TABLE tablename; to load partitions
+
+PITFALL 4: "Query takes 60 seconds for simple COUNT(*)"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: scanning huge uncompressed CSV files
+→ Cause B: thousands of tiny files (S3 listing overhead)
+→ Cause C: cold start on first query of the day
+→ Fix A: convert to Parquet (Project 25)
+→ Fix B: compact small files (Project 62)
+→ Fix C: accept 2-5 second cold start (serverless trade-off)
+
+PITFALL 5: "Query costs $5 for what should be a simple query"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: SELECT * on 1 TB unpartitioned CSV table
+→ $5 per TB scanned = $5 for one query
+→ Fix: NEVER SELECT *, always specify columns
+→ Fix: partition the table
+→ Fix: convert to Parquet
+→ Prevention: set workgroup scan limit to catch this
+
+PITFALL 6: "Different analysts get different results for same query"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: S3 data changed between query executions
+→ Athena has NO snapshot isolation — reads whatever is in S3 right now
+→ If ETL is running while analyst queries → partial/inconsistent data
+→ Fix: schedule ETL during off-hours
+→ Fix: use separate "published" S3 prefix that ETL atomically swaps
+
+PITFALL 7: "Query result CSV in S3 has no column headers"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Athena result CSVs include headers by default in console
+→ But boto3 API results: need to parse separately
+→ Fix: headers are in the result metadata, not always in CSV
+→ For download: use Console "Download results" button (includes headers)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QUERY CONCURRENCY:
+</span>━━━━━━━━━━━━━━━━━━
+→ Default: 20 concurrent DML queries per account per region
+→ Default: 20 concurrent DDL queries per account per region
+→ Can request increase to 100+
+→ Queued queries: up to 200 in queue (auto-retried)
+→ For 10 analysts with 5 concurrent queries each = 50 concurrent → request increase
+
+DATA VOLUME:
+━━━━━━━━━━━━
+→ No limit on data size in S3
+→ Athena can query petabytes of data
+→ But cost scales linearly with data scanned
+→ 1 PB scan = $5,000 per query (obviously avoid this)
+→ Partitioning + columnar format = essential at scale
+
+QUERY COMPLEXITY:
+━━━━━━━━━━━━━━━━━
+→ Simple aggregation on 10 GB: 5-15 seconds
+→ JOIN between two 10 GB tables: 20-60 seconds
+→ Complex multi-table JOIN with window functions: 1-5 minutes
+→ Timeout: 30 minutes default (configurable)
+→ Very complex queries: consider Redshift or Glue Spark instead
+
+RESULT SIZE:
+━━━━━━━━━━━━
+→ Max result size: limited by S3 (practically unlimited)
+→ Console display: limited to 1000 rows in browser
+→ API: full result accessible via S3 output file
+→ Very large results: use CTAS instead (creates table, not CSV)
+
+COST OPTIMIZATION LADDER:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Level 0: SELECT * on CSV (100% cost)
+→ Level 1: SELECT columns on CSV (100% cost — CSV can't prune)
+→ Level 2: SELECT columns on Parquet (30% cost — column pruning)
+→ Level 3: Parquet + partitioning (3-10% cost — partition pruning)
+→ Level 4: Parquet + partitioning + compression (1-5% cost)
+→ Level 5: CTAS materialized tables for repeat queries (~0% marginal)
+
+MONTHLY COST PROJECTIONS:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 10 analysts × 30 queries/day × 100 MB/query = 30 GB/day
+→ 30 GB/day × 30 days = 900 GB/month
+→ 900 GB × $0.005/GB = $4.50/month
+→ With Parquet optimization: 900 GB → 90 GB → $0.45/month</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY ATHENA QUERIES WORK CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check "Data scanned" after every query
+   → Shown in Athena console below results
+   → Shown in API response: Statistics.DataScannedInBytes
+   → Compare: CSV scan vs Parquet scan for same query
+
+2. Use EXPLAIN to preview query plan without executing
+   → EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+   → Shows: scan type, filter pushdown, estimated rows
+   → FREE — no data scanned, no charge
+
+3. Validate row counts against source
+   → Athena COUNT(*) should match Redshift COUNT(*) for same data
+   → Mismatch → S3 data or catalog issue
+
+4. Check query execution details
+   → Athena console → "Query History" tab
+   → Shows: query ID, duration, data scanned, status
+   → Filter by workgroup to see team-specific usage
+
+5. CloudWatch metrics
+   → ProcessedBytes: total bytes scanned
+   → TotalExecutionTime: query duration
+   → Per-workgroup breakdown available</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(24)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Athena Workgroups per Team</h3>
+
+<h3>Step 2: Run Queries via boto3 (Programmatic Access)</h3>
+
+<h3>Step 3: Save Named Queries for Analysts</h3>
+
+<h3>Step 4: Cost Monitoring and Alerting</h3>
+
+<h3>Step 5: IAM Policy for Workgroup-Restricted Access</h3>
+
+<h3>Step 6: Analyst-Friendly Query Patterns (SQL Reference)</h3>
+
+<h3>Step 7: Lifecycle Policy for Query Results</h3>
+
+<h3>Step 8: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Glue Catalog tables exist (Project 23 — crawlers ran)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS topic exists for alerts (Project 12)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists (Project 1)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create workgroups per team</span><span>
+</span>python 01_create_workgroups.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Run sample queries programmatically</span><span>
+</span>python 02_run_athena_query.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create named queries for analysts</span><span>
+</span>python 03_create_named_queries.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Set up cost monitoring and CloudWatch alarms</span><span>
+</span>python 04_cost_monitoring.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Create IAM policies per workgroup</span><span>
+</span>python 05_workgroup_iam_policy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Analysts run queries in Athena console</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Using patterns from 06_analyst_query_patterns.sql</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Set up lifecycle for query result cleanup</span><span>
+</span>python 07_results_lifecycle.py</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Athena = serverless SQL engine that queries S3 data directly
+→ Pricing: $5 per TB scanned — ZERO idle cost
+→ No infrastructure to manage — no cluster, no patching, no scaling
+→ Uses Glue Data Catalog for table metadata (Project 23 crawlers)
+→ CSV tables: column selection does NOT reduce scan (row-based format)
+→ Parquet tables: column selection reduces scan by 70-95% (columnar)
+→ Same query: CSV = $0.0075 vs Parquet = $0.00025 (30x difference)
+→ Workgroups isolate teams: separate costs, scan limits, result locations
+→ Per-query scan limits prevent accidental $50 queries
+→ Named queries give analysts reusable, consistent patterns
+→ CloudWatch alarms catch cost spikes before bill arrives
+→ IAM policies restrict analysts to their team's workgroup
+→ Query results auto-expire via S3 lifecycle (prevent clutter)
+
+COST OPTIMIZATION HIERARCHY:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ #1 BIGGEST WIN: CSV → Parquet (30x cost reduction)
+→ #2 NEXT WIN:    Partitioning (scan only needed date/region)
+→ #3 NEXT WIN:    Column selection (with Parquet only)
+→ #4 NEXT WIN:    CTAS for repeated queries (materialize results)
+→ #5 GOVERNANCE:  Workgroup scan limits (prevent accidents)
+
+ATHENA vs REDSHIFT DECISION MATRIX:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ &lt; 100 GB scanned/month: Athena wins ($0.50 vs $180)
+→ 100 GB – 1 TB/month: Athena still wins ($5 vs $180)
+→ 1-5 TB/month: depends on query patterns
+→ &gt; 5 TB/month: Redshift likely cheaper (fixed cost)
+→ Sub-second response needed: Redshift wins
+→ Zero-admin preferred: Athena wins
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:   S3 where source data lives
+→ Project 12:  SNS alerts for cost monitoring
+→ Project 15:  Manual catalog (now automated by Project 23)
+→ Project 16:  First Athena query (now production-grade)
+→ Project 22:  UNLOAD created Parquet files that Athena queries cheaply
+→ Project 23:  Crawlers created catalog tables that Athena uses
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 25: Convert CSV → Parquet via Glue ETL (30x cost savings)
+→ Project 26: Add partitioning for 10-100x cost savings
+→ Project 36: CTAS to materialize heavy queries
+→ Project 37: Athena Views for reusable business logic
+→ Project 38: Redshift Spectrum (query S3 from Redshift)
+→ Project 46: Athena Federated Query (query MariaDB from Athena)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart analysts now happily query S3 via Athena
+</span>Monthly cost: ~$4.50 instead of $180 (Redshift for ad-hoc)
+
+BUT: Data engineer notices a problem:
+→ raw_orders (CSV): every query scans 1.5 GB regardless of columns
+→ curated_orders_snapshot (Parquet): same query scans only 50 MB
+→ 30x cost difference for identical query!
+
+→ Problem: daily CSV exports from order system land as CSV
+→ Crawlers catalog them as CSV tables
+→ Analysts query CSV tables (expensive)
+→ Only the Redshift UNLOAD Parquet is cheap to query
+
+Analyst asks: "Can we convert ALL our CSVs to Parquet automatically?"
+CTO: "The daily exports will keep coming as CSV. We can't change the source."
+YOU: "We don't need to change the source.
+      Glue ETL can read CSV from S3 → transform → write Parquet to S3.
+      Then Athena queries the Parquet version — 30x cheaper.
+      The CSV stays as raw backup. Parquet becomes the query layer.
+      This is the beginning of a Bronze → Silver → Gold data lake."
+
+→ Project 25: "Convert Raw CSVs into Optimized Parquet via Glue"
+→ Introduces: Glue ETL Job → DynamicFrame → ResolveChoice → Parquet Write
+→ The missing piece: make ALL S3 data Athena-cheap, not just UNLOAD output</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-23.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 24 of 80</span>
+    <span class="nav-project-title">ANALYSTS WANT TO SQL-QUERY S3 DATA WITHOUT REDSHIFT COST</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-25.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-25.html") window.location = "project-25.html";
+  if (e.key === 'ArrowLeft' && "project-23.html") window.location = "project-23.html";
+});
+</script>
+</body>
+</html>

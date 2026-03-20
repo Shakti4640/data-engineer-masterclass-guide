@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 15: CATALOG OUR DATA SO OTHER TOOLS KNOW THE SCHEMA — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:19%"></div></div>
+<div id="progress-label">19%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 15 of 80</div>
+  <div class="project-title">CATALOG OUR DATA SO OTHER TOOLS KNOW THE SCHEMA</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — data platform growing rapidly
+</span>Situation:
+→ Data lives in MULTIPLE places now:
+   - S3: CSV files (Project 1), daily exports, campaign uploads
+   - MariaDB: OLTP tables (Projects 8-9)
+   - Redshift: OLAP warehouse (Projects 10-11)
+
+→ Multiple tools need to QUERY this data:
+   - Athena: SQL on S3 files (Project 16 — coming next)
+   - Glue ETL: transform data between systems (Project 25)
+   - Redshift Spectrum: query S3 from Redshift (Project 38)
+   - EMR/Spark: big data processing (future)
+
+THE PROBLEM — EVERY TOOL ASKS THE SAME QUESTION:
+"What is the SCHEMA of this data?"
+
+ANALYST (trying to use Athena):
+"I want to query orders_20250715.csv in S3 with SQL.
+ But Athena asks: what are the column names? What are the data types?
+ What's the delimiter? Where exactly is the file?
+ I have to define all of this MANUALLY every time.
+ And if the schema changes, my query breaks."
+
+DATA ENGINEER (building Glue ETL):
+"Glue needs to know: what tables exist in MariaDB? What are the 
+ column types? What tables exist in Redshift? I have to configure
+ all of this in every single Glue job. If I have 20 jobs, that's
+ 20 places to update when a schema changes."
+
+BI DEVELOPER (connecting Tableau):
+"I need a list of all available datasets. Where do I look?
+ There's no central place that says 'here's what we have.'"
+
+CTO:
+"We need a DATA CATALOG — a central registry of all our datasets.
+ Every tool reads from the catalog instead of defining schemas 
+ independently. Change the schema in ONE place, all tools adapt."
+
+REQUIREMENTS:
+→ Central metadata store for ALL datasets (S3, MariaDB, Redshift)
+→ Store: database names, table names, column names, data types
+→ Store: physical location (S3 path, JDBC connection)
+→ Store: file format (CSV, Parquet, JSON)
+→ Accessible by: Athena, Glue, Spectrum, EMR, any Hive-compatible tool
+→ Programmable: create/update via API (not just console clicks)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what a Data Catalog IS
+</span>
+  WITHOUT CATALOG:
+  ┌──────────┐   "What columns does orders.csv have?"
+  │  Athena  │──→ Manual DDL: CREATE EXTERNAL TABLE...
+  └──────────┘   Every analyst writes their own definition
+  
+  ┌──────────┐   "What's the MariaDB schema?"
+  │  Glue    │──→ Manual config: JDBC connection + table list
+  └──────────┘   Every job has its own definition
+  
+  ┌──────────┐   "What S3 data can I query?"
+  │ Spectrum │──→ Manual: CREATE EXTERNAL SCHEMA...
+  └──────────┘   Redshift admin defines everything
+
+  WITH CATALOG:
+  ┌──────────┐
+  │  Athena  │──┐
+  └──────────┘  │
+  ┌──────────┐  │    ┌─────────────────────────┐
+  │  Glue    │──┼───→│   GLUE DATA CATALOG     │
+  └──────────┘  │    │                          │
+  ┌──────────┐  │    │  Database: quickcart_raw │
+  │ Spectrum │──┘    │   ├── orders             │
+  └──────────┘       │   ├── customers          │
+                     │   └── products           │
+                     │                          │
+                     │  Database: quickcart_dw  │
+                     │   ├── fact_orders        │
+                     │   └── dim_customers      │
+                     └─────────────────────────┘
+  → ONE definition, MANY consumers
+  → Change schema in catalog → all tools see the change
+
+Step 2: Understand AWS Glue Data Catalog structure
+
+  CATALOG (one per AWS account per region)
+  └── DATABASE (logical grouping — like a schema)
+       └── TABLE (metadata about one dataset)
+            ├── Column definitions (name, type)
+            ├── Storage location (S3 path, JDBC URL)
+            ├── File format (CSV, Parquet, JSON, ORC)
+            ├── SerDe (serializer/deserializer)
+            ├── Partition keys (for partitioned data)
+            └── Table properties (custom key-value metadata)
+
+Step 3: Plan the catalog structure for QuickCart
+
+  Database: quickcart_raw_data
+  → Tables pointing to RAW S3 CSV files (from Project 1)
+  → Used by: Athena for ad-hoc queries (Project 16)
+
+  Database: quickcart_curated
+  → Tables pointing to TRANSFORMED Parquet files (future Project 25)
+  → Used by: Athena, Spectrum, Glue downstream jobs
+
+  Database: quickcart_mariadb
+  → Tables pointing to MariaDB via JDBC (future Project 31)
+  → Used by: Glue ETL for extraction
+
+Step 4: Two ways to populate the catalog
+  → MANUAL: create databases and tables via API (this project)
+  → AUTOMATIC: Glue Crawlers discover schemas (Project 23)
+  → Start manual to understand the mechanics, then automate</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CATALOG ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────────────┐
+  │               AWS GLUE DATA CATALOG                          │
+  │               (Central Metadata Store)                       │
+  │                                                              │
+  │  ┌─────────────────────────────────────────────────────┐    │
+  │  │ Database: quickcart_raw_data                         │    │
+  │  │ Purpose: Raw CSV files in S3 from daily exports      │    │
+  │  │                                                      │    │
+  │  │  ┌─────────────────────────────────────────────┐    │    │
+  │  │  │ Table: orders                                │    │    │
+  │  │  │  Location: s3://quickcart-raw/orders/        │    │    │
+  │  │  │  Format: CSV (comma-delimited, header row)   │    │    │
+  │  │  │  Columns:                                    │    │    │
+  │  │  │   ├── order_id (string)                      │    │    │
+  │  │  │   ├── customer_id (string)                   │    │    │
+  │  │  │   ├── total_amount (double)                  │    │    │
+  │  │  │   ├── status (string)                        │    │    │
+  │  │  │   └── order_date (string)                    │    │    │
+  │  │  └─────────────────────────────────────────────┘    │    │
+  │  │                                                      │    │
+  │  │  ┌─────────────────────────────────────────────┐    │    │
+  │  │  │ Table: customers                             │    │    │
+  │  │  │  Location: s3://quickcart-raw/customers/     │    │    │
+  │  │  │  Format: CSV                                 │    │    │
+  │  │  │  Columns: customer_id, name, email, ...      │    │    │
+  │  │  └─────────────────────────────────────────────┘    │    │
+  │  │                                                      │    │
+  │  │  ┌─────────────────────────────────────────────┐    │    │
+  │  │  │ Table: products                              │    │    │
+  │  │  │  Location: s3://quickcart-raw/products/      │    │    │
+  │  │  │  Format: CSV                                 │    │    │
+  │  │  │  Columns: product_id, name, category, ...    │    │    │
+  │  │  └─────────────────────────────────────────────┘    │    │
+  │  └─────────────────────────────────────────────────────┘    │
+  │                                                              │
+  │  ┌─────────────────────────────────────────────────────┐    │
+  │  │ Database: quickcart_curated                          │    │
+  │  │ Purpose: Transformed Parquet files (Project 25+)     │    │
+  │  │ Tables: (populated later by Glue ETL)                │    │
+  │  └─────────────────────────────────────────────────────┘    │
+  │                                                              │
+  └─────────────────────────────────────────────────────────────┘
+           │                │                  │
+           ▼                ▼                  ▼
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐
+  │   Athena     │ │   Glue ETL   │ │ Redshift Spectrum │
+  │ (Project 16) │ │ (Project 25) │ │  (Project 38)     │
+  │              │ │              │ │                    │
+  │ SELECT *     │ │ DynamicFrame │ │ SELECT * FROM     │
+  │ FROM         │ │ .from_catalog│ │ external_schema.  │
+  │ quickcart_   │ │ (database,   │ │ orders            │
+  │ raw_data.    │ │  table)      │ │                    │
+  │ orders       │ │              │ │                    │
+  └──────────────┘ └──────────────┘ └──────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Define tables manually via Glue API (boto3)
+</span>→ Pros: full control, programmable, version-controllable
+→ Cons: must know exact schema upfront
+→ Best for: well-known schemas, infrastructure-as-code
+→ DECISION: ✅ This project
+
+Option B: Use Glue Crawlers to auto-discover schemas
+→ Pros: automatic — point at S3 path, crawler figures out schema
+→ Cons: may infer wrong types, needs configuration
+→ Best for: unknown schemas, many tables, schema discovery
+→ Covered in: Project 23
+
+Option C: Define tables via Athena DDL (CREATE EXTERNAL TABLE)
+→ Pros: familiar SQL syntax
+→ Cons: Athena-specific, still writes to Glue Catalog behind the scenes
+→ Best for: analysts who prefer SQL over API
+→ Covered in: Project 16
+
+Option D: Define tables via AWS Console (click-through)
+→ Pros: visual, easy for one-off
+→ Cons: not reproducible, not version-controllable, manual
+→ Best for: exploration only — never for production
+
+Option E: Use Terraform/CloudFormation for catalog definitions
+→ Pros: infrastructure-as-code, reproducible
+→ Cons: another tool to learn
+→ Best for: mature teams with IaC pipelines
+→ Covered conceptually in Project 76
+
+DECISION: Option A — Manual API definition via boto3
+→ Understand the mechanics before automating
+→ Code is version-controllable (git)
+→ Foundation for all automated approaches</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create SEPARATE databases for different data layers
+</span>   → quickcart_raw_data: raw CSV files as-is from source
+   → quickcart_curated: cleaned/transformed Parquet (Project 25)
+   → quickcart_aggregated: pre-computed summaries (future)
+   → This maps to Bronze/Silver/Gold pattern (Project 44)
+
+2. Define columns with CORRECT Glue Catalog types
+   → Glue types differ from MariaDB and Redshift types
+   → Glue: string, int, bigint, double, float, boolean, date, timestamp
+   → MariaDB VARCHAR → Glue string
+   → MariaDB DECIMAL → Glue double or decimal(precision, scale)
+   → MariaDB DATE → Glue date (or string if format varies)
+   → Wrong type = Athena query errors or wrong results
+
+3. Set SerDe (Serializer/Deserializer) correctly
+   → CSV: org.apache.hadoop.hive.serde2.OpenCSVSerde
+   → Or: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+   → Parquet: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+   → JSON: org.openx.data.jsonserde.JsonSerDe
+   → Wrong SerDe = all columns NULL or parse errors
+
+4. Handle CSV headers properly
+   → If CSV has header row: set "skip.header.line.count" = "1"
+   → Without this: first row (header) treated as data
+   → Athena returns column names as data values — confusing
+
+5. Use table properties for documentation
+   → description: human-readable purpose
+   → owner: team responsible
+   → source_system: where data originates
+   → refresh_frequency: how often data updates
+   → These help other teams discover and understand datasets
+
+6. Plan partition keys from the start
+   → If data will be partitioned by date (Project 26):
+     define partition keys NOW even if not partitioned yet
+   → Adding partitions later requires table recreation
+   → For now: non-partitioned tables (partition added in Project 26)
+
+7. Tag databases and tables for governance
+   → Environment: production/staging/dev
+   → Classification: public/internal/confidential
+   → Team: data-engineering/marketing/finance
+   → Tags enable Lake Formation access control (Project 74)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT create one giant database for everything
+</span>   → raw + curated + aggregated in one database = confusion
+   → Separate databases = clear boundaries, separate permissions
+   → Athena query: FROM quickcart_raw_data.orders (clear provenance)
+
+2. DO NOT use Glue Catalog types that don't match actual data
+   → Defining order_date as "date" when CSV has "2025-01-15" string
+   → If CSV date format isn't ISO 8601: Athena returns NULL
+   → Safe approach: use "string" for dates in CSV, cast in queries
+   → Use proper "date" type only for Parquet (has native date type)
+
+3. DO NOT forget to set the InputFormat and OutputFormat
+   → InputFormat: how Athena reads the files
+   → OutputFormat: how Glue writes the files
+   → CSV: TextInputFormat + HiveIgnoreKeyTextOutputFormat
+   → Parquet: MapredParquetInputFormat + MapredParquetOutputFormat
+   → Wrong format = empty results or errors
+
+4. DO NOT define tables pointing to non-existent S3 paths
+   → Catalog table is METADATA — doesn't validate S3 path exists
+   → Table created successfully even if S3 path is wrong
+   → Athena query returns zero rows — misleading
+   → Always verify S3 path exists before creating catalog table
+
+5. DO NOT put file names in the table location
+   → Location should be the DIRECTORY (prefix), not the file
+   → Correct: s3://bucket/daily_exports/orders/
+   → Wrong: s3://bucket/daily_exports/orders/orders_20250715.csv
+   → Athena scans ALL files under the directory location
+
+6. DO NOT skip the trailing slash in S3 location
+   → s3://bucket/orders  ← may match orders_backup/ too
+   → s3://bucket/orders/ ← matches only orders/ prefix
+   → Always include trailing slash
+
+7. DO NOT create duplicate table definitions
+   → Same table name in same database = error
+   → If schema changes: UPDATE existing table, don't create new one
+   → Use create_or_update pattern (check exists, then create or update)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                         │ Use                  │ Why                                  │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Known schema, want full control  │ Manual API (boto3)   │ Programmable, version-controllable   │
+│                                  │ (This Project)       │ Exact types, exact properties        │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Unknown schema, many files       │ Glue Crawler         │ Auto-discovers schema from data      │
+│ need discovery                   │ (Project 23)         │ Handles format detection             │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Analyst prefers SQL DDL          │ Athena CREATE TABLE  │ Familiar syntax, writes to catalog   │
+│                                  │ (Project 16)         │ Same result as API approach           │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Infrastructure-as-code pipeline  │ CloudFormation/CDK   │ Reproducible, CI/CD integrated       │
+│                                  │ (Project 76)         │                                      │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Need to catalog JDBC sources     │ Glue Connection +    │ Crawler connects to DB via JDBC      │
+│ (MariaDB, Redshift)             │ Crawler (Project 31) │ Discovers tables and columns          │
+├──────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Fine-grained access control      │ Lake Formation       │ Column-level security on catalog     │
+│ on catalog tables                │ (Project 74)         │ tables                               │
+└──────────────────────────────────┴──────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE DATA CATALOG</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data is only in Redshift and queried only from Redshift
+</span>   → Redshift has its own internal catalog (pg_catalog)
+   → Glue Catalog needed only for Spectrum external tables
+   → Don't duplicate Redshift internal tables in Glue Catalog
+
+2. When data is ephemeral (temporary processing files)
+   → Catalog is for persistent, queryable datasets
+   → Don't catalog staging files that exist for 5 minutes
+   → Catalog the OUTPUT of ETL, not intermediate files
+
+3. When you need real-time schema validation
+   → Catalog is eventually consistent (not real-time)
+   → Schema changes may take seconds to propagate
+   → For real-time validation: use application-level checks
+
+4. When data lives outside AWS
+   → Glue Catalog is AWS-native — no support for GCP/Azure storage
+   → For multi-cloud: consider Apache Hive Metastore or DataHub
+   → Glue Catalog IS a Hive Metastore-compatible implementation
+
+5. When dataset count exceeds 1 million tables per account
+   → Glue Catalog soft limit: 1,000,000 tables per account
+   → Enterprise: request limit increase or use multiple accounts
+   → QuickCart: ~10 tables — nowhere near the limit</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                  GLUE DATA CATALOG INTERNAL MECHANICS                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  1. CATALOG HIERARCHY                                                       │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  AWS Account ([REDACTED:BANK_ACCOUNT_NUMBER]) + Region (us-east-2)                            │
+│  └── Catalog (ONE per account per region — implicit, always exists)         │
+│       ├── Database: "quickcart_raw_data"                                    │
+│       │    ├── Table: "orders"                                              │
+│       │    │    ├── StorageDescriptor                                       │
+│       │    │    │    ├── Location: "s3://bucket/orders/"                    │
+│       │    │    │    ├── InputFormat: "TextInputFormat"                     │
+│       │    │    │    ├── OutputFormat: "HiveIgnoreKeyText..."              │
+│       │    │    │    ├── SerdeInfo:                                         │
+│       │    │    │    │    ├── SerializationLibrary: "OpenCSVSerde"         │
+│       │    │    │    │    └── Parameters: {"separatorChar": ","}           │
+│       │    │    │    └── Columns: [{name, type}, ...]                      │
+│       │    │    ├── PartitionKeys: [] (none for now)                       │
+│       │    │    ├── TableType: "EXTERNAL_TABLE"                            │
+│       │    │    └── Parameters: {"skip.header.line.count": "1"}           │
+│       │    ├── Table: "customers"                                          │
+│       │    └── Table: "products"                                           │
+│       └── Database: "quickcart_curated"                                    │
+│            └── (populated later)                                            │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  2. HOW ATHENA USES THE CATALOG                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  User runs: SELECT * FROM quickcart_raw_data.orders WHERE status='completed'│
+│                                                                             │
+│  Step 1: Athena queries Glue Catalog                                        │
+│    → GET TABLE: quickcart_raw_data.orders                                  │
+│    → Returns: StorageDescriptor (location, format, columns, serde)         │
+│                                                                             │
+│  Step 2: Athena reads metadata                                              │
+│    → Location: s3://quickcart-raw-data-prod/daily_exports/orders/          │
+│    → Format: CSV with OpenCSVSerde                                          │
+│    → Columns: order_id(string), customer_id(string), total_amount(double)  │
+│    → Skip header: yes (first row)                                          │
+│                                                                             │
+│  Step 3: Athena lists S3 objects under location                             │
+│    → s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250715.csv │
+│    → s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250714.csv │
+│    → ALL files under the prefix are scanned                                │
+│                                                                             │
+│  Step 4: Athena reads files using SerDe                                     │
+│    → OpenCSVSerde splits each line by comma                                │
+│    → Maps column 0 → order_id, column 1 → customer_id, etc.               │
+│    → Casts values to declared types (string, double, etc.)                 │
+│    → Applies WHERE filter                                                   │
+│                                                                             │
+│  Step 5: Return results to user                                             │
+│    → Only matching rows returned                                            │
+│    → Billing: based on data SCANNED (not returned)                         │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  3. HOW GLUE ETL USES THE CATALOG                                           │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Glue job code:                                                             │
+│  df = glueContext.create_dynamic_frame.from_catalog(                        │
+│      database="quickcart_raw_data",                                         │
+│      table_name="orders"                                                    │
+│  )                                                                          │
+│                                                                             │
+│  Step 1: Glue reads catalog metadata                                        │
+│    → Same GET TABLE call as Athena                                          │
+│    → Gets location, format, schema                                          │
+│                                                                             │
+│  Step 2: Glue reads data from S3                                            │
+│    → Uses Spark readers appropriate for the format                          │
+│    → CSV: spark.read.csv() with inferred settings from catalog             │
+│    → Parquet: spark.read.parquet()                                         │
+│                                                                             │
+│  Step 3: Glue creates DynamicFrame with catalog schema                      │
+│    → Columns named and typed per catalog definition                         │
+│    → If data doesn't match: ResolveChoice handles mismatches               │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  4. SERDE — THE PARSER THAT MAKES IT WORK                                   │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  SerDe = Serializer + Deserializer                                          │
+│  → Deserializer: reads raw bytes → structured columns                      │
+│  → Serializer: structured columns → raw bytes (for writes)                 │
+│                                                                             │
+│  CSV SerDe options:                                                         │
+│                                                                             │
+│  1. LazySimpleSerDe (default):                                              │
+│     → Simple delimiter-based splitting                                      │
+│     → Does NOT handle quoted fields with commas inside                     │
+│     → Fast but fragile for complex CSV                                     │
+│     → Use for: simple CSV without quoted fields                            │
+│                                                                             │
+│  2. OpenCSVSerDe:                                                           │
+│     → Handles quoted fields: "New York, NY" is ONE field                   │
+│     → Handles escaped quotes: "She said ""hello"""                         │
+│     → All columns returned as STRING (must cast in query)                  │
+│     → Use for: CSV with quoted fields, standard format                     │
+│                                                                             │
+│  3. RegexSerDe:                                                             │
+│     → Parses using regular expression                                       │
+│     → For non-standard formats (log files, custom delimiters)              │
+│     → Most flexible but slowest                                            │
+│                                                                             │
+│  Parquet SerDe:                                                             │
+│     → ParquetHiveSerDe                                                      │
+│     → Schema embedded in Parquet file — SerDe reads it                     │
+│     → Types preserved exactly (int, long, double, string, date)            │
+│     → No parsing needed — binary format                                    │
+│     → 10-100x faster than CSV SerDe                                        │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  5. CATALOG IS HIVE METASTORE COMPATIBLE                                    │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Apache Hive Metastore:                                                     │
+│  → Open-source metadata store for Hadoop ecosystem                          │
+│  → Standard interface for: Hive, Spark, Presto, Trino                      │
+│  → AWS Glue Data Catalog IMPLEMENTS the Hive Metastore API                 │
+│                                                                             │
+│  What this means:                                                           │
+│  → Any tool that reads Hive Metastore can read Glue Catalog               │
+│  → Athena (based on Presto/Trino) reads Glue Catalog natively             │
+│  → Spark on EMR can use Glue Catalog as its metastore                      │
+│  → Redshift Spectrum reads Glue Catalog for external tables                │
+│  → No proprietary lock-in — standard metadata format                       │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  6. TABLE TYPES                                                              │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  EXTERNAL_TABLE:                                                            │
+│  → Data lives OUTSIDE the catalog (in S3, JDBC, etc.)                      │
+│  → Dropping the table does NOT delete the data                             │
+│  → Most common type — ALL S3-backed tables are external                    │
+│  → This is what we create in this project                                  │
+│                                                                             │
+│  VIRTUAL_VIEW:                                                              │
+│  → Stored query (like a SQL VIEW)                                          │
+│  → No data stored — query executed at read time                            │
+│  → Used by Athena views (Project 37)                                       │
+│                                                                             │
+│  GOVERNED:                                                                  │
+│  → Lake Formation governed table                                           │
+│  → ACID transactions on S3 data                                            │
+│  → Used in Project 74 (Lake Formation)                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Athena returns all NULL values"
+</span>→ Cause #1: wrong SerDe — LazySimpleSerDe for CSV with quoted fields
+→ Fix: use OpenCSVSerDe
+→ Cause #2: wrong delimiter in SerDe parameters
+→ Fix: verify separatorChar matches actual file delimiter
+→ Cause #3: column count mismatch between catalog and file
+→ Fix: catalog column count must match file column count exactly
+
+PITFALL 2: "Athena returns header row as data"
+→ Cause: skip.header.line.count not set in table properties
+→ Fix: add "skip.header.line.count": "1" to table Parameters
+→ Note: this property works with LazySimpleSerDe and OpenCSVSerDe
+
+PITFALL 3: "Glue Catalog table created but Athena can't find it"
+→ Cause: table created in different region than Athena workgroup
+→ Fix: Glue Catalog is per-region — create in same region as Athena
+→ Debug: aws glue get-table --database-name X --name Y --region Z
+
+PITFALL 4: "Table shows 0 rows even though S3 has files"
+→ Cause #1: S3 location path doesn't match actual file location
+→ Fix: verify trailing slash and exact path
+→ Cause #2: files are in subdirectories not matching partition scheme
+→ Fix: for non-partitioned tables, files must be directly under location
+
+PITFALL 5: "DOUBLE column returns NULL for decimal values"
+→ Cause: OpenCSVSerDe returns ALL columns as STRING
+→ Fix: use string type in catalog, CAST in Athena queries
+→ Or: use LazySimpleSerDe (supports native types but no quoting)
+→ Best: convert to Parquet (Project 25) — native type support
+
+PITFALL 6: "Can't create table — database doesn't exist"
+→ Cause: database must exist before creating tables in it
+→ Fix: create database first, then tables
+→ API: glue.create_database() before glue.create_table()
+
+PITFALL 7: "Column names have spaces or special characters"
+→ Cause: CSV header has "Order ID" instead of "order_id"
+→ Glue Catalog: column names should be lowercase, no spaces
+→ Fix: use underscore naming in catalog, handle mapping in SerDe
+→ Best practice: clean column names during ETL (Project 25)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CATALOG LIMITS:
+</span>→ Databases per account: 10,000
+→ Tables per database: 1,000,000
+→ Partitions per table: 10,000,000
+→ Columns per table: 1,600 (Athena limit)
+→ Table versions: 1,000,000 per table
+→ QuickCart: ~3 databases, ~10 tables — nowhere near limits
+
+API RATE LIMITS:
+→ GetTable: 100 requests/second
+→ CreateTable: 5 requests/second
+→ UpdateTable: 5 requests/second
+→ GetPartitions: 20 requests/second
+→ For bulk operations: use BatchCreatePartition (up to 100 per call)
+
+COST:
+→ First 1 million objects stored: FREE
+→ Above 1 million: $1 per 100,000 objects per month
+→ API requests: $1 per 1,000,000 requests
+→ QuickCart: essentially $0/month
+
+SCALING PATTERNS:
+→ 1-10 tables: manual API creation (this project)
+→ 10-50 tables: Glue Crawlers for discovery (Project 23)
+→ 50-500 tables: automated pipeline with versioning (Project 76)
+→ 500+ tables: data mesh with per-domain catalogs (Project 71)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CATALOG IS CORRECT:
+</span>
+1. List databases:
+   → aws glue get-databases
+   → Verify expected databases exist
+
+2. List tables in database:
+   → aws glue get-tables --database-name quickcart_raw_data
+   → Verify expected tables exist
+
+3. Get table details:
+   → aws glue get-table --database-name quickcart_raw_data --name orders
+   → Verify: columns, location, format, SerDe, properties
+
+4. Query via Athena (ultimate test):
+   → SELECT * FROM quickcart_raw_data.orders LIMIT 10;
+   → If results look correct: catalog definition is correct
+   → If NULLs or wrong data: SerDe or type mismatch
+
+5. Check S3 location has data:
+   → aws s3 ls s3://quickcart-raw-data-prod/daily_exports/orders/
+   → Files must exist at the location specified in catalog</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(15)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Databases</h3>
+
+<h3>Step 2: Create Tables for Raw CSV Data</h3>
+
+<h3>Step 3: Catalog Explorer — Browse and Search</h3>
+
+<h3>Step 4: Schema Update &amp; Version Management</h3>
+
+<h3>Step 5: Catalog Validation — Verify S3 Data Matches Catalog</h3>
+
+<h3>Step 6: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Prerequisites:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket with CSV files (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → boto3 installed</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create Glue Catalog databases</span><span>
+</span>python3 01_create_databases.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create tables for raw CSV data</span><span>
+</span>python3 02_create_raw_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Explore the catalog</span><span>
+</span>python3 03_catalog_explorer.py databases
+python3 03_catalog_explorer.py tables quickcart_raw_data
+python3 03_catalog_explorer.py describe quickcart_raw_data orders
+python3 03_catalog_explorer.py search order
+python3 03_catalog_explorer.py ddl quickcart_raw_data orders
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Schema management demo (add columns, compare, history)</span><span>
+</span>python3 04_schema_management.py demo
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Validate catalog against actual S3 data</span><span>
+</span>python3 05_validate_catalog.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED CATALOG EXPLORER OUTPUT:
+</span>
+📋 TABLES IN 'quickcart_raw_data':
+   ──────────────────────────────────────────────────────────────
+
+   📄 orders
+      Description: Daily order export from MariaDB. One row per order.
+      Location:    s3://quickcart-raw-data-prod/daily_exports/orders/
+      Format:      csv (SerDe: OpenCSVSerde)
+      Columns:     8
+
+   📄 customers
+      Description: Daily customer export from MariaDB. One row per customer.
+      Location:    s3://quickcart-raw-data-prod/daily_exports/customers/
+      Format:      csv (SerDe: OpenCSVSerde)
+      Columns:     7
+
+   📄 products
+      Description: Daily product catalog export from MariaDB. One row per product.
+      Location:    s3://quickcart-raw-data-prod/daily_exports/products/
+      Format:      csv (SerDe: OpenCSVSerde)
+      Columns:     6
+
+─────────────────────────────────────────────────────────────────
+EXPECTED VALIDATION OUTPUT:
+
+🔍 Validating: quickcart_raw_data.orders
+   ───────────────────────────────────────────────────────────
+   ✅ Location format correct: s3://quickcart-raw-data-prod/daily_exports/orders/
+   ✅ S3 has 3 file(s) (0.12 MB)
+   File: orders_20250715.csv
+   ✅ Column count matches: 8
+   ✅ Header names match catalog columns
+   ✅ Sample data row has no empty values
+
+📊 VALIDATION SUMMARY
+   ✅ Passed:   15
+   ⚠️  Warnings: 0
+   ❌ Failed:   0
+   🟢 CATALOG IS VALID</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ GLUE DATA CATALOG: central metadata store for ALL datasets
+   → ONE catalog per account per region (implicit, always exists)
+   → Databases: logical groupings (raw, curated, aggregated)
+   → Tables: metadata about one dataset (columns, location, format)
+   → Tables are POINTERS to data — they don't contain data themselves
+
+→ CATALOG HIERARCHY: Catalog → Database → Table → Columns
+   → Databases map to data layers (bronze/silver/gold)
+   → Tables map to datasets (orders, customers, products)
+   → Columns define structure (name, type, comment)
+
+→ SERDE: the parser that reads raw bytes into structured columns
+   → OpenCSVSerde: handles quoted fields, returns strings
+   → LazySimpleSerDe: simple delimiter, native types
+   → ParquetHiveSerDe: binary format, fastest, type-safe
+   → Wrong SerDe = all NULL values or parse errors
+
+→ KEY PROPERTIES for CSV tables:
+   → skip.header.line.count = "1" (skip CSV header row)
+   → S3 location must end with trailing slash
+   → Column order must match file column order
+   → Column count must match file column count
+
+→ SCHEMA EVOLUTION: add columns, change types, track versions
+   → Glue stores version history automatically
+   → New columns in catalog → old files return NULL for that column
+   → Version tracking via table Parameters
+
+→ HIVE METASTORE COMPATIBLE: any Hive-compatible tool can read
+   → Athena, Glue ETL, Spectrum, EMR Spark — all read same catalog
+   → Define once, use everywhere
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): catalog points to CSV files stored in S3
+→ Projects 8-9 (MariaDB): column definitions mirror MariaDB schema
+→ Projects 10-11 (Redshift): separate catalog for warehouse tables
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 16 (Athena): query S3 data using SQL via catalog tables
+→ Project 23 (Glue Crawler): auto-discover schemas instead of manual
+→ Project 25 (Glue ETL): read from catalog, transform, write back
+→ Project 26 (Partitioning): add partition keys to catalog tables
+→ Project 38 (Spectrum): Redshift queries S3 via Glue Catalog
+→ Project 45 (Schema Evolution): handle schema changes in ETL
+→ Project 74 (Lake Formation): fine-grained access control on catalog</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a central Data Catalog:
+</span>→ 3 databases (raw, curated, aggregated)
+→ 3 tables in raw database (orders, customers, products)
+→ Schema documented with types, comments, properties
+→ Validated against actual S3 data
+
+The analyst says:
+"Perfect — now I have table definitions. But I still can't 
+ QUERY the data. I know the schema exists in the catalog.
+ Now I need a tool that READS the catalog and lets me run SQL 
+ against the S3 files WITHOUT loading them into any database.
+
+ I want to type:
+   SELECT status, COUNT(*), SUM(total_amount)
+   FROM quickcart_raw_data.orders
+   WHERE order_date &gt;= '2025-01-01'
+   GROUP BY status;
+
+ And get results in seconds. No Redshift needed. No MariaDB.
+ Just SQL directly on S3 files."
+
+→ Project 16: "Query S3 Files Using SQL Without Loading Anywhere"
+→ Introduces: Amazon Athena → First Query → Output Location → 
+   SerDe → Pricing model → Query optimization
+→ Athena reads the catalog we just created (Project 15)
+→ Runs SQL directly on S3 files — serverless, pay-per-scan</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-14.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 15 of 80</span>
+    <span class="nav-project-title">CATALOG OUR DATA SO OTHER TOOLS KNOW THE SCHEMA</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-16.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-16.html") window.location = "project-16.html";
+  if (e.key === 'ArrowLeft' && "project-14.html") window.location = "project-14.html";
+});
+</script>
+</body>
+</html>

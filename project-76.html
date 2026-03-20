@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 76: CI/CD FOR DATA PIPELINES — GIT PUSH → TEST → DEPLOY GLUE + R — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:95%"></div></div>
+<div id="progress-label">95%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 76 of 80</div>
+  <div class="project-title">CI/CD FOR DATA PIPELINES — GIT PUSH → TEST → DEPLOY GLUE + REDSHIFT DDL</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag">Glue</span><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: QuickCart — Full data lake platform (Project 73)
+</span>         DR across regions (Project 75)
+         50+ Glue jobs, 200+ catalog tables, Redshift DDL, Step Functions
+
+THE INCIDENT:
+→ Friday 4:30 PM: Junior engineer updates Glue ETL job for daily_orders
+→ Changes column mapping: "order_total" → "total_amount" (rename)
+→ Uploads new script to S3 manually via Console
+→ Saturday 2:00 AM: Nightly pipeline runs with new script
+→ Glue job SUCCEEDS but writes wrong column name to Gold Parquet
+→ Saturday 8:00 AM: BI dashboards show $0 revenue (column mismatch)
+→ Saturday 10:00 AM: On-call engineer discovers the issue
+→ Saturday 12:00 PM: Engineer can't find the OLD version of the script
+→ Saturday 2:00 PM: Engineer rewrites from memory, deploys fix
+→ Saturday 3:00 PM: Re-runs nightly pipeline, dashboards recover
+
+DAMAGE:
+→ 13 hours of broken dashboards
+→ Weekend executive report showed $0 revenue (sent to board)
+→ No version history of the change
+→ No code review before deployment
+→ No automated test caught the column mismatch
+→ No rollback mechanism
+
+ROOT CAUSE ANALYSIS:
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  PROBLEM 1: No version control                                         │
+│  → Glue scripts uploaded directly to S3 via Console                    │
+│  → No Git history, no diff, no blame                                   │
+│  → "Who changed what, when?" → nobody knows                           │
+│                                                                         │
+│  PROBLEM 2: No code review                                             │
+│  → Junior engineer deployed directly to production                     │
+│  → No pull request, no peer review, no approval                        │
+│                                                                         │
+│  PROBLEM 3: No automated testing                                       │
+│  → Column rename not caught before deployment                          │
+│  → No schema validation test                                           │
+│  → No integration test against sample data                             │
+│                                                                         │
+│  PROBLEM 4: No deployment pipeline                                     │
+│  → Manual upload to S3 = manual deploy to production                   │
+│  → No staging environment, no canary deploy                            │
+│  → No separation between dev → staging → prod                         │
+│                                                                         │
+│  PROBLEM 5: No rollback mechanism                                      │
+│  → S3 object overwritten — old version gone                            │
+│  → S3 versioning enabled but nobody knew how to restore                │
+│  → Redshift DDL changes: no migration history                          │
+│                                                                         │
+│  PROBLEM 6: No infrastructure as code                                  │
+│  → Step Functions created via Console clicks                           │
+│  → EventBridge rules created via boto3 scripts                         │
+│  → Glue jobs created via mix of Console + scripts                      │
+│  → No reproducible deployment                                          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CTO MANDATE:
+"Every change to our data platform must:
+ → Be version controlled in Git
+ → Pass automated tests before deployment
+ → Be reviewed by at least one peer
+ → Deploy through an automated pipeline
+ → Be rollback-able within 5 minutes
+ → Work across dev → staging → production environments"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Define What Needs CI/CD
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CATEGORY A: ETL Code (changes frequently)
+→ Glue job PySpark scripts (50 scripts)
+→ Glue job configurations (DPU, timeout, bookmarks)
+→ Lambda functions for automation
+→ SQL scripts for Athena CTAS / Redshift procedures
+
+CATEGORY B: Infrastructure (changes occasionally)
+→ Glue job definitions (name, role, connections)
+→ Step Functions state machines
+→ EventBridge rules and schedules
+→ Kinesis streams and Firehose configurations
+→ SNS topics and SQS queues
+→ IAM roles and policies
+
+CATEGORY C: Schema (changes rarely but dangerously)
+→ Glue Catalog table definitions
+→ Redshift DDL (CREATE/ALTER TABLE)
+→ Redshift stored procedures
+→ Lake Formation tag assignments
+
+Step 2: Choose CI/CD Tools
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OPTION A: AWS-Native (CodeCommit + CodeBuild + CodePipeline)
+→ Fully integrated with AWS IAM
+→ No external accounts needed
+→ CodeBuild runs in VPC (can access Redshift, MariaDB)
+→ ✅ SELECTED for simplicity
+
+OPTION B: GitHub + GitHub Actions + AWS
+→ Better Git UX, better PR experience
+→ Requires GitHub ↔ AWS OIDC authentication
+→ More familiar to most engineers
+→ ✅ ALTERNATIVE (shown as option)
+
+OPTION C: GitLab CI + AWS
+→ Self-hosted or SaaS
+→ Good but adds another vendor
+→ ❌ NOT SELECTED for this project
+
+DECISION: AWS-Native primary, GitHub Actions as alternative
+
+Step 3: Design the Pipeline Stages
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Git     │ →  │  Build   │ →  │  Test    │ →  │  Deploy  │ →  │  Verify  │
+│  Push    │    │  &amp; Lint  │    │  (Auto)  │    │  (Auto)  │    │  (Auto)  │
+└─────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+     │              │               │               │               │
+  CodeCommit    CodeBuild       CodeBuild       CodePipeline    CodeBuild
+  or GitHub     pylint          pytest          CloudFormation  smoke test
+  PR + review   cfn-lint        schema check    S3 deploy       Athena query
+                syntax          integration     Glue update     Redshift check
+
+Step 4: Define Environment Promotion
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+dev branch → dev account (111111111111-dev)
+  ↓ PR + tests pass
+staging branch → staging account (111111111111-staging)
+  ↓ Manual approval
+main branch → production account (111111111111)
+  ↓ Automated deploy + smoke test
+  ↓ If smoke test fails → automatic rollback</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE CI/CD ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                  │
+│  DEVELOPER WORKFLOW                                                              │
+│  ═══════════════════                                                             │
+│                                                                                  │
+│  1. Engineer creates feature branch                                              │
+│     git checkout -b feature/fix-order-total-column                               │
+│                                                                                  │
+│  2. Makes changes to Glue script + CloudFormation template                       │
+│     vim glue_jobs/transform_silver_to_gold.py                                    │
+│     vim infrastructure/glue-jobs.yaml                                            │
+│                                                                                  │
+│  3. Runs local tests                                                             │
+│     make test-local                                                              │
+│                                                                                  │
+│  4. Pushes and creates Pull Request                                              │
+│     git push origin feature/fix-order-total-column                               │
+│     → PR created → triggers CI pipeline                                          │
+│                                                                                  │
+│  5. CI pipeline runs automatically                                               │
+│     ┌──────────────────────────────────────────────────────────────┐             │
+│     │  STAGE 1: BUILD &amp; LINT                                       │             │
+│     │  → Python syntax check (py_compile)                          │             │
+│     │  → PySpark import validation                                 │             │
+│     │  → CloudFormation lint (cfn-lint)                            │             │
+│     │  → SQL syntax validation                                     │             │
+│     │  → Security scan (bandit)                                    │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 2: UNIT TESTS                                         │             │
+│     │  → Schema validation tests                                   │             │
+│     │  → Column mapping tests                                      │             │
+│     │  → Transformation logic tests (with sample data)             │             │
+│     │  → SQL output verification                                   │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 3: INTEGRATION TESTS (in dev account)                 │             │
+│     │  → Deploy to dev environment                                 │             │
+│     │  → Run Glue job against test data                            │             │
+│     │  → Verify output schema matches expected                     │             │
+│     │  → Verify row counts and data quality                        │             │
+│     │  → Athena query on output data                               │             │
+│     └──────────────────────────────────────────────────────────────┘             │
+│                                                                                  │
+│  6. Peer reviews PR                                                              │
+│     → Reviews code changes                                                       │
+│     → Sees CI pipeline passed ✅                                                │
+│     → Approves PR                                                                │
+│                                                                                  │
+│  7. PR merged to main → triggers CD pipeline                                     │
+│     ┌──────────────────────────────────────────────────────────────┐             │
+│     │  STAGE 4: DEPLOY TO STAGING                                  │             │
+│     │  → CloudFormation deploy (infra changes)                     │             │
+│     │  → S3 upload (Glue scripts)                                  │             │
+│     │  → Redshift DDL migration                                    │             │
+│     │  → Glue Catalog updates                                      │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 5: STAGING SMOKE TEST                                 │             │
+│     │  → Trigger pipeline in staging                               │             │
+│     │  → Verify output                                             │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 6: MANUAL APPROVAL GATE                               │             │
+│     │  → SNS notification to team lead                             │             │
+│     │  → Team lead approves in CodePipeline console                │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 7: DEPLOY TO PRODUCTION                               │             │
+│     │  → Same deployment steps as staging                          │             │
+│     │  → CloudFormation changeset review                           │             │
+│     ├──────────────────────────────────────────────────────────────┤             │
+│     │  STAGE 8: PRODUCTION SMOKE TEST                              │             │
+│     │  → Athena test query                                         │             │
+│     │  → Redshift test query                                       │             │
+│     │  → If FAILS → automatic rollback                             │             │
+│     └──────────────────────────────────────────────────────────────┘             │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. MONOREPO for all data platform code
+</span>   → Single repository: quickcart-data-platform
+   → Folder structure mirrors AWS services
+   → One PR can change Glue script + CloudFormation + Redshift DDL together
+   → Atomic deployments: all related changes deploy together
+
+2. CLOUDFORMATION for ALL infrastructure
+   → Every AWS resource defined in YAML templates
+   → No Console clicks, no ad-hoc boto3 scripts
+   → Reproducible: same template deploys to dev, staging, prod
+   → Drift detection: know when someone changes resources manually
+
+3. SEPARATE TESTS by speed and scope
+   → Unit tests: &lt; 30 seconds, no AWS calls, run on every push
+   → Integration tests: 2-5 minutes, uses dev AWS account, run on PR
+   → Smoke tests: 1-2 minutes, verifies deployed resources, run post-deploy
+
+4. PARAMETERIZE everything by environment
+   → Bucket names: {project}-data-{env} (prod, staging, dev)
+   → Glue database names: {domain}_{layer}_{env}
+   → Redshift workgroup: {project}-{env}
+   → Same CloudFormation template, different parameter files
+
+5. MIGRATION PATTERN for Redshift DDL
+   → Numbered SQL migration files: 001_create_tables.sql, 002_add_column.sql
+   → Applied in order, tracked in migrations table
+   → Never ALTER existing migrations — only add new ones
+   → Rollback = new migration that reverses the change
+
+6. GLUE SCRIPT VERSIONING via S3 + Git
+   → Scripts stored in S3: s3://bucket/scripts/{version}/script.py
+   → Glue job updated to point to new S3 path
+   → Rollback: update Glue job to previous S3 path
+   → Git tag marks each production deployment</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT upload Glue scripts to S3 via Console
+</span>   → This is how the incident happened
+   → All deployments through CI/CD pipeline only
+   → Console write access removed from developer IAM roles
+
+2. DO NOT run CloudFormation directly from laptop
+   → "It works on my machine" → different IAM permissions
+   → All deploys through CodePipeline (consistent IAM role)
+   → Exception: emergency hotfix with mandatory post-deploy PR
+
+3. DO NOT skip the approval gate for production
+   → Every production deploy requires human approval
+   → Automated tests necessary but NOT sufficient
+   → Team lead must review CloudFormation changeset
+
+4. DO NOT test against production data
+   → Integration tests use synthetic test datasets
+   → Test data stored in dev S3 bucket
+   → Never read from or write to production S3 in tests
+
+5. DO NOT version Glue scripts with timestamps
+   → s3://bucket/scripts/transform_20250115.py → unmaintainable
+   → Use Git commit SHA: s3://bucket/scripts/{commit_sha}/transform.py
+   → Deterministic, traceable, reproducible
+
+6. DO NOT mix infrastructure and application deploys
+   → Infrastructure (CloudFormation): separate pipeline stage
+   → Application (Glue scripts): separate pipeline stage
+   → Infrastructure deploys first, then application
+   → Prevents: new script references resource that doesn't exist yet</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬─────────────────────────┬──────────────────────────────────┐
+</span>│ Change Type                        │ Pipeline Path           │ Why                              │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ Glue ETL script logic change       │ Full CI/CD pipeline     │ Highest risk — affects data       │
+│                                    │ (all 8 stages)          │ quality downstream                │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ New Glue job addition              │ Full CI/CD pipeline     │ New infra (CloudFormation) +      │
+│                                    │ + CloudFormation        │ new script                        │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ Redshift DDL change                │ Migration pipeline      │ Schema change — needs careful     │
+│ (add column, create table)         │ (numbered migrations)   │ ordering and rollback plan        │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ Step Functions definition change   │ CloudFormation update   │ Infra change — deploy template    │
+│                                    │                         │ with changeset review             │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ Lake Formation tag/grant change    │ Dedicated security      │ Sensitive — requires security     │
+│                                    │ pipeline + approval     │ team approval, not just eng lead  │
+├────────────────────────────────────┼─────────────────────────┼──────────────────────────────────┤
+│ Emergency hotfix                   │ Fast-track: skip staging│ Direct to prod with post-deploy   │
+│ (production is broken NOW)         │ but require 2 approvals │ PR and mandatory review           │
+└────────────────────────────────────┴─────────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+</span>CODEPIPELINE EXECUTION — INTERNAL FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  1. SOURCE STAGE                                                 │
+│  → CodePipeline polls CodeCommit (or webhook from GitHub)       │
+│  → Detects new commit on 'main' branch                          │
+│  → Downloads source code as ZIP artifact                         │
+│  → Stores artifact in pipeline S3 bucket                         │
+│                                                                  │
+│  2. BUILD STAGE (CodeBuild)                                      │
+│  → CodeBuild provisions Docker container (aws/codebuild/std)    │
+│  → Container starts in configured VPC (for DB access)            │
+│  → Runs buildspec.yml commands:                                  │
+│    a) Install dependencies (pip install)                         │
+│    b) Lint code (pylint, cfn-lint, bandit)                       │
+│    c) Run unit tests (pytest)                                    │
+│    d) Package artifacts (ZIP Glue scripts, bundle CFN templates) │
+│  → Outputs: test results + packaged artifacts                    │
+│  → If ANY step fails → pipeline STOPS here                      │
+│                                                                  │
+│  3. DEPLOY STAGE (CloudFormation)                                │
+│  → CodePipeline invokes CloudFormation with template             │
+│  → CloudFormation creates CHANGESET (preview of changes)         │
+│  → For production: changeset requires manual approval            │
+│  → After approval: CloudFormation EXECUTES changeset             │
+│  → Resources created/updated/deleted as specified                │
+│                                                                  │
+│  4. HOW GLUE SCRIPT DEPLOYMENT WORKS:                            │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │                                                      │       │
+│  │  CodeBuild uploads scripts to S3:                    │       │
+│  │  s3://quickcart-artifacts-prod/                      │       │
+│  │    glue-scripts/                                     │       │
+│  │      {commit_sha}/                                   │       │
+│  │        transform_bronze_to_silver.py                 │       │
+│  │        transform_silver_to_gold.py                   │       │
+│  │        extract_mariadb_orders.py                     │       │
+│  │                                                      │       │
+│  │  CloudFormation updates Glue Job:                    │       │
+│  │    ScriptLocation: s3://bucket/scripts/{sha}/t.py    │       │
+│  │                                                      │       │
+│  │  ROLLBACK:                                           │       │
+│  │  → CloudFormation reverts ScriptLocation to prev SHA │       │
+│  │  → Glue job now points to previous script version    │       │
+│  │  → Previous scripts still exist in S3 (not deleted)  │       │
+│  │  → Instant rollback — no re-upload needed            │       │
+│  │                                                      │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                                                                  │
+│  5. HOW REDSHIFT MIGRATION WORKS:                                │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │                                                      │       │
+│  │  Migration files in Git:                             │       │
+│  │  redshift/migrations/                                │       │
+│  │    001_create_mart_sales.sql                         │       │
+│  │    002_create_materialized_views.sql                 │       │
+│  │    003_add_shipping_country_column.sql   ← NEW       │       │
+│  │                                                      │       │
+│  │  CodeBuild migration runner:                         │       │
+│  │  1. Connect to Redshift via Data API                 │       │
+│  │  2. Check: SELECT MAX(version) FROM _migrations      │       │
+│  │     → Returns: 2 (migrations 001, 002 already run)   │       │
+│  │  3. Find new migrations: 003 (version &gt; 2)           │       │
+│  │  4. Execute 003_add_shipping_country_column.sql       │       │
+│  │  5. INSERT INTO _migrations (3, '003_add...', NOW()) │       │
+│  │  6. If fails: ROLLBACK transaction, pipeline fails    │       │
+│  │                                                      │       │
+│  │  ROLLBACK:                                           │       │
+│  │  → Create 004_rollback_shipping_country.sql          │       │
+│  │  → Contains: ALTER TABLE DROP COLUMN                  │       │
+│  │  → Deploy through normal pipeline                     │       │
+│  │  → Migration system runs 004 automatically            │       │
+│  │                                                      │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: CloudFormation stack update fails mid-way
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ CFN creates new Glue job but fails on Step Functions update
+→ Stack in UPDATE_ROLLBACK_IN_PROGRESS state
+→ Rollback may also fail → UPDATE_ROLLBACK_FAILED (stuck)
+→ Fix: use CFN change sets with careful dependency ordering
+→ Fix: avoid replacing resources (update in-place when possible)
+
+PITFALL 2: Glue script deployed but references non-existent catalog table
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ New script references analytics_derived.new_table
+→ CloudFormation creates table AFTER script deploys
+→ Nightly run fails: "Table not found"
+→ Fix: deploy infrastructure BEFORE application code
+→ Fix: integration test catches this before production
+
+PITFALL 3: Redshift migration runs in wrong order
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Developer creates 003_add_column.sql
+→ Another developer creates 003_create_view.sql (same number!)
+→ Which runs first depends on filesystem sort order
+→ Fix: use timestamp-based naming: 20250115_143000_add_column.sql
+→ Fix: migration runner checks for gaps and duplicates
+
+PITFALL 4: Tests pass in dev but fail in staging
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Dev has different IAM permissions than staging
+→ Dev S3 bucket has different data than staging
+→ Fix: environments must be identical except data volume
+→ Fix: use same CloudFormation template with different parameters
+
+PITFALL 5: Pipeline takes 45 minutes — developers skip it
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ If pipeline is too slow, people find workarounds
+→ "I'll just upload to S3 directly this one time"
+→ Fix: unit tests &lt; 2 min, integration tests &lt; 10 min
+→ Fix: cache dependencies in CodeBuild
+→ Fix: parallel test execution
+
+PITFALL 6: Rollback leaves orphaned resources
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ CloudFormation rolls back Glue job definition
+→ But S3 data written by the failed job remains
+→ Stale/corrupt data in Bronze/Silver layer
+→ Fix: smoke test verifies data BEFORE marking deploy as success
+→ Fix: write to timestamped partition — old data unaffected</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(76)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Repository Structure</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>quickcart-data-platform/
+</span>├── README.md
+├── Makefile                              # Developer shortcuts
+├── buildspec.yml                         # CodeBuild instructions
+├── pipeline.yml                          # CodePipeline definition
+│
+├── infrastructure/                       # CloudFormation templates
+│   ├── glue-jobs.yaml                   # All Glue job definitions
+│   ├── step-functions.yaml              # State machine definitions
+│   ├── kinesis.yaml                     # Stream + Firehose
+│   ├── eventbridge.yaml                 # Rules and schedules
+│   ├── iam-roles.yaml                   # All IAM roles
+│   └── parameters/
+│       ├── dev.json                     # Dev environment params
+│       ├── staging.json                 # Staging params
+│       └── prod.json                    # Production params
+│
+├── glue_jobs/                           # Glue ETL scripts
+│   ├── extract_mariadb_orders.py
+│   ├── transform_bronze_to_silver.py
+│   ├── transform_silver_to_gold.py
+│   └── clickstream_microbatch_etl.py
+│
+├── redshift/                            # Redshift migrations
+│   └── migrations/
+│       ├── 001_create_schemas.sql
+│       ├── 002_create_mart_tables.sql
+│       ├── 003_create_materialized_views.sql
+│       └── 004_create_spectrum_schemas.sql
+│
+├── lambdas/                             # Lambda functions
+│   ├── dr_promote_mariadb/
+│   ├── dr_restore_catalog/
+│   └── smoke_test_runner/
+│
+├── tests/                               # All tests
+│   ├── unit/
+│   │   ├── test_schema_validation.py
+│   │   ├── test_transform_logic.py
+│   │   └── test_column_mappings.py
+│   ├── integration/
+│   │   ├── test_glue_job_output.py
+│   │   └── test_athena_queries.py
+│   └── smoke/
+│       ├── test_production_health.py
+│       └── test_data_freshness.py
+│
+└── scripts/                             # CI/CD helper scripts
+    ├── deploy_glue_scripts.py
+    ├── run_redshift_migrations.py
+    └── rollback.py</code></pre></div>
+<hr>
+<h3>Part 1: CodeBuild Build Specification</h3>
+
+<hr>
+<h3>Part 2: CloudFormation Template for Glue Jobs</h3>
+
+<hr>
+<h3>Part 3: Unit Tests (Schema Validation)</h3>
+
+<hr>
+<h3>Part 4: Redshift Migration Runner</h3>
+
+<hr>
+<h3>Part 5: Rollback Script</h3>
+
+<hr>
+<h3>Part 6: CodePipeline Definition</h3>
+
+<hr>
+<h3>Part 7: Makefile for Developer Experience</h3>
+
+<hr>
+<h3>Complete File Summary &amp; Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ONE-TIME SETUP</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create CI/CD pipeline infrastructure</span><span>
+</span>python scripts/create_pipeline.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Clone repo and push initial code</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> clone https://git-codecommit.us-east-2.amazonaws.com/v1/repos/quickcart-data-platform
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">cd</span><span> quickcart-data-platform
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Copy all files from this project into repo</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> </span><span class="token" style="color: rgb(57, 58, 52);">add</span><span> </span><span class="token builtin" style="color: rgb(43, 145, 175);">.</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> commit -m </span><span class="token" style="color: rgb(163, 21, 21);">"Initial data platform CI/CD setup"</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> push origin main
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Pipeline triggers automatically!</span><span>
+</span>
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY DEVELOPER WORKFLOW</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create feature branch</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> checkout -b feature/fix-order-total-column
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Make changes</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">vim</span><span> glue_jobs/transform_silver_to_gold.py
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Test locally</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">make</span><span> test-local
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Push and create PR</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">git</span><span> push origin feature/fix-order-total-column
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → CI pipeline runs: lint → unit tests → integration tests</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. PR reviewed and merged</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → CD pipeline runs: staging deploy → smoke test → approval → prod deploy</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. If production breaks:</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">make</span><span> rollback </span><span class="token assign-left" style="color: rgb(54, 172, 170);">ENVIRONMENT</span><span class="token" style="color: rgb(57, 58, 52);">=</span><span>prod</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED PIPELINE FLOW:
+</span>
+┌─────────────────────────────────────────────────────────────────────┐
+│ Push to main                                                        │
+│   ↓                                                                 │
+│ Stage 1: Source (CodeCommit) ─────────────── 10 seconds            │
+│   ↓                                                                 │
+│ Stage 2: Build &amp; Test (CodeBuild) ─────────── 3-5 minutes          │
+│   ├── py_compile (syntax check)                                     │
+│   ├── pylint (error detection)                                      │
+│   ├── cfn-lint (CloudFormation validation)                          │
+│   ├── bandit (security scan)                                        │
+│   ├── pytest unit tests (schema, logic, mappings)                  │
+│   └── package artifacts                                             │
+│   ↓                                                                 │
+│ Stage 3: Deploy Staging (CloudFormation) ──── 2-5 minutes          │
+│   ├── Upload Glue scripts to S3 (commit SHA versioned)             │
+│   ├── CloudFormation changeset → execute                            │
+│   └── Redshift migrations                                           │
+│   ↓                                                                 │
+│ Stage 4: Staging Smoke Test ──────────────── 1-2 minutes           │
+│   ├── Athena test query                                             │
+│   ├── Glue job dry run                                              │
+│   └── Redshift connectivity check                                   │
+│   ↓                                                                 │
+│ Stage 5: Manual Approval ─────────────────── (human review)        │
+│   └── SNS notification → team lead approves                        │
+│   ↓                                                                 │
+│ Stage 6: Deploy Production ───────────────── 2-5 minutes           │
+│   └── Same as staging but against prod                              │
+│   ↓                                                                 │
+│ Stage 7: Production Smoke Test ───────────── 1-2 minutes           │
+│   ├── Verify Glue jobs point to new SHA                            │
+│   ├── Verify Athena queries return data                            │
+│   └── If FAILS → trigger rollback script                           │
+│   ↓                                                                 │
+│ ✅ DEPLOYMENT COMPLETE (total: 15-25 minutes)                      │
+└─────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Every data platform change must go through version control
+→ Commit SHA as S3 path = instant rollback without re-upload
+→ CloudFormation makes deployments reproducible across environments
+→ Unit tests catch schema mismatches BEFORE deployment
+   (The incident would have been caught by test_daily_orders_column_names_exact)
+→ Numbered SQL migrations = safe, ordered, auditable Redshift changes
+→ Manual approval gate = human safety net before production
+→ Smoke tests post-deploy = automated verification
+→ Rollback script = 5-minute recovery from bad deployment
+→ Makefile = developer experience matters (make test-local is 1 command)
+→ EventBridge trigger &gt; polling (faster, cheaper, more reliable)
+
+HOW THIS BUILDS ON PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 25:  Glue ETL scripts (now version-controlled)
+→ Project 35:  Glue Workflows (now deployed via CloudFormation)
+→ Project 49:  Redshift stored procedures (now migration-managed)
+→ Project 55:  Step Functions (now defined in CloudFormation YAML)
+→ Project 66:  EventBridge (triggers pipeline, not just data events)
+→ Project 72:  Clickstream pipeline (deployed through CI/CD)
+→ Project 73:  Full platform (all components now IaC)
+→ Project 75:  DR (IaC templates replicated to DR region via S3 CRR)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 77: Data Lineage — Where Did This Column Come From 5 Hops Ago?
+   "Analyst asks: 'The revenue number on the dashboard — where did it
+    come from? Which table? Which Glue job? Which MariaDB column?
+    Can you trace it back 5 hops to the source?'"
+→ Introduces: Data lineage graph, Glue Catalog metadata,
+              Lake Formation tags, CloudTrail API logs,
+              lineage visualization</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Full platform with CI/CD (this project)
+→ Column-level security (Project 74)
+→ Multi-region DR (Project 75)
+→ Every change version-controlled and tested
+
+THEN: The CFO asks during a board meeting:
+"This dashboard shows $4.2M revenue for January.
+ I need to know EXACTLY where that number came from.
+ Which database? Which table? Which transformation?
+ If there's a bug, I need to trace it back to the source.
+ Our auditors require this for SOX compliance."
+
+Data team realizes:
+→ Revenue flows: MariaDB → Glue JDBC → Bronze → Silver → Gold → Redshift → Dashboard
+→ That's 6 hops — nobody can trace the full path
+→ If Gold table has wrong number, which Glue job caused it?
+→ If Silver has wrong data, was it the Bronze extraction or the Silver transform?
+
+→ Project 77: "Track Data Lineage: Where Did This Column Come From
+               5 Hops Ago?"</code></pre></div>
+<hr>
+</div>
+</div>
+
+
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-75.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 76 of 80</span>
+    <span class="nav-project-title">CI/CD FOR DATA PIPELINES — GIT PUSH → TEST → DEPLOY GLUE + REDSHIFT DDL</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-77.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-77.html") window.location = "project-77.html";
+  if (e.key === 'ArrowLeft' && "project-75.html") window.location = "project-75.html";
+});
+</script>
+</body>
+</html>

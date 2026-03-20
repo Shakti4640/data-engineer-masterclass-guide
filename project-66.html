@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 66: REPLACE CRON + GLUE WORKFLOW WITH EVENT-DRIVEN ARCHITECTURE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:82%"></div></div>
+<div id="progress-label">82%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 66 of 80</div>
+  <div class="project-title">REPLACE CRON + GLUE WORKFLOW WITH EVENT-DRIVEN ARCHITECTURE</div>
+  <div class="project-tags"><span class="project-tag">Glue</span><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multi-account data platform maturing
+</span>
+CURRENT STATE (Cron-Based Scheduling):
+→ 2:00 AM → Glue CDC job extracts from MariaDB (Project 65)
+→ 2:07 AM → MV refresh Lambda (Project 63)
+→ 3:00 AM → Sunday full reconciliation (Project 65)
+→ 4:00 AM → Sunday compaction job (Project 62)
+→ All triggered by Glue Triggers (cron schedules)
+
+ADDITIONAL DATA SOURCES ARRIVING:
+→ Partner feed: CSV dropped to S3 daily (arrival time: 1:30-3:00 AM, unpredictable)
+→ Payment processor: JSON webhook → SQS → S3 (arrives continuously)
+→ Marketing team: campaign export CSV uploaded manually (anytime during business hours)
+→ Third-party API: Glue job pulls hourly inventory data
+
+THE PROBLEMS:
+
+PROBLEM 1: Fixed schedule misses variable arrival times
+┌────────────────────────────────────────────────────────────────────┐
+│ Partner feed CSV arrives at 2:45 AM                                │
+│ Glue trigger fires at 2:00 AM → partner file doesn't exist yet   │
+│ Result: partner data NOT processed until next day (2:00 AM + 24h) │
+│ Business impact: 24-hour delay in partner revenue reporting       │
+└────────────────────────────────────────────────────────────────────┘
+
+PROBLEM 2: Early arrival wastes time waiting
+┌────────────────────────────────────────────────────────────────────┐
+│ MariaDB CDC delta ready at 1:50 AM                                 │
+│ Glue trigger fires at 2:00 AM → 10 minutes wasted waiting        │
+│ At scale: 10 min × 365 days = 60 hours/year of idle time          │
+└────────────────────────────────────────────────────────────────────┘
+
+PROBLEM 3: Cascading delays
+┌────────────────────────────────────────────────────────────────────┐
+│ CDC job runs at 2:00 AM → finishes at 2:06 AM                     │
+│ MV refresh scheduled at 2:07 AM → runs on schedule ✅              │
+│ But: if CDC runs long (2:15 AM) → MV refresh already ran          │
+│ MV refreshed with STALE data → dashboard shows yesterday's numbers│
+│ Must WAIT for CDC before refreshing — cron can't express this     │
+└────────────────────────────────────────────────────────────────────┘
+
+PROBLEM 4: No parallelism control
+┌────────────────────────────────────────────────────────────────────┐
+│ 5 independent data sources → all could process in PARALLEL         │
+│ But: Glue Workflow runs steps SEQUENTIALLY by default              │
+│ Sequential: 6 + 4 + 8 + 3 + 5 = 26 minutes                       │
+│ Parallel: max(6, 4, 8, 3, 5) = 8 minutes                          │
+│ Wasted: 18 minutes of sequential overhead                          │
+└────────────────────────────────────────────────────────────────────┘
+
+PROBLEM 5: No dynamic routing
+┌────────────────────────────────────────────────────────────────────┐
+│ Marketing uploads campaign file at 11:30 AM                        │
+│ Next scheduled run: 2:00 AM tomorrow                               │
+│ Marketing VP: "Why can't I see my data for 14 hours?"              │
+│ Need: process IMMEDIATELY when file lands, regardless of schedule  │
+└────────────────────────────────────────────────────────────────────┘
+
+CTO: "Our pipeline is clock-driven. I want it EVENT-driven.
+      When data arrives → process it. When processing completes → trigger next step.
+      Independent sources process in parallel. Dependencies respected.
+      No cron. No waiting. No missed files."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand EVENT-DRIVEN vs SCHEDULE-DRIVEN
+</span>
+  SCHEDULE-DRIVEN (current):
+  ┌────────────────────────────────────────────────────────────┐
+  │ TIME → triggers action                                     │
+  │ "At 2:00 AM, run CDC job"                                  │
+  │ "At 2:07 AM, refresh MVs"                                  │
+  │ Problem: time doesn't know if data is ready                │
+  │ Problem: data doesn't know when next schedule fires        │
+  └────────────────────────────────────────────────────────────┘
+
+  EVENT-DRIVEN (target):
+  ┌────────────────────────────────────────────────────────────┐
+  │ EVENT → triggers action                                    │
+  │ "When file lands in S3 → process it"                       │
+  │ "When CDC job completes → refresh MVs"                     │
+  │ "When all sources processed → build gold layer"            │
+  │ Advantage: zero wait, zero miss, zero waste                │
+  └────────────────────────────────────────────────────────────┘
+
+Step 2: Map events to actions
+
+  ┌──────────────────────────────────┬──────────────────────────────────────┐
+  │ EVENT                            │ ACTION                               │
+  ├──────────────────────────────────┼──────────────────────────────────────┤
+  │ Partner CSV lands in S3          │ Start partner ETL Glue job           │
+  │ Payment JSON lands in S3         │ Start payment ETL Glue job           │
+  │ Marketing CSV lands in S3        │ Start marketing ETL Glue job         │
+  │ Scheduled time (hourly)          │ Start inventory API pull Glue job    │
+  │ CDC window opens (2 AM)          │ Start MariaDB CDC Glue job           │
+  │ ANY ETL job completes            │ Evaluate: are all sources ready?     │
+  │ ALL sources ready                │ Build gold aggregations              │
+  │ Gold layer built                 │ Refresh Redshift MVs                 │
+  │ MVs refreshed                    │ Send success notification            │
+  │ ANY step fails                   │ Send failure alert + retry logic     │
+  └──────────────────────────────────┴──────────────────────────────────────┘
+
+Step 3: Choose orchestration technology
+
+  ┌──────────────────────────────┬──────────┬───────────────────────────────────┐
+  │ Option                       │ Fit      │ Why                               │
+  ├──────────────────────────────┼──────────┼───────────────────────────────────┤
+  │ S3 Events → Lambda           │ ⚠️ Basic  │ No orchestration, no parallelism  │
+  │ S3 Events → SQS → Lambda     │ ⚠️ Basic  │ Buffered but still no workflow    │
+  │ Glue Workflows               │ ⚠️ Limited│ No S3 event trigger, rigid graph  │
+  │ EventBridge → Step Functions  │ ✅ Best   │ Event routing + state machine     │
+  │ EventBridge → Lambda → Glue   │ ⚠️ Medium │ Works but manual state tracking   │
+  │ Apache Airflow (MWAA)         │ ✅ Good   │ Powerful but heavy infrastructure │
+  └──────────────────────────────┴──────────┴───────────────────────────────────┘
+
+  DECISION: EventBridge + Step Functions
+  → EventBridge: universal event bus — routes events to targets
+  → Step Functions: stateful workflow — manages dependencies, parallelism, retries
+  → Together: events trigger workflows, workflows manage complex logic</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  EVENT SOURCES                    EVENTBRIDGE              STEP FUNCTIONS   │
+│  ──────────────                   ───────────              ──────────────   │
+│                                                                             │
+│  S3: partner CSV ──────┐                                                    │
+│                        │         ┌──────────────┐    ┌──────────────────┐  │
+│  S3: payment JSON ─────┼────────►│ EventBridge  │───►│ Main Pipeline    │  │
+│                        │         │ Event Bus    │    │ State Machine    │  │
+│  S3: marketing CSV ────┘         │              │    │                  │  │
+│                                  │ RULES:       │    │ ┌──────────────┐│  │
+│  CloudWatch: hourly ────────────►│ 1. S3 Put →  │    │ │Classify Event││  │
+│  schedule                        │    Pipeline  │    │ └──────┬───────┘│  │
+│                                  │ 2. Glue Done │    │        │        │  │
+│  Glue: job completed ──────────►│    → Pipeline │    │        ▼        │  │
+│                                  │ 3. Schedule  │    │ ┌──────────────┐│  │
+│  CDC: timer (2 AM) ────────────►│    → Pipeline │    │ │Route to      ││  │
+│                                  └──────────────┘    │ │correct ETL   ││  │
+│                                                      │ └──────┬───────┘│  │
+│                                                      │        │        │  │
+│                                                      │   ┌────┴────┐   │  │
+│                                                      │   ▼    ▼    ▼   │  │
+│                                                      │ ┌──┐ ┌──┐ ┌──┐ │  │
+│                                                      │ │P │ │M │ │C │ │  │
+│                                                      │ │a │ │a │ │D │ │  │
+│                                                      │ │r │ │r │ │C │ │  │
+│                                                      │ │t │ │k │ │  │ │  │
+│                                                      │ │n │ │e │ │  │ │  │
+│                                                      │ │e │ │t │ │  │ │  │
+│                                                      │ │r │ │i │ │  │ │  │
+│                                                      │ └─┬┘ └─┬┘ └─┬┘ │  │
+│                                                      │   └────┬────┘   │  │
+│                                                      │        ▼        │  │
+│                                                      │ ┌──────────────┐│  │
+│                                                      │ │Check: all    ││  │
+│                                                      │ │sources done? ││  │
+│                                                      │ └──────┬───────┘│  │
+│                                                      │        ▼        │  │
+│                                                      │ ┌──────────────┐│  │
+│                                                      │ │Build Gold    ││  │
+│                                                      │ │+ Refresh MVs ││  │
+│                                                      │ │+ Notify      ││  │
+│                                                      │ └──────────────┘│  │
+│                                                      └──────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Monolithic Step Function — one giant state machine ⚠️
+</span>→ Single state machine handles ALL events and ALL logic
+→ Simple to deploy but: massive JSON, hard to debug, tight coupling
+→ Change to one source impacts entire workflow
+
+Option B: Micro-orchestration — one Step Function per source + coordinator ✅ (CHOSEN)
+→ Per-source Step Function: handles ETL for that source
+→ Coordinator Step Function: waits for all sources, builds gold layer
+→ EventBridge: routes events to correct per-source Step Function
+→ Loose coupling: change one source without affecting others
+→ Parallel by design: each source runs independently
+
+Option C: EventBridge → Lambda → Glue (no Step Functions)
+→ Lambda acts as "glue" (pun intended) between events and Glue jobs
+→ Works for simple pipelines
+→ BUT: no built-in state tracking, retry logic, parallelism
+→ Must build orchestration logic in Lambda code → reinventing Step Functions
+
+Option D: Apache Airflow (MWAA)
+→ Full-featured DAG orchestration
+→ Sensor operators can wait for S3 files
+→ BUT: $0.49/hr minimum ($353/month) for MWAA environment
+→ Overkill for 5 data sources
+→ Better when: 50+ DAGs, complex dependency graphs, team familiarity
+
+DECISION: Option B — micro-orchestration
+→ Each data source: independent Step Function
+→ Coordinator: waits for all, triggers downstream
+→ EventBridge: event routing layer
+→ Clean separation of concerns</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. USE EventBridge for ALL event routing
+</span>   → S3 events → EventBridge (not S3 notifications directly)
+   → Glue job state changes → EventBridge (native integration)
+   → Scheduled events → EventBridge rules
+   → Single event bus → centralized routing, filtering, monitoring
+
+2. ENABLE S3 EventBridge notifications on source buckets
+   → Default: S3 events go to SNS/SQS/Lambda only
+   → Must EXPLICITLY enable EventBridge delivery per bucket
+   → s3.put_bucket_notification_configuration with EventBridge enabled
+
+3. USE Step Functions for workflow logic
+   → Parallel branches: process independent sources simultaneously
+   → Choice states: route based on event type or source
+   → Wait states: pause until external condition met
+   → Error handling: Retry + Catch at every step
+   → Map state: dynamic parallelism (iterate over list of sources)
+
+4. DESIGN idempotent ETL jobs
+   → Event-driven = same event might fire twice (at-least-once delivery)
+   → Glue job must handle re-processing gracefully
+   → CDC MERGE pattern (Project 65) is naturally idempotent ✅
+   → Full load with TRUNCATE+INSERT is idempotent ✅
+   → Append-only: must deduplicate (check if file already processed)
+
+5. TRACK pipeline state in DynamoDB
+   → Which sources completed for today's batch?
+   → DynamoDB table: pipeline_state (batch_date, source_name, status, timestamp)
+   → Coordinator queries: "have ALL sources completed for 2025-01-15?"
+   → If yes → trigger gold layer build
+
+6. USE EventBridge event patterns for precise filtering
+   → Filter by: S3 bucket, key prefix, key suffix
+   → Example: only trigger on s3://bucket/partner_feed/*.csv
+   → Prevents: triggering on _SUCCESS files, temp files, wrong prefixes
+
+7. SET Step Function execution name to include batch identifier
+   → Name: "partner-etl-2025-01-15-abc123"
+   → Prevents duplicate executions for same event
+   → Enables: easy debugging in console, searchable history
+
+8. IMPLEMENT dead letter queue for failed events
+   → EventBridge → Step Function invocation can fail
+   → DLQ captures failed invocations
+   → Alert + manual retry from DLQ</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use S3 event notifications directly (bypass EventBridge)
+</span>   → S3 notifications: limited filtering, no replay, no archive
+   → EventBridge: rich filtering, archive, replay, schema registry
+   → S3 → EventBridge → Step Functions (correct)
+   → S3 → Lambda → Glue (fragile, no state management)
+
+2. DO NOT create one Step Function per file
+   → "Every file gets its own execution"
+   → 1000 files/day = 1000 executions = expensive + hard to monitor
+   → Instead: batch files by source, one execution per batch
+
+3. DO NOT ignore duplicate events
+   → S3 EventBridge: may deliver same event 2-3 times
+   → Step Function execution: use idempotency key in execution name
+   → ETL job: must handle re-processing (CDC MERGE does this naturally)
+
+4. DO NOT hardcode file paths in Step Function definition
+   → Step Function receives event payload dynamically
+   → Extract bucket/key from event → pass to Glue job as argument
+   → Reusable state machine for any file in same pattern
+
+5. DO NOT skip error handling in Step Functions
+   → "It's just 5 steps, what could go wrong?"
+   → Glue job fails → Step Function stuck in RUNNING state forever
+   → ALWAYS: Retry (with backoff) + Catch (with error notification)
+   → TimeoutSeconds on every Task state
+
+6. DO NOT trigger gold layer build after EACH source
+   → Source A completes → build gold → Source B completes → rebuild gold
+   → Wasteful: gold rebuilt 5 times instead of once
+   → Instead: coordinator waits for ALL sources → build gold ONCE
+
+7. DO NOT mix EventBridge rules with Glue Triggers
+   → "Some jobs triggered by EventBridge, some by Glue cron"
+   → Two orchestration systems = confusion, gaps, duplicates
+   → Migrate ALL to EventBridge + Step Functions
+   → Disable ALL Glue Triggers (cron-based)
+
+8. DO NOT forget to handle the "source never arrives" case
+   → Partner feed usually arrives by 3 AM
+   → What if it doesn't arrive by 5 AM?
+   → Timeout: EventBridge scheduled rule at 5 AM checks state
+   → If source missing: alert + proceed without it (or wait with SLA)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬────────────────────────┬───────────────────────────────────┐
+</span>│ Scenario                             │ Use                    │ Why                               │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ File lands in S3 → trigger ETL       │ EventBridge + S3 Event │ Native integration, rich filtering│
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Glue job completes → trigger next    │ EventBridge +          │ Glue emits state change events    │
+│ step                                 │ Glue State Change      │ natively to EventBridge           │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Run job at fixed time (hourly/daily) │ EventBridge Scheduled  │ Cron expression, no EC2 needed    │
+│                                      │ Rule                   │                                   │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Complex workflow with dependencies   │ Step Functions          │ State machine, parallel, retry    │
+│ parallelism, retries                 │                        │                                   │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Simple trigger (no workflow)         │ EventBridge → Lambda   │ Lightweight, no state machine     │
+│ e.g., send SNS on file arrival       │                        │ overhead                          │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ 50+ DAGs, team knows Airflow         │ MWAA (Airflow)         │ Full-featured, Python DAGs,       │
+│                                      │                        │ sensors, XComs                    │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Buffer events before processing      │ EventBridge → SQS →   │ SQS provides buffering + retry    │
+│                                      │ Lambda/Step Functions  │ for bursty event sources          │
+├──────────────────────────────────────┼────────────────────────┼───────────────────────────────────┤
+│ Cross-account event routing          │ EventBridge Cross-Acct │ Account A event → Account B bus   │
+│                                      │ Rules                  │ No polling needed                 │
+└──────────────────────────────────────┴────────────────────────┴───────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE EVENT-DRIVEN</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When pipeline has strict ordering that can't be parallelized
+</span>   → "Step A must finish before Step B which must finish before Step C"
+   → Sequential-only pipeline: cron + Glue Workflow is simpler
+   → Event-driven adds complexity without parallelism benefit
+
+2. When source has no event emission capability
+   → On-prem FTP server drops file — no S3 event
+   → Must POLL for new files → scheduled check (cron pattern)
+   → Hybrid: cron polls → puts to S3 → S3 event → event-driven
+
+3. When debugging requires linear execution trace
+   → Event-driven: execution scattered across multiple services
+   → Debugging: follow event through EventBridge → Step Function → Glue → Lambda
+   → New team members may struggle with distributed tracing
+   → Invest in: CloudWatch dashboards, X-Ray tracing
+
+4. When cost of Step Functions exceeds benefit
+   → Step Functions pricing: $0.025 per 1000 state transitions
+   → Simple pipeline with 5 states × 1 run/day = $0.004/month (negligible)
+   → Complex pipeline with 100 states × 100 runs/day = $7.50/month (still cheap)
+   → BUT: 10,000 runs/day with 50 states = $375/month → evaluate alternatives
+
+5. When exactly-once processing is critical and hard to achieve
+   → Event-driven = at-least-once delivery
+   → Must design idempotent consumers
+   → If idempotency is impossible: use database transactions + dedup table</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│            EVENTBRIDGE + STEP FUNCTIONS — INTERNAL MECHANICS                  │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  EVENTBRIDGE INTERNALS:                                                       │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ EVENT BUS                                                    │              │
+│  │ (default bus — receives events from all AWS services)        │              │
+│  │                                                               │              │
+│  │ Event arrives:                                                │              │
+│  │ {                                                             │              │
+│  │   "source": "aws.s3",                                        │              │
+│  │   "detail-type": "Object Created",                           │              │
+│  │   "detail": {                                                 │              │
+│  │     "bucket": {"name": "quickcart-partner-feeds"},            │              │
+│  │     "object": {"key": "daily/partner_2025-01-15.csv"}         │              │
+│  │   }                                                           │              │
+│  │ }                                                             │              │
+│  │                                                               │              │
+│  │ RULE EVALUATION (all rules evaluated in parallel):            │              │
+│  │                                                               │              │
+│  │ Rule 1: "partner-file-arrival"                                │              │
+│  │   Pattern: source=aws.s3 AND bucket=quickcart-partner-feeds  │              │
+│  │            AND key ENDS WITH .csv                             │              │
+│  │   Match? ✅ YES                                               │              │
+│  │   Target: Step Function "partner-etl-pipeline"                │              │
+│  │   → Invoke with event payload                                 │              │
+│  │                                                               │              │
+│  │ Rule 2: "payment-file-arrival"                                │              │
+│  │   Pattern: source=aws.s3 AND bucket=quickcart-payments        │              │
+│  │   Match? ❌ NO (wrong bucket)                                 │              │
+│  │   → Skip                                                      │              │
+│  │                                                               │              │
+│  │ Rule 3: "any-etl-completion"                                  │              │
+│  │   Pattern: source=aws.glue AND detail-type=Glue Job State    │              │
+│  │            AND detail.state=SUCCEEDED                         │              │
+│  │   Match? ❌ NO (this event is S3, not Glue)                   │              │
+│  │   → Skip                                                      │              │
+│  │                                                               │              │
+│  │ RULE EVALUATION TIME: &lt; 50ms for all rules                   │              │
+│  │ THROUGHPUT: millions of events per second                     │              │
+│  │ DELIVERY: at-least-once (may deliver 2-3 times rarely)        │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  S3 → EVENTBRIDGE FLOW:                                                       │
+│                                                                               │
+│  1. S3 PutObject completes                                                    │
+│  2. S3 publishes event to EventBridge (if enabled on bucket)                  │
+│  3. EventBridge receives event in &lt; 1 second                                  │
+│  4. Rules evaluated → matching rule fires                                     │
+│  5. Target invoked (Step Function StartExecution)                             │
+│  6. Step Function execution begins                                            │
+│                                                                               │
+│  TOTAL LATENCY: S3 upload → Step Function start: 1-5 seconds                 │
+│  vs CRON: up to 24 hours wait for next schedule                               │
+│                                                                               │
+│  STEP FUNCTIONS INTERNALS:                                                    │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ STATE MACHINE EXECUTION                                      │              │
+│  │                                                               │              │
+│  │ Execution = one run of the state machine                     │              │
+│  │ Each execution has:                                           │              │
+│  │ → Unique execution ARN                                        │              │
+│  │ → Input (event payload)                                       │              │
+│  │ → State history (every state transition logged)               │              │
+│  │ → Output (final result)                                       │              │
+│  │                                                               │              │
+│  │ STATE TYPES:                                                  │              │
+│  │                                                               │              │
+│  │ Task: invoke external service (Glue, Lambda, etc.)            │              │
+│  │  → .sync: wait for completion (Glue job finish)               │              │
+│  │  → .waitForTaskToken: pause until external callback           │              │
+│  │                                                               │              │
+│  │ Parallel: execute multiple branches simultaneously            │              │
+│  │  → All branches start at same time                            │              │
+│  │  → Parallel state completes when ALL branches complete        │              │
+│  │  → If any branch fails: entire Parallel fails (configurable)  │              │
+│  │                                                               │              │
+│  │ Map: iterate over array, execute sub-workflow per item        │              │
+│  │  → Dynamic parallelism: array length determines branches      │              │
+│  │  → MaxConcurrency: limit parallel executions                  │              │
+│  │  → Perfect for: "process each source in parallel"             │              │
+│  │                                                               │              │
+│  │ Choice: conditional branching (if/else)                       │              │
+│  │  → Evaluate variable → route to different states              │              │
+│  │  → "If source=partner → partner ETL"                          │              │
+│  │  → "If source=payment → payment ETL"                          │              │
+│  │                                                               │              │
+│  │ Wait: pause for time or until timestamp                       │              │
+│  │  → "Wait 30 seconds for data settlement"                     │              │
+│  │  → "Wait until 2025-01-15T06:00:00Z"                         │              │
+│  │                                                               │              │
+│  │ GLUE INTEGRATION (.sync):                                     │              │
+│  │                                                               │              │
+│  │ Task: arn:aws:states:::glue:startJobRun.sync                  │              │
+│  │  1. Step Functions calls Glue StartJobRun API                 │              │
+│  │  2. Step Functions polls Glue GetJobRun every ~10 seconds     │              │
+│  │  3. When Glue job reaches terminal state:                     │              │
+│  │     → SUCCEEDED: Step Functions proceeds to next state        │              │
+│  │     → FAILED: Step Functions enters Catch/error handler       │              │
+│  │  4. Glue job result passed as output to next state            │              │
+│  │                                                               │              │
+│  │ RETRY MECHANICS:                                              │              │
+│  │                                                               │              │
+│  │ Retry: [                                                      │              │
+│  │   {                                                           │              │
+│  │     "ErrorEquals": ["Glue.AWSGlueException"],                 │              │
+│  │     "IntervalSeconds": 60,      ← wait 60s before retry      │              │
+│  │     "MaxAttempts": 3,           ← try up to 3 times          │              │
+│  │     "BackoffRate": 2.0          ← double wait each retry     │              │
+│  │   }                              60s → 120s → 240s            │              │
+│  │ ]                                                             │              │
+│  │                                                               │              │
+│  │ CATCH MECHANICS:                                              │              │
+│  │                                                               │              │
+│  │ Catch: [                                                      │              │
+│  │   {                                                           │              │
+│  │     "ErrorEquals": ["States.ALL"],  ← catch any error         │              │
+│  │     "Next": "NotifyFailure",        ← go to error handler    │              │
+│  │     "ResultPath": "$.error"         ← preserve error details  │              │
+│  │   }                                                           │              │
+│  │ ]                                                             │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  DYNAMIC PARALLELISM WITH MAP STATE:                                          │
+│                                                                               │
+│  Input: {                                                                     │
+│    "sources": [                                                               │
+│      {"name": "partner", "bucket": "feeds", "key": "partner.csv"},           │
+│      {"name": "payment", "bucket": "payments", "key": "pay.json"},           │
+│      {"name": "marketing", "bucket": "marketing", "key": "camp.csv"}         │
+│    ]                                                                          │
+│  }                                                                            │
+│                                                                               │
+│  Map state iterates over $.sources array:                                     │
+│  → Iteration 0: process partner (parallel)                                    │
+│  → Iteration 1: process payment (parallel)                                    │
+│  → Iteration 2: process marketing (parallel)                                  │
+│  → All 3 run simultaneously                                                   │
+│  → Map completes when ALL 3 finish                                            │
+│  → If any fails: configurable (fail all or tolerate)                          │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "S3 event never reaches EventBridge"
+</span>→ Cause: EventBridge notifications NOT enabled on S3 bucket
+→ Default: S3 does NOT send to EventBridge — must opt-in
+→ Fix: aws s3api put-bucket-notification-configuration with EventBridgeConfiguration
+→ This is the #1 missed step in event-driven S3 pipelines
+
+PITFALL 2: "Step Function triggered twice for same file"
+→ Cause: S3 EventBridge delivers at-least-once
+→ Same PutObject event delivered twice → two executions start
+→ Fix: use file path as execution name (idempotency)
+→ Step Functions rejects duplicate execution names → second invocation fails harmlessly
+
+PITFALL 3: "EventBridge rule matches too many events"
+→ Cause: rule pattern too broad
+→ Pattern: source=aws.s3 → matches ALL S3 events in account
+→ Every file upload triggers pipeline → chaos
+→ Fix: filter by bucket AND prefix AND suffix
+→ Pattern: bucket=quickcart-partner-feeds AND key PREFIX "daily/" AND key SUFFIX ".csv"
+
+PITFALL 4: "Step Function execution times out after 1 year"
+→ Cause: .sync task waiting for Glue job that's stuck
+→ Standard Step Functions: max 1 year execution
+→ But: Glue job stuck in RUNNING → Step Function waits forever
+→ Fix: TimeoutSeconds on every Task state (e.g., 3600 = 1 hour)
+→ Timeout triggers Catch → error handler → alert
+
+PITFALL 5: "Parallel branches: one slow source blocks everything"
+→ Cause: Parallel state waits for ALL branches
+→ Partner ETL: 3 min, Payment ETL: 5 min, CDC: 6 min, Marketing: 45 min (huge file)
+→ Gold layer build waits 45 minutes for marketing
+→ Fix: set per-branch timeout, or decouple gold build from slow sources
+→ Or: tolerate failures (ToleratedFailurePercentage in Map state)
+
+PITFALL 6: "EventBridge rule exists but target invocation fails"
+→ Cause: EventBridge role lacks permission to start Step Function
+→ Rule matches → tries to invoke target → AccessDenied → silent failure
+→ Fix: EventBridge rule needs IAM role with states:StartExecution permission
+→ Debug: EventBridge → Rules → Monitoring tab shows FailedInvocations metric
+
+PITFALL 7: "File processed by event AND by leftover cron schedule"
+→ Cause: old Glue Trigger (cron) still active alongside new EventBridge
+→ Same file processed twice: once by event, once by cron
+→ Fix: DISABLE all Glue Triggers after migrating to EventBridge
+→ Verify: Glue console → Triggers → all should be DEACTIVATED
+
+PITFALL 8: "Step Function Map state: 40 items but only 10 process"
+→ Cause: MaxConcurrency = 10 on Map state
+→ Only 10 iterations run simultaneously, rest queued
+→ If each takes 5 min: 40 items × 5 min / 10 concurrent = 20 min
+→ Fix: increase MaxConcurrency (max 40 for inline, unlimited for distributed)
+→ Or: use DISTRIBUTED Map mode for &gt; 40 items
+
+PITFALL 9: "Can't pass S3 key with special characters to Glue"
+→ Cause: S3 key "daily/partner feed (2025-01-15).csv" has spaces and parens
+→ EventBridge passes raw key → Step Function passes to Glue → URL encoding issues
+→ Fix: use intrinsic functions States.StringToJson, States.Format
+→ Or: URL-encode in Lambda preprocessor
+
+PITFALL 10: "Event storm: 1000 files land simultaneously"
+→ Cause: bulk upload to S3 → 1000 S3 events → 1000 Step Function executions
+→ Glue concurrent job limit: 200 by default
+→ Step Functions all try to start Glue → throttling → failures
+→ Fix: SQS between EventBridge and Step Function (buffer)
+→ Or: batch files into single execution (Lambda preprocessor)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVENT VOLUME SCALING:
+</span>→ 5 events/day (current): trivial
+→ 100 events/day: easily handled
+→ 10,000 events/day: need SQS buffering before Step Functions
+→ 1M events/day: need EventBridge → SQS → Lambda batch → Step Function
+
+STEP FUNCTION SCALING:
+→ Standard: 25,000 state transitions/second (per account)
+→ Express: 100,000 state transitions/second (for high-volume)
+→ 5 pipelines × 10 states each = 50 transitions/day → negligible
+→ Express workflow: for sub-second file processing (not our case)
+
+GLUE JOB CONCURRENCY:
+→ Default: 200 concurrent job runs per account
+→ 5 parallel sources × 1 job each = 5 concurrent → fine
+→ If 50 sources: may hit limit → request increase or batch
+
+COST SCALING:
+┌───────────────────────────┬───────────────┬─────────────────────────┐
+│ Component                 │ Current (5/d) │ Scaled (100/d)          │
+├───────────────────────────┼───────────────┼─────────────────────────┤
+│ EventBridge               │ Free (&lt; 14M)  │ Free (&lt; 14M events/mo) │
+│ Step Functions (Standard) │ $0.001/month  │ $0.075/month            │
+│ Glue jobs (same as before)│ unchanged     │ unchanged               │
+│ Lambda (preprocessor)     │ $0.001/month  │ $0.02/month             │
+│ DynamoDB (state tracking) │ $0.25/month   │ $0.25/month             │
+├───────────────────────────┼───────────────┼─────────────────────────┤
+│ TOTAL ORCHESTRATION COST  │ ~$0.25/month  │ ~$0.60/month            │
+└───────────────────────────┴───────────────┴─────────────────────────┘
+
+→ EventBridge: free for first 14M custom events/month
+→ Step Functions Standard: $0.025 per 1000 state transitions
+→ Orchestration cost is NEGLIGIBLE compared to Glue compute costs</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(66)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: Enable S3 EventBridge Notifications</h3>
+
+<h3>PART 2: Pipeline State Tracker (DynamoDB)</h3>
+
+<h3>PART 3: Event Router Lambda</h3>
+
+<h3>PART 4: Main Pipeline Step Function</h3>
+
+<hr>
+<h3>PART 5: EventBridge Rules</h3>
+
+<hr>
+<h3>PART 6: Watchdog Lambda (Missing Source Alert)</h3>
+
+<hr>
+<h3>PART 7: Pipeline Dashboard and Monitoring</h3>
+
+<hr>
+<h3>PART 8: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ONE-TIME SETUP ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Enable S3 EventBridge on all source buckets</span><span>
+</span>python 66_01_enable_s3_eventbridge.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create DynamoDB state tracking table</span><span>
+</span>python 66_02_create_state_tracker.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Deploy event router Lambda</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    (package 66_03_event_router_lambda.py → Lambda)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Deploy watchdog Lambda</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    (package 66_06_watchdog_lambda.py → Lambda)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Create Step Function state machine</span><span>
+</span>python 66_04_create_step_function.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Create EventBridge rules</span><span>
+</span>python 66_05_create_eventbridge_rules.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Create monitoring dashboard + alarms</span><span>
+</span>python 66_07_pipeline_monitoring.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- OLD INFRASTRUCTURE CLEANUP ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># All old Glue Triggers disabled by step 6</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Verify: Glue console → Triggers → all DEACTIVATED</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EVENT-DRIVEN FLOW VISUALIZATION:
+</span>
+TIME    EVENT                           ACTION
+─────── ─────────────────────────────── ──────────────────────────────────────
+1:47 AM Partner CSV lands in S3         → EventBridge detects
+1:47 AM EventBridge matches rule        → Step Function starts
+1:47 AM ClassifyEvent Lambda            → source=partner_feed
+1:47 AM RunSourceETL                    → Glue etl-partner-feed starts
+1:51 AM Partner ETL completes           → MarkSourceComplete → DynamoDB updated
+1:51 AM CheckAllSources                 → 1/4 required complete → Wait
+                                         
+2:00 AM CDC schedule fires             → EventBridge scheduled rule
+2:00 AM Step Function starts            → source=cdc_mariadb  
+2:00 AM RunSourceETL                    → Glue cdc-mariadb-to-redshift starts
+2:06 AM CDC completes                   → MarkSourceComplete → DynamoDB updated
+2:06 AM CheckAllSources                 → 2/4 required complete → Wait
+
+2:00 AM Inventory schedule fires       → EventBridge hourly rule
+2:00 AM Step Function starts            → source=inventory_api
+2:00 AM RunSourceETL                    → Glue etl-inventory-api starts
+2:03 AM Inventory completes             → MarkSourceComplete → 3/4 → Wait
+
+2:15 AM Payment JSON lands in S3       → EventBridge detects
+2:15 AM Step Function starts            → source=payment_data
+2:15 AM RunSourceETL                    → Glue etl-payment-data starts
+2:20 AM Payment ETL completes           → MarkSourceComplete → 4/4 → ALL DONE!
+2:20 AM BuildGoldLayer                  → Glue build-gold-aggregations starts
+2:25 AM Gold layer built                → RefreshMaterializedViews
+2:26 AM MVs refreshed                   → NotifySuccess → SNS
+2:26 AM ✅ PIPELINE COMPLETE             
+
+TOTAL: 39 minutes (partner arrived at 1:47 → done at 2:26)
+vs CRON: would have waited until 2:00 AM even though partner arrived at 1:47
+vs SEQUENTIAL: 6+4+3+5+5+1 = 24 min compute, but 39 min wall clock (parallel!)
+
+BEFORE vs AFTER:
+┌─────────────────────────────────────────────────────────────────┐
+│ CRON-BASED (before)                                             │
+│ → Fixed 2:00 AM start regardless of data availability          │
+│ → Sequential processing: 26 minutes                            │
+│ → Missed files: partner arrives at 2:45 AM → 24h delay         │
+│ → No parallelism: each source waits for previous               │
+│ → No dynamic routing: same flow regardless of what arrived     │
+│ → No state tracking: "did partner feed arrive today?"          │
+│                                                                 │
+│ EVENT-DRIVEN (after)                                            │
+│ → Process IMMEDIATELY when data arrives                         │
+│ → Parallel processing: 8 min (longest source)                  │
+│ → Zero missed files: event fires on every S3 PutObject         │
+│ → Full parallelism: all sources process simultaneously         │
+│ → Dynamic routing: each event → correct ETL job                │
+│ → State tracking: DynamoDB shows exactly what completed        │
+│ → Watchdog: 5 AM alert if any source missing                   │
+│ → Audit: every event logged in EventBridge + Step Functions    │
+└─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ EventBridge is the universal event router — connects ANY event to ANY target
+→ S3 → EventBridge requires EXPLICIT opt-in (put_bucket_notification_configuration)
+→ Glue emits state change events to EventBridge AUTOMATICALLY (no config needed)
+→ Step Functions provides stateful orchestration: parallel, choice, retry, catch
+→ .sync integration: Step Functions waits for Glue job to complete natively
+→ DynamoDB state table: tracks which sources completed per batch
+→ Coordinator pattern: each source completes independently → check if ALL done → proceed
+→ Watchdog pattern: scheduled check catches "source never arrives" scenarios
+→ Idempotency: events may deliver 2-3x → ETL jobs must handle gracefully
+→ EventBridge rule patterns: filter by bucket, prefix, suffix → surgical event matching
+→ Event-driven = zero wait, zero miss, maximum parallelism
+→ Orchestration cost (EventBridge + Step Functions): &lt; $1/month for typical pipeline
+→ DISABLE old Glue Triggers after migrating — prevent duplicate processing
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 17: S3 → SNS events — primitive version of S3 event routing
+  → Project 28: S3 → SNS → SQS → EC2 — manual event pipeline, now replaced
+  → Project 35: Glue Workflows — rigid sequential, now replaced by Step Functions
+  → Project 41: EventBridge basics — now fully productionized
+  → Project 55: Step Functions — expanded from simple chain to event-driven coordinator
+  → Project 62: Compaction — can be triggered by event (large file count detected)
+  → Project 63: MV refresh — now triggered by Step Function after gold layer built
+  → Project 65: CDC — now triggered by EventBridge schedule, not Glue Trigger
+
+→ FORWARD:
+  → Project 67: Redshift Serverless — event-driven pipeline works same way
+  → Project 68: Data quality — add quality gate between ETL and gold layer
+  → Project 72: Streaming — EventBridge + Kinesis for real-time events
+  → Project 76: CI/CD — EventBridge triggers pipeline redeployment on code push
+  → Project 78: SLA pipeline — Step Function retry/catch ensures 99.9% uptime</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Event-driven pipeline is running beautifully.
+</span>Files arrive → process immediately → gold layer built → MVs refreshed.
+
+THEN: Finance team runs the monthly cost review:
+
+→ Redshift provisioned cluster: $180/month (2× dc2.large, running 24/7)
+→ Actual usage: 2 hours/day for ETL + 8 hours/day for analyst queries
+→ 14 hours/day: cluster is IDLE but still billing
+→ Idle cost: $180 × (14/24) = $105/month WASTED
+
+→ Peak hour: 15 analysts running complex queries simultaneously
+→ Off-peak: 0 queries from 10 PM to 8 AM
+
+CFO: "We're paying $180/month for a cluster that's idle 58% of the time.
+      Isn't there a pay-per-use option? I heard about 'Serverless' —
+      can we just pay for what we actually use?"
+
+→ Project 67: "Migrate from Provisioned Redshift to Serverless for Cost"
+→ Introduces: Redshift Serverless → Workgroup → Namespace → RPU
+             → Snapshot Restore → Cost Comparison → Migration Path</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-65.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 66 of 80</span>
+    <span class="nav-project-title">REPLACE CRON + GLUE WORKFLOW WITH EVENT-DRIVEN ARCHITECTURE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-67.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-67.html") window.location = "project-67.html";
+  if (e.key === 'ArrowLeft' && "project-65.html") window.location = "project-65.html";
+});
+</script>
+</body>
+</html>

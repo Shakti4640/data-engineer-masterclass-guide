@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 30: AUTOMATED S3 CSV → REDSHIFT LOAD TRIGGERED BY FILE ARRIVAL — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:38%"></div></div>
+<div id="progress-label">38%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 30 of 80</div>
+  <div class="project-title">AUTOMATED S3 CSV → REDSHIFT LOAD TRIGGERED BY FILE ARRIVAL</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">Redshift</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — nightly MariaDB export now automated (Project 29)
+</span>Situation:
+→ Every night at 2:00 AM: MariaDB exports land in S3 (Project 29)
+   s3://bucket/mariadb_exports/orders/export_date=2025-01-30/orders.csv.gz
+   s3://bucket/mariadb_exports/customers/export_date=2025-01-30/customers.csv.gz
+   s3://bucket/mariadb_exports/products/export_date=2025-01-30/products.csv.gz
+
+→ Redshift cluster hosts the analytics warehouse (Project 10, 11)
+→ Dashboard team queries Redshift every morning at 8 AM
+→ But Redshift still has YESTERDAY's data (last manual COPY was 24h ago)
+
+→ Current manual process:
+   2:00 AM  — Cron exports MariaDB → S3 (automated ✅)
+   8:00 AM  — Engineer arrives, SSHes into EC2
+   8:10 AM  — Engineer runs Redshift COPY manually (Project 21)
+   8:25 AM  — COPY completes
+   8:30 AM  — Dashboard team starts querying
+   
+   → 6 hours of stale data every morning
+   → If engineer is sick/on vacation → data stays stale ALL DAY
+   → Weekend exports never loaded until Monday
+
+→ Desired automated process:
+   2:00 AM  — Cron exports MariaDB → S3
+   2:15 AM  — S3 event fires → SQS message
+   2:15 AM  — EC2 worker receives message → runs Redshift COPY
+   2:20 AM  — COPY completes → notification sent
+   2:25 AM  — Fresh data available in Redshift
+   
+   → Data fresh by 2:30 AM (not 8:30 AM)
+   → Zero human involvement
+   → Works weekends, holidays, sick days
+
+CTO: "We automated the export. Now automate the load.
+      When a file lands in S3, load it into Redshift. Period."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Identify the pieces we already have
+</span>→ S3 event → SQS: configured in Project 28 (or new config for this prefix)
+→ EC2 worker polling SQS: built in Project 27
+→ Redshift COPY from S3: mastered in Project 21
+→ This project: CONNECT these three pieces
+
+Step 2: Design the trigger logic
+→ S3 event notification on: mariadb_exports/ prefix
+→ Filter: suffix=.csv.gz (only compressed exports)
+→ S3 → SQS (direct — no SNS needed here, single consumer)
+→ Worker parses event → extracts S3 key → determines target table → runs COPY
+
+Step 3: Map S3 key to Redshift table
+→ S3 key: mariadb_exports/orders/export_date=2025-01-30/orders.csv.gz
+→ Extract table name from key path: "orders"
+→ Map to Redshift table: public.orders
+→ Each table has its own COPY configuration (columns, types, options)
+
+Step 4: Design the COPY strategy
+→ Option A: TRUNCATE + COPY (full replace — simplest)
+→ Option B: COPY into staging → MERGE into production (safest)
+→ Option C: DELETE matching date + COPY (incremental by date)
+→ For this project: Option A (full replace) for simplicity
+→ Option B covered in Project 65 (CDC merge pattern)
+
+Step 5: Handle multiple files arriving simultaneously
+→ Nightly export creates 3-4 files within 15 minutes
+→ Each file triggers separate SQS message
+→ Worker processes them sequentially (one COPY at a time)
+→ Must not run two COPYs to same table concurrently</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE ARCHITECTURE:
+</span>
+  ┌──────────────────────────────────────────────────────────────┐
+  │  EC2 (CRON) — Project 29                                     │
+  │  2:00 AM: exports MariaDB → S3                               │
+  │                                                              │
+  │  Writes:                                                     │
+  │   s3://bucket/mariadb_exports/orders/export_date=.../        │
+  │   s3://bucket/mariadb_exports/customers/export_date=.../     │
+  │   s3://bucket/mariadb_exports/products/export_date=.../      │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       │ S3 Event Notification (ObjectCreated)
+       │ Filter: prefix=mariadb_exports/, suffix=.csv.gz
+       ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  SQS QUEUE: quickcart-redshift-load-queue                    │
+  │                                                              │
+  │  Message 1: {orders.csv.gz arrived}                          │
+  │  Message 2: {customers.csv.gz arrived}                       │
+  │  Message 3: {products.csv.gz arrived}                        │
+  │                                                              │
+  │  Visibility: 600s (COPY can take 5+ minutes)                 │
+  │  DLQ: after 3 failures                                       │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       │ EC2 Worker long-polls SQS
+       ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  EC2 WORKER: Redshift COPY Executor                          │
+  │                                                              │
+  │  For each SQS message:                                       │
+  │   1. Parse S3 event → extract bucket, key                    │
+  │   2. Determine target Redshift table from S3 key             │
+  │   3. Verify file exists in S3                                │
+  │   4. TRUNCATE Redshift target table                          │
+  │   5. Run COPY from S3 path                                   │
+  │   6. Validate: row count, data quality                       │
+  │   7. Delete SQS message                                      │
+  │   8. Send completion notification                            │
+  └──────────────────────────────────────────────────────────────┘
+       │
+       │ psycopg2 + Redshift COPY
+       ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  REDSHIFT CLUSTER                                            │
+  │                                                              │
+  │  public.orders      ← COPY from orders.csv.gz               │
+  │  public.customers   ← COPY from customers.csv.gz            │
+  │  public.products    ← COPY from products.csv.gz             │
+  │                                                              │
+  │  Fresh data available by ~2:25 AM                            │
+  └──────────────────────────────────────────────────────────────┘
+
+  COMPLETE NIGHTLY FLOW:
+  ━━━━━━━━━━━━━━━━━━━━━
+  2:00 AM  Cron starts MariaDB export (Project 29)
+  2:05 AM  orders.csv.gz uploaded → S3 event → SQS message
+  2:06 AM  Worker receives message → COPY orders into Redshift
+  2:10 AM  orders COPY complete ✅
+  2:10 AM  customers.csv.gz uploaded → S3 event → SQS message
+  2:11 AM  Worker receives → COPY customers
+  2:12 AM  customers COPY complete ✅
+  2:12 AM  products.csv.gz uploaded → event → message
+  2:13 AM  Worker receives → COPY products
+  2:14 AM  products COPY complete ✅
+  2:14 AM  All tables loaded → SNS notification sent
+  2:15 AM  Dashboard team has fresh data (6+ hours earlier!)</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Cron schedules BOTH export AND COPY (sequential)
+</span>→ 2:00 AM: cron exports MariaDB → S3
+→ 2:30 AM: cron runs COPY into Redshift
+→ Simple but brittle: if export takes longer than 30 min → COPY fails
+→ No awareness of WHEN export actually finishes
+→ REJECTED (timing-dependent)
+
+Option B: S3 event → SQS → EC2 worker → COPY (selected)
+→ COPY triggers IMMEDIATELY when file lands
+→ No timing assumptions — reacts to actual file arrival
+→ Same pattern as Project 27/28 — proven reliable
+→ SELECTED ✅
+
+Option C: S3 event → Lambda → COPY
+→ Serverless — no EC2 worker needed
+→ But: Lambda needs VPC access for Redshift
+→ But: COPY may take &gt; 15 minutes for large tables
+→ Lambda 15-minute timeout is risky
+→ Good for small tables, risky for large
+
+Option D: S3 event → Step Functions → Glue → Redshift
+→ Most sophisticated orchestration
+→ Glue can transform + load in one step
+→ Overkill for simple COPY operation
+→ Covered in Project 32 (Glue → Redshift) and 55 (Step Functions)
+
+Option E: Export script directly runs COPY after upload
+→ Modify Project 29 to: export → upload → COPY (in same script)
+→ Works but: tight coupling between export and load
+→ If COPY fails: must re-run entire export
+→ Event-driven approach: retry COPY independently of export
+→ REJECTED (tight coupling)
+
+DECISION: Option B — S3 event → SQS → EC2 worker → COPY
+→ Decoupled: export and load are independent
+→ Reliable: SQS retry handles transient failures
+→ Extensible: same queue can trigger other consumers later
+→ Proven pattern: built on Projects 18, 21, 27</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. CREATE separate SQS queue for Redshift loads
+</span>   → Don't reuse Project 27's queue (different processing logic)
+   → quickcart-redshift-load-queue: dedicated to COPY operations
+   → Separate DLQ: quickcart-redshift-load-dlq
+   → Visibility timeout: 600s (COPY can take 5-10 minutes)
+
+2. MAP S3 key paths to Redshift table configurations
+   → mariadb_exports/orders/ → public.orders
+   → mariadb_exports/customers/ → public.customers
+   → Configuration-driven: add new tables without code changes
+   → Each table config includes: column mapping, COPY options
+
+3. TRUNCATE before COPY for full-replace pattern
+   → TRUNCATE is instant (metadata operation)
+   → COPY appends — without TRUNCATE you get duplicates
+   → Alternative: staging + merge (Project 65 — more complex)
+   → For nightly full export: TRUNCATE + COPY is perfect
+
+4. VALIDATE after COPY
+   → Check: row count matches source export
+   → Check: no load errors (STL_LOAD_ERRORS)
+   → Check: sample data looks reasonable
+   → If validation fails: rollback (re-COPY from previous day)
+
+5. SET visibility timeout &gt; maximum COPY time
+   → 10M rows COPY: 2-5 minutes typical
+   → Set timeout: 600s (10 minutes) for safety margin
+   → If COPY takes longer → extend visibility mid-processing
+
+6. HANDLE manifest file for multi-table coordination
+   → Project 29 writes export manifest to S3
+   → Worker can optionally wait for manifest before processing
+   → Ensures: all tables exported before any are loaded
+   → Simple approach: process each file independently (selected)
+
+7. SEND summary notification after all tables loaded
+   → Track which tables have been loaded today
+   → After last table: send "All tables loaded" notification
+   → Include: table names, row counts, COPY durations</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT COPY and TRUNCATE in separate transactions
+</span>   → TRUNCATE → (crash) → COPY never runs → table empty!
+   → Better: BEGIN → TRUNCATE → COPY → COMMIT (atomic)
+   → Or: COPY into staging → swap tables (zero-downtime)
+
+2. DO NOT process files that aren't from today's export
+   → S3 event may fire for old files being re-uploaded
+   → Check: export_date in S3 key matches today (or yesterday)
+   → Reject stale files to prevent loading outdated data
+
+3. DO NOT run two COPYs to same table simultaneously
+   → Two COPY commands to public.orders at same time
+   → Both TRUNCATE → both COPY → one overwrites the other
+   → Use: table-level lock in worker or process sequentially
+
+4. DO NOT ignore COPY errors and delete the SQS message
+   → COPY fails → delete message → data not loaded → nobody knows
+   → ALWAYS: verify COPY succeeded BEFORE deleting message
+   → On failure: leave message → retry → DLQ if persistent
+
+5. DO NOT hardcode Redshift credentials in the script
+   → Use: environment variables, Secrets Manager (Project 70), or IAM
+   → Credentials in code → credentials in git → security breach
+
+6. DO NOT run COPY during peak Redshift query hours without WLM
+   → COPY consumes cluster I/O and memory
+   → Dashboard queries compete for same resources
+   → 2:00 AM is off-peak — good timing from Project 29
+   → For peak-hour loads: configure WLM queues (Project 40)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────────┬────────────────────────────────┐
+</span>│ Scenario                         │ Use                   │ Why                            │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ S3 file arrival → Redshift COPY  │ SQS → EC2 → COPY     │ Event-driven, reliable,        │
+│ (this project)                   │                       │ decoupled from export          │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ S3 → transform → Redshift       │ Glue ETL → Redshift   │ When data needs cleaning/      │
+│                                  │ (Project 32)          │ transformation before load     │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Scheduled bulk load (no event)   │ Cron → COPY           │ When timing is predictable     │
+│                                  │                       │ and event-driven is overkill   │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Real-time streaming → Redshift   │ Kinesis Firehose      │ Sub-minute latency needed      │
+│                                  │ (Project 72)          │                                │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Incremental load with CDC        │ Staging → MERGE       │ Only changed rows loaded       │
+│                                  │ (Project 65)          │ (not full table replace)       │
+├──────────────────────────────────┼───────────────────────┼────────────────────────────────┤
+│ Complex orchestration with       │ Step Functions        │ Multi-step with error handling  │
+│ conditional logic                │ (Project 55)          │ and parallel execution         │
+└──────────────────────────────────┴───────────────────────┴────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│           AUTOMATED S3 → REDSHIFT COPY — INTERNAL FLOW                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  EVENT CHAIN TIMING:                                                        │
+│  ───────────────────                                                        │
+│                                                                             │
+│  T=0.0s   Project 29 cron: s3_client.upload_file(orders.csv.gz)            │
+│  T=0.2s   S3 replicates across 3 AZs → returns 200 OK                     │
+│  T=0.5s   S3 Event Notification fires (ObjectCreated:Put)                  │
+│  T=0.7s   S3 delivers event to SQS queue                                  │
+│  T=0.7s   SQS message visible in queue                                    │
+│                                                                             │
+│  T=1.0s   EC2 worker's long poll returns with message                      │
+│  to        (depends on where in 20s poll cycle)                             │
+│  T=20.0s                                                                    │
+│                                                                             │
+│  T=5.0s   Worker parses S3 event:                                          │
+│           bucket: quickcart-raw-data-prod                                   │
+│           key: mariadb_exports/orders/export_date=2025-01-30/orders.csv.gz │
+│           → Extracts table name: "orders"                                   │
+│           → Looks up config: public.orders, GZIP, CSV, IGNOREHEADER 1      │
+│                                                                             │
+│  T=5.5s   Worker verifies file exists (head_object)                        │
+│                                                                             │
+│  T=6.0s   Worker connects to Redshift (psycopg2)                          │
+│           BEGIN transaction                                                 │
+│                                                                             │
+│  T=6.1s   TRUNCATE TABLE public.orders;                                    │
+│           → Instant (metadata-only operation)                               │
+│           → Table now has 0 rows                                            │
+│                                                                             │
+│  T=6.2s   COPY public.orders                                              │
+│           FROM 's3://bucket/mariadb_exports/orders/export_date=2025-01-30/'│
+│           IAM_ROLE 'arn:...'                                                │
+│           CSV GZIP IGNOREHEADER 1 DATEFORMAT 'auto'                        │
+│           MAXERROR 0 COMPUPDATE OFF STATUPDATE ON;                          │
+│                                                                             │
+│           → Redshift COPY mechanics (from Project 21):                      │
+│             - Leader node parses command                                    │
+│             - Assigns files to compute node slices                          │
+│             - Each slice reads directly from S3                             │
+│             - Decompresses GZIP → parses CSV → loads columns               │
+│             - All slices work in parallel                                   │
+│                                                                             │
+│  T=130s   COPY completes: "10,000,000 rows loaded"                         │
+│  (~2 min)                                                                   │
+│                                                                             │
+│  T=131s   Worker validates:                                                │
+│           SELECT COUNT(*) FROM public.orders; → 10,000,000 ✅              │
+│           Check STL_LOAD_ERRORS → 0 errors ✅                              │
+│                                                                             │
+│  T=132s   COMMIT transaction                                               │
+│           → TRUNCATE + COPY atomic: either both or neither                 │
+│                                                                             │
+│  T=132s   Worker deletes SQS message (acknowledgment)                      │
+│                                                                             │
+│  T=133s   Worker sends SNS notification:                                   │
+│           "✅ Loaded orders: 10M rows in 127s from export_date=2025-01-30" │
+│                                                                             │
+│  TOTAL: ~2 minutes from file arrival to data available in Redshift         │
+│                                                                             │
+│                                                                             │
+│  MULTI-TABLE SEQUENCE:                                                      │
+│  ─────────────────────                                                      │
+│  T=0    orders.csv.gz arrives → SQS message 1                              │
+│  T=5    Worker picks up message 1 → COPY orders (2 min)                    │
+│  T=125  orders done → message 1 deleted                                    │
+│  T=300  customers.csv.gz arrives → SQS message 2                           │
+│  T=305  Worker picks up message 2 → COPY customers (10 sec)               │
+│  T=315  customers done → message 2 deleted                                 │
+│  T=600  products.csv.gz arrives → SQS message 3                            │
+│  T=605  Worker picks up message 3 → COPY products (5 sec)                  │
+│  T=610  products done → message 3 deleted                                  │
+│  T=611  All tables loaded → summary notification                           │
+│                                                                             │
+│  FAILURE HANDLING:                                                          │
+│  ─────────────────                                                          │
+│  COPY fails (bad data):                                                     │
+│  → Transaction ROLLBACK → table still has OLD data (not empty)             │
+│  → SQS message NOT deleted → retries after visibility timeout              │
+│  → After 3 failures → DLQ → alert                                         │
+│  → Old data remains in Redshift (better than empty table)                  │
+│                                                                             │
+│  Redshift unreachable:                                                      │
+│  → psycopg2.connect() fails → exception caught                            │
+│  → SQS message NOT deleted → retries                                       │
+│  → Redshift may be in maintenance window → retries succeed later           │
+│                                                                             │
+│  Worker crashes mid-COPY:                                                   │
+│  → Redshift COPY is transactional → auto-rollback on disconnect            │
+│  → SQS visibility timeout expires → message reappears                      │
+│  → New worker picks up → retries COPY from scratch                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "TRUNCATE succeeded but COPY failed — table is empty"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: TRUNCATE and COPY in separate transactions
+→ TRUNCATE commits → COPY fails → table empty
+→ Dashboard queries return 0 rows → panic
+→ Fix: wrap TRUNCATE + COPY in single transaction
+→ BEGIN → TRUNCATE → COPY → COMMIT
+→ If COPY fails → ROLLBACK → table still has old data ✅
+
+PITFALL 2: "Same table loaded twice — duplicate rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: SQS delivers duplicate message (at-least-once)
+→ Worker processes COPY twice for same file
+→ With TRUNCATE + COPY: second run just replaces first (idempotent ✅)
+→ Without TRUNCATE: COPY appends → double the data ❌
+→ TRUNCATE + COPY is naturally idempotent for full-replace
+
+PITFALL 3: "COPY takes 10 minutes — visibility timeout expires"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: visibility timeout (300s) &lt; COPY time (600s)
+→ At T=300s: message reappears → second worker picks up
+→ Two workers run COPY simultaneously → chaos
+→ Fix: set visibility timeout = 600s (or extend mid-processing)
+→ Use: sqs.change_message_visibility() to extend during long COPY
+
+PITFALL 4: "Worker picks up file from WRONG export date"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: old file re-uploaded triggers new S3 event
+→ Worker loads stale data over fresh data
+→ Fix: validate export_date in S3 key matches expected date
+→ Reject files where export_date &lt; yesterday
+
+PITFALL 5: "COPY fails with Access Denied on S3"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Redshift IAM role lacks s3:GetObject on mariadb_exports/ prefix
+→ Project 21 role was configured for daily_exports/ only
+→ Fix: update Redshift IAM role to include mariadb_exports/* 
+→ Or: use broader s3:GetObject on entire bucket
+
+PITFALL 6: "Export manifest arrives BEFORE all data files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Project 29 writes manifest after all tables exported
+→ Manifest upload triggers S3 event → worker receives
+→ But worker expects .csv.gz files, not .json
+→ Fix: S3 notification suffix filter = .csv.gz (not .json)
+→ Manifest file ignored by worker automatically</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TABLE SIZE vs COPY TIME:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+→ products (5K rows, 2 MB):       COPY &lt; 5 seconds
+→ customers (50K rows, 10 MB):    COPY &lt; 10 seconds
+→ orders (10M rows, 120 MB gz):   COPY 2-3 minutes
+→ orders (100M rows, 1.2 GB gz):  COPY 10-15 minutes
+
+QUEUE PROCESSING:
+━━━━━━━━━━━━━━━━━
+→ 3-4 files/night: single worker handles easily
+→ Files processed sequentially: 2-3 min each = 10 min total
+→ If 20+ tables: consider parallel workers or Lambda
+→ Auto-scaling (Project 52): scale workers based on queue depth
+
+REDSHIFT CLUSTER IMPACT:
+━━━━━━━━━━━━━━━━━━━━━━━━
+→ COPY at 2 AM: cluster is idle → zero contention
+→ COPY at peak hours: competes with dashboard queries
+→ WLM (Project 40): isolate COPY to separate queue
+→ Concurrency scaling: auto-add capacity for query spikes
+
+COST:
+━━━━━
+→ SQS: ~130K messages/month = free tier
+→ EC2 worker: shared with Project 27/28 worker ($15/month)
+→ Redshift COPY: no additional cost (part of cluster usage)
+→ S3 reads: $0.0004 per 1000 GET requests (trivial)
+→ Total incremental cost: ~$0/month (reuses existing infrastructure)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(30)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Dedicated SQS Queue for Redshift Loads</h3>
+
+<h3>Step 2: Table Configuration Registry</h3>
+
+<h3>Step 3: Redshift COPY Worker (Core Logic)</h3>
+
+<h3>Step 4: End-to-End Test</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+============================================================
+🧪 END-TO-END TEST: S3 → SQS → EC2 → Redshift COPY
+   Time: 2025-01-30 14:22:15
+============================================================
+✅ Generated test export: /tmp/test_products.csv.gz (200 rows)
+✅ Uploaded to: s3://quickcart-raw-data-prod/mariadb_exports/products/export_date=2025-01-30/products.csv.gz
+   → This triggers S3 event → SQS → worker → COPY
+
+⏳ Waiting for Redshift COPY to complete...
+   ⏳ 10.2s — products has 5000 rows (waiting for 200)
+   ⏳ 20.4s — products has 5000 rows (waiting for 200)
+   ⏳ 30.6s — products has 200 rows (waiting for 200)
+
+✅ REDSHIFT LOADED!
+   Rows: 200
+   Wait time: 30.6s
+
+📊 REDSHIFT VERIFICATION:
+   Total rows: 200
+
+   Category Distribution:
+      Electronics        45 products, avg $487.32
+      Clothing           42 products, avg $312.18
+      Home               41 products, avg $445.67
+      Books              38 products, avg $289.54
+      Sports             34 products, avg $398.21
+
+   Sample Rows:
+      ('PROD-00001', 'Test Product 1', 'Electronics', 249.99, 3200, 'true')
+      ('PROD-00002', 'Test Product 2', 'Clothing', 89.50, 1500, 'false')
+      ('PROD-00003', 'Test Product 3', 'Home', 599.99, 800, 'true')
+
+============================================================
+🎉 END-TO-END TEST PASSED!
+   File uploaded to S3 → auto-loaded into Redshift
+============================================================</code></pre></div>
+<h3>Step 5: Nightly Load Monitor</h3>
+
+<h3>Step 6: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket with mariadb_exports/ (Project 29)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift cluster with tables (Project 10, 11)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift IAM role with S3 access (Project 21)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → EC2 with psycopg2 installed</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SQS fundamentals (Project 13)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SQS worker pattern (Project 27)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create dedicated SQS queue + S3 notification</span><span>
+</span>python 01_create_redshift_load_queue.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Review table configuration (no execution needed)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Edit 02_table_config.py to add/modify tables</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Start the Redshift COPY worker (runs continuously)</span><span>
+</span><span>python 03_redshift_copy_worker.py </span><span class="token" style="color: rgb(57, 58, 52);">&amp;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run end-to-end test</span><span>
+</span>python 04_end_to_end_test.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Install monitoring cron (runs at 4 AM)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 0 4 * * * /opt/venv/bin/python /opt/scripts/05_monitor_nightly_loads.py</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># FULL NIGHTLY FLOW:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:00 AM  → Cron exports MariaDB → S3 (Project 29)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:05 AM  → S3 events fire → SQS messages</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:06 AM  → Worker receives → COPY orders (2 min)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:10 AM  → Worker receives → COPY customers (10 sec)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:11 AM  → Worker receives → COPY products (5 sec)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:15 AM  → All tables loaded, notifications sent</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4:00 AM  → Monitor verifies everything loaded</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8:00 AM  → Dashboard team has 6-hour-fresher data</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 event → SQS → EC2 worker → Redshift COPY = fully automated load pipeline
+→ TRUNCATE + COPY in single transaction = atomic (no empty table risk)
+→ If COPY fails → ROLLBACK → old data preserved (better than empty)
+→ Configuration-driven table mapping: add tables without code changes
+→ Visibility timeout must exceed longest COPY time (10 min for safety)
+→ Validate after COPY: row count + load errors + data quality checks
+→ DLQ catches persistent failures → alerting → manual investigation
+→ End-to-end test proves: file drop → Redshift data (automated)
+→ Monitor at 4 AM catches: missed exports, failed COPYs, empty tables
+
+THE COMPLETE AUTOMATED NIGHTLY PIPELINE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2:00 AM  MariaDB → S3 export (Project 29, cron)
+  2:05 AM  S3 event → SQS (Project 18 pattern)
+  2:06 AM  EC2 worker → Redshift COPY (this project)
+  2:15 AM  All tables loaded ✅
+  4:00 AM  Monitor verifies (this project)
+  
+  ZERO HUMAN INVOLVEMENT from MariaDB → Redshift
+  
+  If anything fails:
+  → Worker retries (SQS visibility timeout)
+  → After 3 failures → DLQ → SNS alert
+  → 4 AM monitor catches any gaps
+  → Team investigates and fixes in the morning
+
+THIS COMPLETES PHASE 2 (Projects 17-30):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Every 2-service integration pattern is now proven:
+  S3 ↔ SNS/SQS (Projects 17, 18)
+  S3 ↔ MariaDB via EC2 (Projects 19, 20)
+  S3 ↔ Redshift COPY/UNLOAD (Projects 21, 22)
+  S3 ↔ Glue Crawler (Project 23)
+  S3 ↔ Athena (Projects 24, 26)
+  S3 ↔ Glue ETL (Project 25)
+  SQS ↔ EC2 Worker (Project 27)
+  S3 → SNS → SQS → EC2 → MariaDB (Project 28)
+  MariaDB → S3 scheduled export (Project 29)
+  S3 → SQS → EC2 → Redshift COPY (Project 30)
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket (data hub)
+→ Project 10: Redshift cluster (target warehouse)
+→ Project 11: Redshift table schema (COPY target)
+→ Project 12: SNS notifications
+→ Project 13: SQS queue fundamentals
+→ Project 18: S3 → SQS event pattern
+→ Project 21: Redshift COPY mechanics
+→ Project 27: EC2 SQS worker pattern
+→ Project 29: MariaDB nightly export (produces the files we load)
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 31: Glue JDBC to MariaDB (managed alternative to cron export)
+→ Project 32: Glue → Redshift direct load (managed alternative to COPY worker)
+→ Project 39: Redshift table optimization (after data is loaded)
+→ Project 40: Redshift WLM (manage COPY vs query resource competition)
+→ Project 65: CDC merge pattern (incremental loads, not full replace)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PHASE 2 COMPLETE ✅ — All core integration patterns mastered
+</span>
+We've built every possible 2-service connection:
+  S3, EC2, MariaDB, Redshift, Glue, Athena, SNS, SQS
+
+NOW: Phase 3 — Professional Techniques (Projects 31-55)
+Multi-service pipelines, real production patterns
+
+The first gap to fill:
+→ Project 29 exports MariaDB → S3 via custom Python script + cron
+→ Project 30 loads S3 → Redshift via custom Python worker + COPY
+→ These work but: WE wrote and maintain ALL the code
+→ Connection management, error handling, retries — all on us
+
+What if AWS had a MANAGED service that:
+→ Connects to MariaDB via JDBC (no custom pymysql code)
+→ Reads tables automatically (no custom SELECT queries)
+→ Handles parallelism (no custom batching)
+→ Writes directly to S3 in Parquet (no CSV → Parquet conversion)
+→ Integrates with Glue Catalog (no manual table creation)
+
+That service is: Glue JDBC Connection
+
+CTO: "Our custom scripts work. But they're fragile.
+      If the EC2 instance dies, exports stop.
+      Is there a managed way to extract from MariaDB?"
+
+YOU: "Glue JDBC. It connects to MariaDB like our script does,
+      but it's managed by AWS. No EC2 to maintain.
+      It reads tables → writes Parquet → updates Catalog.
+      All in one job, with built-in retry and monitoring."
+
+→ Project 31: "Extract MariaDB Tables to S3 Parquet via Glue JDBC"
+→ Introduces: Glue JDBC Connection → VPC/Subnet/SG → DynamicFrame from JDBC
+→ Managed replacement for Projects 29 (export) + 25 (CSV→Parquet)
+→ Entering Phase 3: Professional Techniques</code></pre></div>
+<hr>
+</div>
+</div>
+
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-29.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 30 of 80</span>
+    <span class="nav-project-title">AUTOMATED S3 CSV → REDSHIFT LOAD TRIGGERED BY FILE ARRIVAL</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-31.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-31.html") window.location = "project-31.html";
+  if (e.key === 'ArrowLeft' && "project-29.html") window.location = "project-29.html";
+});
+</script>
+</body>
+</html>

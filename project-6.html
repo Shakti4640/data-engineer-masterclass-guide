@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 6: PYTHON SCRIPT ON EC2 MUST READ/WRITE S3 WITHOUT HARDCODED KE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:8%"></div></div>
+<div id="progress-label">8%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 6 of 80</div>
+  <div class="project-title">PYTHON SCRIPT ON EC2 MUST READ/WRITE S3 WITHOUT HARDCODED KEYS</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">EC2</span><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — same startup from Project 1
+</span>Current State:
+→ The upload script from Project 1 runs on EC2
+→ Developer initially made it work by running:
+     aws configure
+     → pasted Access Key ID:[REDACTED:AWS_ACCESS_KEY]E
+     → pasted Secret Access Key:[REDACTED:AWS_SECRET_KEY]Y
+→ These credentials are now stored in ~/.aws/credentials on the EC2 instance
+→ The same credentials are ALSO hardcoded in a second script
+
+6 months later:
+→ 3 EC2 instances now run various S3 upload/download scripts
+→ All 3 use the SAME IAM user's access keys (copy-pasted everywhere)
+→ Security audit reveals:
+   - Keys are 6 months old (never rotated)
+   - Same keys on 3 machines (blast radius = everything)
+   - Keys belong to an IAM user with AdministratorAccess (!!!)
+   - Keys are committed in a private GitHub repo
+   - If ONE machine is compromised, attacker has full AWS access
+
+CISO: "Remove ALL hardcoded keys from EC2 instances by Friday.
+       Use IAM Roles instead. Explain to me WHY this is safer."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY hardcoded keys are dangerous
+</span>→ Keys are STATIC — they don't expire unless you manually rotate
+→ Keys are PORTABLE — anyone who copies them can use them from anywhere
+→ Keys are BROAD — typically over-permissioned (lazy admin gave Admin access)
+→ Keys are INVISIBLE — no way to know if someone extracted them silently
+→ Keys are SHARED — same key on multiple machines = no audit trail per machine
+
+Step 2: Understand the ALTERNATIVE — IAM Roles for EC2
+→ IAM Role = identity WITHOUT permanent credentials
+→ EC2 Instance Profile = container that delivers role credentials TO the instance
+→ Credentials are TEMPORARY — auto-rotated every ~6 hours by AWS
+→ Credentials are LOCAL — only accessible from that specific EC2 instance
+→ Credentials are SCOPED — role has ONLY the permissions you define
+→ Credentials are TRACEABLE — CloudTrail logs show which instance made each call
+
+Step 3: Understand what CHANGES in our code
+→ NOTHING changes in boto3 code
+→ boto3 automatically discovers credentials via the "credential chain"
+→ If Instance Profile exists → boto3 uses it automatically
+→ No code change needed — only infrastructure change
+
+Step 4: Plan the migration
+→ Create IAM Role with MINIMAL S3 permissions
+→ Create Instance Profile and attach the role
+→ Attach Instance Profile to EC2 instance
+→ Delete ~/.aws/credentials from all instances
+→ Remove hardcoded keys from all scripts
+→ Verify everything still works
+→ Deactivate and delete the old IAM user access keys</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE: BEFORE vs AFTER
+</span>
+BEFORE (DANGEROUS):
+┌──────────────┐          ┌──────────────────┐
+│   EC2         │          │   S3 Bucket       │
+│               │  keys    │                   │
+│ ~/.aws/creds  │─────────→│ quickcart-raw-    │[REDACTED:AWS_ACCESS_KEY]SFO...  │  in      │ data-prod         │
+│ wJalrXUt...   │  HTTP    │                   │
+│               │  header  │                   │
+└──────────────┘          └──────────────────┘
+     │
+     │ Keys can be STOLEN:
+     │ → SSH into machine → cat ~/.aws/credentials
+     │ → Leaked in logs
+     │ → Committed to git
+     │ → Extracted by malware
+     │
+     ▼
+  PERMANENT credentials → NEVER expire → FULL admin access
+
+
+AFTER (SECURE):
+┌──────────────┐          ┌──────────────────┐
+│   EC2         │          │   S3 Bucket       │
+│               │  temp    │                   │
+│ Instance      │─────────→│ quickcart-raw-    │
+│ Metadata      │  creds   │ data-prod         │
+│ Service       │  auto    │                   │
+│ (169.254.     │  rotated │                   │
+│  169.254)     │          │                   │
+└──────┬───────┘          └──────────────────┘
+       │
+       │ Credentials are:
+       │ → TEMPORARY (expire in ~6 hours)
+       │ → AUTO-ROTATED (new ones before expiry)
+       │ → SCOPED (only s3:GetObject, s3:PutObject on ONE bucket)
+       │ → NEVER in code or filesystem
+       │ → TRACEABLE via CloudTrail
+       │
+       ▼
+  ┌──────────────────────┐
+  │ IAM Role:             │
+  │ QuickCartEC2S3Role    │
+  │                       │
+  │ Trust: EC2 service    │
+  │ Permission: S3 only   │
+  └──────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Rotate access keys every 90 days manually
+</span>→ Still keys → still portable → still dangerous
+→ Rotation is manual → people forget
+→ 3 machines to update → one always missed
+→ VERDICT: band-aid, not a solution
+
+Option B: Use AWS Systems Manager Parameter Store for keys
+→ Keys stored centrally, fetched at runtime
+→ Better than hardcoded, BUT still static credentials
+→ Still need a way to authenticate TO Parameter Store (chicken-and-egg)
+→ VERDICT: useful for OTHER secrets, not for AWS API auth
+
+Option C: Use IAM Roles attached to EC2 via Instance Profile ✅
+→ No credentials in code, filesystem, or environment variables
+→ Temporary, auto-rotated, scoped, traceable
+→ boto3 discovers them automatically via metadata service
+→ VERDICT: the CORRECT and ONLY recommended approach
+
+Option D: Use AWS SSO / Identity Center
+→ Designed for HUMAN users accessing console/CLI from laptops
+→ Not for machine-to-machine (EC2 to S3)
+→ VERDICT: wrong use case
+
+DECISION: Option C — IAM Role + Instance Profile</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create role with LEAST PRIVILEGE policy
+</span>   → Only s3:GetObject, s3:PutObject, s3:ListBucket
+   → Only on the specific bucket ARN
+   → NOT s3:* and definitely NOT *
+
+2. Use trust policy that ONLY allows EC2 service to assume the role
+   → Principal: {"Service": "ec2.amazonaws.com"}
+   → No human user should be able to assume this role
+
+3. Name the role descriptively
+   → QuickCart-EC2-S3ReadWrite-Prod
+   → NOT "MyRole" or "test-role-1"
+
+4. One role per responsibility
+   → Upload script → role with PutObject
+   → Download script → role with GetObject
+   → In practice: one role per application is acceptable
+
+5. Verify credential chain BEFORE deleting old keys
+   → Attach role → test script works → THEN delete keys
+   → Never delete first and hope for the best
+
+6. Use IMDSv2 (Instance Metadata Service v2)
+   → v1 is vulnerable to SSRF attacks
+   → v2 requires session token → much harder to exploit
+
+7. Log and monitor with CloudTrail
+   → Every S3 call from the role is logged
+   → AssumedRole ARN includes the instance ID</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT give the role AdministratorAccess or PowerUserAccess
+</span>   → "It works with Admin" is the most dangerous sentence in AWS
+   → A compromised EC2 with Admin = attacker owns your entire account
+
+2. DO NOT create one "shared" role used by all applications
+   → Blast radius: if one app is compromised, all permissions are exposed
+   → Each application/purpose gets its own role
+
+3. DO NOT hardcode the temporary credentials fetched from metadata
+   → Some developers fetch from 169.254.169.254 and cache in variables
+   → Let boto3 handle this — it manages refresh automatically
+
+4. DO NOT leave IMDSv1 enabled
+   → SSRF vulnerability: attacker tricks app into calling metadata URL
+   → 2019 Capital One breach: SSRF → IMDSv1 → stole credentials → 100M records
+   → ALWAYS enforce IMDSv2 (HttpTokens = required)
+
+5. DO NOT skip testing after attaching the role
+   → Policy might have typo in bucket ARN
+   → Policy might be missing s3:ListBucket (causes confusing 403 on list)
+
+6. DO NOT keep old access keys "just in case"
+   → Deactivate immediately after role works
+   → Delete after 7-day observation period
+
+7. DO NOT attach role to instance without understanding trust policy
+   → Trust policy = WHO can assume this role
+   → Permission policy = WHAT the role can do
+   → Both must be correct — either one wrong = broken or insecure</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬─────────────────────────┬────────────────────────────────┐
+</span>│ Scenario                           │ Credential Method       │ Why                            │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ EC2 instance calling AWS APIs      │ IAM Role +              │ Temp creds, auto-rotated,      │
+│                                    │ Instance Profile        │ no keys to manage              │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ Lambda function calling AWS APIs   │ IAM Execution Role      │ Same concept, Lambda-native    │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ Glue job calling S3/Redshift       │ IAM Role for Glue       │ Glue assumes role at start     │
+│                                    │                         │ (Project 25+)                  │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ Developer on laptop (local dev)    │ AWS SSO / Identity      │ Temp creds via browser login   │
+│                                    │ Center                  │                                │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ CI/CD pipeline (GitHub Actions)    │ OIDC Federation →       │ No long-lived keys needed      │
+│                                    │ AssumeRoleWithWebId     │                                │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ Third-party app needing access     │ IAM User + Access Keys  │ ONLY acceptable case for keys  │
+│ (no role assumption possible)      │ + strict policy         │ → rotate every 90 days         │
+├────────────────────────────────────┼─────────────────────────┼────────────────────────────────┤
+│ Cross-account access               │ AssumeRole with         │ Account B assumes role in A    │
+│                                    │ ExternalId              │ (Project 56)                   │
+└────────────────────────────────────┴─────────────────────────┴────────────────────────────────┘
+
+RULE OF THUMB:
+→ If compute runs IN AWS → USE IAM ROLES (never keys)
+→ If compute runs OUTSIDE AWS → minimize key scope + rotate</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE IAM ROLES FOR EC2</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When application runs OUTSIDE of AWS (on-prem server)
+</span>   → EC2 Instance Metadata doesn't exist on-prem
+   → Use: IAM User keys (last resort) or SSM Hybrid Activation
+
+2. When you need CROSS-ACCOUNT access
+   → Instance Profile alone isn't enough
+   → Use: Instance Profile + AssumeRole into target account (Project 56)
+
+3. When you need database credentials (MariaDB password, API keys)
+   → IAM Roles provide AWS API credentials, NOT application passwords
+   → Use: Secrets Manager or Parameter Store for non-AWS secrets (Project 70)
+
+4. When you need to limit access PER-USER on a shared EC2
+   → Instance Profile applies to the INSTANCE, not the SSH user
+   → All users on that EC2 get the same role
+   → Use: separate instances per team, or containerize with ECS/EKS task roles</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│                  IAM ROLE + INSTANCE PROFILE — DEEP MECHANICS               │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  COMPONENT 1: IAM ROLE                                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━                                                       │
+│  An IAM Role is an identity with TWO types of policies:                      │
+│                                                                              │
+│  A) TRUST POLICY (who can BECOME this role):                                 │
+│     {                                                                        │
+│       "Effect": "Allow",                                                     │
+│       "Principal": {"Service": "ec2.amazonaws.com"},                         │
+│       "Action": "sts:AssumeRole"                                             │
+│     }                                                                        │
+│     → This says: ONLY the EC2 service can assume this role                   │
+│     → A human, Lambda, or Glue CANNOT assume it                             │
+│     → The "Principal" field is the GATEKEEPER                                │
+│                                                                              │
+│  B) PERMISSION POLICY (what the role CAN DO):                                │
+│     {                                                                        │
+│       "Effect": "Allow",                                                     │
+│       "Action": ["s3:GetObject", "s3:PutObject"],                            │
+│       "Resource": "arn:aws:s3:::quickcart-raw-data-prod/*"                   │
+│     }                                                                        │
+│     → This says: whoever assumes this role can read/write objects            │
+│     → ONLY in the specified bucket                                           │
+│                                                                              │
+│  COMPONENT 2: INSTANCE PROFILE                                               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                                │
+│  → An Instance Profile is a CONTAINER (wrapper) for an IAM Role              │
+│  → EC2 doesn't directly attach roles — it attaches Instance Profiles         │
+│  → One Instance Profile holds exactly ONE role                               │
+│  → When you "attach role to EC2" in console, AWS auto-creates the profile    │
+│  → Via API/CLI, you must create both separately                              │
+│                                                                              │
+│  RELATIONSHIP:                                                               │
+│  ┌──────────────────┐     contains     ┌──────────────────┐                  │
+│  │ Instance Profile  │────────────────→│ IAM Role          │                  │
+│  │ (wrapper)         │                 │ (actual identity)  │                 │
+│  └────────┬─────────┘                 └──────────────────┘                  │
+│           │                                                                  │
+│           │ attached to                                                      │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                        │
+│  │ EC2 Instance      │                                                       │
+│  └──────────────────┘                                                        │
+│                                                                              │
+│  COMPONENT 3: EC2 INSTANCE METADATA SERVICE (IMDS)                           │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            │
+│  → Special HTTP endpoint: http://169.254.169.254                             │
+│  → ONLY accessible from WITHIN the EC2 instance                              │
+│  → Link-local address — never routed to internet                             │
+│  → Returns instance metadata: ID, region, role credentials                   │
+│                                                                              │
+│  CREDENTIAL FLOW (step by step):                                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                             │
+│                                                                              │
+│  Step 1: EC2 boots with Instance Profile attached                            │
+│          └→ AWS associates role with the instance                            │
+│                                                                              │
+│  Step 2: boto3 script starts on EC2                                          │
+│          └→ boto3 searches for credentials (credential chain — see below)    │
+│                                                                              │
+│  Step 3: boto3 reaches "Instance Metadata" in the chain                      │
+│          └→ Makes HTTP call to:                                              │
+│             http://169.254.169.254/latest/meta-data/                         │
+│             iam/security-credentials/QuickCart-EC2-S3ReadWrite-Prod           │
+│                                                                              │
+│  Step 4: IMDS calls STS (Security Token Service) internally                  │
+│          └→ STS generates TEMPORARY credentials:                             │
+│             - AccessKeyId:     ASIA...  (starts with ASIA, not AKIA)         │
+│             - SecretAccessKey:  wJal...                                      │
+│             - SessionToken:     FwoGZX... (THIS is what makes it temporary)  │
+│             - Expiration:       2025-01-15T18:30:00Z (~6 hours from now)     │
+│                                                                              │
+│  Step 5: boto3 receives these temp credentials                               │
+│          └→ Caches them in memory                                            │
+│          └→ Uses them for ALL subsequent AWS API calls                       │
+│          └→ Includes SessionToken in every request signature                 │
+│                                                                              │
+│  Step 6: Before expiry, boto3 AUTO-REFRESHES                                 │
+│          └→ Calls IMDS again → gets new temp credentials                     │
+│          └→ No code change, no restart needed                                │
+│          └→ Seamless rotation every ~6 hours                                 │
+│                                                                              │
+│                                                                              │
+│  BOTO3 CREDENTIAL CHAIN (search order):                                      │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                      │
+│  boto3 checks these locations IN ORDER — uses FIRST one found:               │
+│                                                                              │
+│  Priority 1: Hardcoded in boto3.client(aws_access_key_id=...)                │
+│  Priority 2: Environment variables (AWS_ACCESS_KEY_ID)                       │
+│  Priority 3: Shared credentials file (~/.aws/credentials)                    │
+│  Priority 4: AWS config file (~/.aws/config)                                 │
+│  Priority 5: Assume Role provider (role_arn in config)                       │
+│  Priority 6: boto3 can assume role via web identity                          │
+│  Priority 7: ★ EC2 Instance Metadata Service (IMDS) ★                       │
+│  Priority 8: Container credentials (ECS task role)                           │
+│                                                                              │
+│  KEY INSIGHT:                                                                │
+│  → If ~/.aws/credentials EXISTS, it takes PRIORITY over Instance Profile     │
+│  → This is why we MUST delete old credential files                           │
+│  → Otherwise, boto3 uses the old static keys, NOT the role                   │
+│                                                                              │
+│                                                                              │
+│  IMDSv1 vs IMDSv2:                                                           │
+│  ━━━━━━━━━━━━━━━━                                                            │
+│  v1 (DANGEROUS — default on older instances):                                │
+│  → Simple GET request: curl http://169.254.169.254/...                       │
+│  → Any process on the instance can call it                                   │
+│  → SSRF attack: trick a web app into calling metadata URL                    │
+│  → Capital One breach (2019): SSRF → IMDSv1 → stole creds → 100M records    │
+│                                                                              │
+│  v2 (SECURE — always enforce this):                                          │
+│  → Requires two-step process:                                                │
+│     Step A: PUT request to get a SESSION TOKEN (with TTL)                    │
+│       TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token"          │
+│              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")               │
+│     Step B: GET request WITH token in header                                 │
+│       curl -H "X-aws-ec2-metadata-token: $TOKEN"                            │
+│              http://169.254.169.254/latest/meta-data/                         │
+│  → SSRF can't do PUT + capture token → attack blocked                        │
+│  → boto3 handles v2 automatically (no code change)                           │
+│                                                                              │
+│                                                                              │
+│  STS (Security Token Service) — THE ENGINE BEHIND ROLES:                     │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                      │
+│  → STS is the service that GENERATES temporary credentials                   │
+│  → When EC2 metadata is queried, STS is called behind the scenes             │
+│  → STS operations:                                                           │
+│     - AssumeRole → for IAM roles (this project)                              │
+│     - AssumeRoleWithWebIdentity → for OIDC federation                        │
+│     - AssumeRoleWithSAML → for SAML federation                               │
+│     - GetSessionToken → for MFA-protected API access                         │
+│     - GetCallerIdentity → "who am I?" (debugging tool)                       │
+│  → Every temp credential has:                                                │
+│     - AccessKeyId (starts with ASIA for temp, AKIA for permanent)            │
+│     - SecretAccessKey                                                        │
+│     - SessionToken (MUST be included in API calls)                           │
+│     - Expiration (UTC timestamp)                                             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "I attached the role but boto3 still uses old keys"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: ~/.aws/credentials still exists → Priority 3 beats Priority 7
+→ Fix: delete or rename ~/.aws/credentials
+→ Verify: python -c "import boto3; print(boto3.Session().get_credentials().method)"
+   → Should print: "iam-role" (NOT "shared-credentials-file")
+
+PITFALL 2: "AccessDenied even though role has S3 permissions"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: Permission policy has wrong bucket ARN
+   → "arn:aws:s3:::quickcart-raw-data-prod" (bucket-level) allows ListBucket
+   → "arn:aws:s3:::quickcart-raw-data-prod/*" (object-level) allows Get/Put
+   → NEED BOTH for full access
+→ Cause 2: S3 bucket policy has explicit Deny that overrides role
+   → Explicit Deny ALWAYS wins (Project 3 bucket policy concept)
+→ Cause 3: S3 Block Public Access blocks cross-account (not this case)
+→ Debug: aws sts get-caller-identity → verify you ARE the role
+
+PITFALL 3: "Works from SSH but fails from cron job"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: cron runs as root, SSH session runs as ec2-user
+→ ~/.aws/credentials might exist for ec2-user but not root
+→ With IAM Role: works for ALL users → no more user-specific issues
+→ Fix: ensure no credential files exist for ANY user
+
+PITFALL 4: "Temporary credentials expired mid-upload"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: uploading a huge file takes &gt; 6 hours
+→ boto3 auto-refreshes for NEW API calls, but mid-transfer refresh is tricky
+→ Fix: use multipart upload → each part is a separate API call → auto-refreshes
+
+PITFALL 5: "Instance Profile exists but EC2 says 'no role attached'"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Instance Profile created but not ASSOCIATED with EC2 instance
+→ Creating a profile ≠ attaching it
+→ Must call: associate_iam_instance_profile() or set at launch time
+
+PITFALL 6: "I can assume the role from my laptop too"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Trust policy says Principal: "*" or includes your IAM user
+→ Fix: Trust policy MUST only have: {"Service": "ec2.amazonaws.com"}
+→ No human principal should be there (unless for debugging, then remove)
+
+PITFALL 7: "IMDSv1 still enabled — security team flagged it"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Default on older instances: IMDSv1 + v2 both enabled
+→ Must explicitly set: HttpTokens=required (forces v2-only)
+→ Do this at launch time or modify running instance</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SINGLE EC2 INSTANCE:
+</span>→ One role, one Instance Profile
+→ Credentials fetched from IMDS → negligible overhead
+→ boto3 caches credentials → no repeated IMDS calls
+
+MULTIPLE EC2 INSTANCES (same function):
+→ All can share the SAME Instance Profile
+→ Each gets its OWN temporary credentials (different AccessKeyId)
+→ CloudTrail distinguishes them by instance ID in the ARN:
+   arn:aws:sts::123456789012:assumed-role/QuickCart-EC2-S3Role/i-0abc123def456
+
+AUTO SCALING GROUP:
+→ Launch Template specifies Instance Profile
+→ Every new instance automatically gets the role
+→ No credential distribution needed (unlike access keys)
+→ This is WHY roles are essential for auto-scaling (Project 52)
+
+MULTIPLE ROLES ON ONE INSTANCE:
+→ EC2 supports ONLY ONE Instance Profile at a time
+→ If you need multiple permission sets:
+   Option A: combine permissions into one role (simplest)
+   Option B: application assumes a DIFFERENT role via STS (advanced)
+   → script calls sts.assume_role(RoleArn=...) to switch roles
+   → useful for cross-account access (Project 56)
+
+RATE LIMITS:
+→ IMDS: no documented rate limit, but throttles under extreme load
+→ STS AssumeRole: 1 request per second per role per account (soft limit)
+→ boto3 credential refresh: happens ~15 min before expiry
+→ For 1000+ instances: consider STS regional endpoints to distribute load
+
+COST:
+→ IAM Roles: FREE
+→ STS API calls: FREE
+→ Instance Profiles: FREE
+→ Literally zero cost for better security</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY THE ROLE IS WORKING:
+</span>
+1. Check current identity:
+   → aws sts get-caller-identity
+   → Output:
+     {
+       "UserId": "AROA3XFRBF23ZCQHMOXYZ:i-0abc123def456",
+       "Account": "123456789012",
+       "Arn": "arn:aws:sts::123456789012:assumed-role/QuickCart-EC2-S3ReadWrite-Prod/i-0abc123def456"
+     }
+   → If you see "assumed-role" → role is working
+   → If you see "user/SomeIAMUser" → still using access keys
+
+2. Check which credential source boto3 is using:
+   → session = boto3.Session()
+   → credentials = session.get_credentials()
+   → print(credentials.method)
+   → Expected: "iam-role"
+   → If "shared-credentials-file" → old keys still present
+
+3. View temporary credentials (for debugging only):
+   → curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
+   → Returns role name
+   → curl http://169.254.169.254/latest/meta-data/iam/security-credentials/{role-name}
+   → Returns: AccessKeyId, SecretAccessKey, Token, Expiration
+   → NEVER log these — for debugging only
+
+4. CloudTrail audit:
+   → Every API call logged with:
+     - sourceIPAddress: EC2 instance's private/public IP
+     - userIdentity.arn: includes instance ID
+     - eventTime, eventName, resources
+   → Can trace exactly which instance did what, when
+
+5. IAM Policy Simulator:
+   → Console: IAM → Policy Simulator
+   → Select role → select S3 actions → test against resource ARN
+   → Shows Allow/Deny without actually calling S3</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(6)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create IAM Role with Trust Policy and Permission Policy</h3>
+
+<h3>Step 2: Attach Instance Profile to Running EC2 Instance</h3>
+
+<h3>Step 3: Cleanup Script — Remove Old Credentials from EC2</h3>
+
+<h3>Step 4: Verify from Python — Which Credential Source Is Active</h3>
+
+<h3>Step 5: Updated Upload Script — Zero Code Change Needed</h3>
+
+<h3>Step 6: Deactivate and Delete Old IAM User Access Keys</h3>
+
+<h3>Step 7: Permanently Delete Keys After Observation Period</h3>
+
+<h3>Step 8: CloudTrail Query — Audit Who Did What</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE MIGRATION SEQUENCE</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 1: Create IAM Role + Instance Profile (run from admin machine)</span><span>
+</span>python 06_01_create_iam_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 2: Attach Instance Profile to EC2 (run from admin machine)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Edit INSTANCE_ID first!</span><span>
+</span>python 06_02_attach_profile_to_ec2.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 3: SSH into EC2 and clean up old credentials</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">ssh</span><span> -i my-key.pem ec2-user@</span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span>EC2-IP</span><span class="token" style="color: rgb(57, 58, 52);">&gt;</span><span>
+</span><span></span><span class="token" style="color: rgb(57, 58, 52);">bash</span><span> 06_03_cleanup_old_credentials.sh
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 4: Verify credential source (run ON the EC2 instance)</span><span>
+</span>python 06_04_verify_credential_source.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 5: Test upload with role (run ON the EC2 instance)</span><span>
+</span><span>python 03_generate_test_data.py    </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># From Project 1</span><span>
+</span>python 06_05_upload_with_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 6: Deactivate old IAM user keys (run from admin machine)</span><span>
+</span>python 06_06_deactivate_old_keys.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 7: Wait 7 days, monitor CloudTrail</span><span>
+</span>python 06_08_audit_role_usage.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># STEP 8: After 7 days clean — permanently delete old keys</span><span>
+</span>python 06_07_delete_old_keys.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED VERIFICATION OUTPUT:
+</span>
+============================================================
+🔐 CREDENTIAL SOURCE VERIFICATION
+============================================================
+
+📋 Credential Details:
+   Method:           iam-role
+   Access Key ID:    ASIAXYZ1...AB12
+   Key Type:         TEMPORARY (starts with ASIA) ✅
+   Session Token:    FwoGZXIvYXdzEBYa... (present) ✅
+
+📋 Caller Identity:
+   Account:          123456789012
+   ARN:              arn:aws:sts::123456789012:assumed-role/QuickCart-EC2-S3ReadWrite-Prod/i-0abc123def456
+   User ID:          AROA3XFRBF23ZCQHMOXYZ:i-0abc123def456
+
+✅ CONFIRMED: Using IAM Role
+   Role Name:        QuickCart-EC2-S3ReadWrite-Prod
+   Instance ID:      i-0abc123def456
+
+============================================================
+📦 S3 ACCESS TEST
+============================================================
+
+🧪 Test 1: ListBucket (s3:ListBucket)
+   ✅ PASS — Found 3 objects
+
+🧪 Test 2: PutObject (s3:PutObject)
+   ✅ PASS — Wrote to s3://quickcart-raw-data-prod/test/credential_verification_test.txt
+
+🧪 Test 3: GetObject (s3:GetObject)
+   ✅ PASS — Read back: 'Credential test at 2025-01-15T14:30:22'
+
+🧪 Test 4: DeleteObject (should FAIL — not in policy)
+   ✅ CORRECTLY DENIED — least privilege working!</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ NEVER hardcode AWS credentials — not in code, not in files, not in env vars
+→ IAM Roles provide TEMPORARY, AUTO-ROTATED, SCOPED credentials
+→ Instance Profile = wrapper that delivers a role to EC2
+→ boto3 credential chain has 8 priorities — Role is #7 (ensure nothing above it)
+→ ALWAYS delete ~/.aws/credentials when using Instance Profiles
+→ ALWAYS enforce IMDSv2 — IMDSv1 is the #1 EC2 credential theft vector
+→ Trust Policy (who can assume) and Permission Policy (what they can do) are SEPARATE
+→ Deactivate before delete — 7-day observation prevents surprises
+→ AKIA = permanent key (bad), ASIA = temporary key (good)
+→ STS is the engine behind ALL temporary credentials in AWS
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: Upload script works IDENTICALLY — zero code change
+→ Project 3: Bucket policies (resource-based) + IAM role policies (identity-based)
+   work TOGETHER — both must Allow, neither can Deny
+→ Project 5: EC2 instance is the compute layer — now it has secure identity
+
+CONNECTION TO FUTURE PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 7: Deep dive into IAM policy evaluation logic
+   (how AWS decides Allow vs Deny when multiple policies interact)
+→ Project 21: Redshift COPY needs IAM Role too (same concept, different service)
+→ Project 25: Glue ETL jobs need IAM Role (same concept, Glue service principal)
+→ Project 31: Glue JDBC connections need role with VPC permissions
+→ Project 56: Cross-account access: EC2 role in Account A assumes role in Account B
+   (sts:AssumeRole chain — builds directly on this project)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ S3 bucket with proper structure (Project 1)
+→ Versioning protecting against accidental deletes (Project 2)
+→ Bucket policies controlling department access (Project 3)
+→ Lifecycle rules managing storage costs (Project 4)
+→ EC2 instance running scripts (Project 5)
+→ IAM Role providing secure, keyless authentication (Project 6) ← YOU ARE HERE
+
+NEXT PROBLEM:
+→ The CTO asks: "We have 3 roles, 5 bucket policies, and 2 IAM groups now.
+   When someone gets AccessDenied, HOW do I figure out WHY?"
+→ Security auditor asks: "Walk me through exactly how AWS decides
+   Allow vs Deny when a request has 4 overlapping policies."
+→ Developer asks: "I have Admin access on my IAM user but STILL get
+   AccessDenied on one bucket — how is that possible?"
+
+→ Project 7: "Manager Asks: Who Can Access What and Why?"
+→ Introduces: IAM Policy Evaluation Logic, Explicit Deny vs Implicit Deny,
+   Policy boundaries, Permission Boundaries, SCPs,
+   the COMPLETE decision flowchart AWS uses for every API call</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-5.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 6 of 80</span>
+    <span class="nav-project-title">PYTHON SCRIPT ON EC2 MUST READ/WRITE S3 WITHOUT HARDCODED KEYS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-7.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-7.html") window.location = "project-7.html";
+  if (e.key === 'ArrowLeft' && "project-5.html") window.location = "project-5.html";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 2: INTERN ACCIDENTALLY DELETES PRODUCTION FILE FROM S3 — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:2%"></div></div>
+<div id="progress-label">2%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 2 of 80</div>
+  <div class="project-title">INTERN ACCIDENTALLY DELETES PRODUCTION FILE FROM S3</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — same startup from Project 1
+</span>Timeline: 3 months after Project 1 deployment
+Situation:
+→ 270+ CSV files now living in s3://quickcart-raw-data-prod/
+→ Upload script from Project 1 runs reliably every night
+→ New intern joins the data team
+→ Intern is tasked: "Delete the TEST files from the dev folder"
+→ Intern runs:
+   aws s3 rm s3://quickcart-raw-data-prod/daily_exports/orders/ --recursive
+→ PRODUCTION orders folder — not dev
+→ 90 days of orders CSVs: GONE
+→ No backup exists anywhere else
+→ CTO: "Can we recover this?"
+→ Current answer: NO — versioning was never enabled
+→ Real question: How do we make sure this NEVER happens again?</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHAT actually happened inside S3
+</span>→ S3 DeleteObject is a PERMANENT operation (without versioning)
+→ Once deleted, the object bytes are removed from all 3+ AZs
+→ No recycle bin, no undo, no "restore from trash"
+→ AWS Support CANNOT recover unversioned deleted objects
+
+Step 2: Understand the PROTECTION layers available
+→ Layer 1: Versioning — keeps every version of every object
+→ Layer 2: MFA Delete — requires MFA token to permanently delete
+→ Layer 3: Object Lock — WORM (Write Once Read Many) — legal hold
+→ Layer 4: Lifecycle Rules — auto-manage old versions
+→ Layer 5: Bucket Policy — restrict delete permissions
+
+Step 3: Understand the COST of protection
+→ Versioning: every version stored = extra storage cost
+→ Without lifecycle rules: old versions accumulate forever
+→ Need both: versioning ON + lifecycle to expire old versions
+
+Step 4: Design the solution
+→ Enable versioning (can never be fully disabled once enabled — only suspended)
+→ Add lifecycle rules to manage version accumulation
+→ Restrict s3:DeleteObject permission via IAM (Project 3 covers this deeply)
+→ Optionally: MFA Delete for critical data</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+BEFORE (Project 1 — no protection):
+
+  DELETE request
+       │
+       ▼
+  S3 Object ──→ PERMANENTLY GONE ──→ NO RECOVERY
+  
+
+AFTER (Project 2 — versioning enabled):
+
+  DELETE request
+       │
+       ▼
+  S3 adds "Delete Marker" (a tombstone)
+       │
+       │  Original object versions STILL EXIST
+       ▼
+  ┌─────────────────────────────────────────────────┐
+  │  Key: daily_exports/orders/orders_20250101.csv  │
+  │                                                  │
+  │  Version v3 ← DELETE MARKER (latest — "deleted")│
+  │  Version v2 ← previous upload (STILL EXISTS)    │
+  │  Version v1 ← first upload (STILL EXISTS)       │
+  │                                                  │
+  │  GET request → returns 404 (sees delete marker)  │
+  │  But: v1 and v2 are FULLY RECOVERABLE           │
+  └─────────────────────────────────────────────────┘
+
+RECOVERY:
+→ Option A: Delete the delete marker → latest version reappears
+→ Option B: GET specific version ID → download any old version</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Enable Versioning Only
+</span>→ Simplest protection
+→ All versions kept indefinitely
+→ Risk: storage cost grows unbounded
+
+Option B: Versioning + Lifecycle Rules (RECOMMENDED)
+→ Keep current + last 3 versions
+→ Auto-delete versions older than 90 days
+→ Move non-current versions to cheaper storage after 30 days
+→ Balanced protection + cost control
+
+Option C: Versioning + MFA Delete
+→ Root account must enable MFA Delete via CLI
+→ Permanent version deletion requires MFA token
+→ Extremely strong but operationally heavy
+
+Option D: S3 Object Lock (WORM)
+→ Legal/compliance requirement (SEC Rule 17a-4, HIPAA)
+→ Objects literally CANNOT be deleted for a defined retention period
+→ Even root account cannot override in Compliance mode
+→ Overkill for QuickCart — designed for regulated industries
+
+DECISION: Option B — Versioning + Lifecycle Rules
+→ Reason: protects against accidental deletion
+→ Controls cost via automatic version expiration
+→ Can always add MFA Delete later for critical datasets</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Enable versioning IMMEDIATELY on production bucket
+</span>   → One API call: put_bucket_versioning(Status='Enabled')
+   → Takes effect for ALL new operations instantly
+   → Existing objects don't get version IDs until next PUT/DELETE
+
+2. Create lifecycle rules with CLEAR strategy:
+   → Rule 1: Transition non-current versions to S3-IA after 30 days
+   → Rule 2: Permanently delete non-current versions after 90 days
+   → Rule 3: Clean up incomplete multipart uploads after 7 days
+   → Rule 4: Remove expired delete markers (keeps bucket clean)
+
+3. Verify versioning status PROGRAMMATICALLY after enabling
+   → get_bucket_versioning() must return {'Status': 'Enabled'}
+
+4. Test the recovery process BEFORE a real disaster
+   → Upload file → Delete it → Recover it → Confirm contents match
+   → Document the recovery runbook
+
+5. Add CloudTrail logging for DeleteObject events
+   → Know WHO deleted WHAT and WHEN
+   → Covered deeper in Project 7 (IAM)
+
+6. Educate the team:
+   → "Delete markers are NOT permanent deletions"
+   → "Versioned buckets have TWO types of delete"
+   → "Always verify which bucket/prefix before --recursive"
+
+7. Separate environments STRICTLY
+   → Production: quickcart-raw-data-prod
+   → Development: quickcart-raw-data-dev
+   → NEVER same bucket with prefix-based separation for environments</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT assume versioning protects against EVERYTHING
+</span>   → If someone deletes a specific VERSION ID — that version is PERMANENTLY gone
+   → Versioning protects against simple DELETE, not version-targeted DELETE
+   → MFA Delete protects against version-targeted DELETE
+
+2. DO NOT enable versioning without lifecycle rules
+   → Every PUT overwrites creates a new version
+   → Daily 62MB × 365 days = 22.6 GB of CURRENT data
+   → But with 5 versions each: 113 GB of VERSIONED data
+   → Without lifecycle: versions accumulate FOREVER
+
+3. DO NOT confuse "Suspended" with "Disabled"
+   → Versioning has THREE states: Unversioned → Enabled → Suspended
+   → Once Enabled, you can NEVER go back to Unversioned
+   → Suspended: stops creating new versions but KEEPS existing ones
+   → Existing versioned objects remain and still incur cost
+
+4. DO NOT use Object Lock unless legally required
+   → Once enabled on bucket creation, CANNOT be disabled
+   → Compliance mode: even root account cannot delete
+   → Governance mode: can be overridden with special permission
+   → Wrong choice → you're locked into paying for storage you can't free
+
+5. DO NOT skip testing recovery
+   → "We have versioning" means nothing if nobody knows how to recover
+   → Run a disaster recovery drill quarterly
+
+6. DO NOT grant s3:DeleteObject to broad IAM groups
+   → Intern had permission because everyone used the same admin role
+   → Principle of Least Privilege (Project 3)
+
+7. DO NOT rely on versioning as your ONLY backup strategy
+   → Versioning protects within ONE bucket in ONE region
+   → Region failure = all versions gone
+   → Cross-region replication (Project 47) is the true DR solution</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────┬────────────────────────┬─────────────────────────────────────┐
+</span>│ Threat                       │ Protection             │ How It Helps                        │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Accidental delete            │ Versioning             │ Delete marker placed, old version   │
+│ (intern runs rm)             │                        │ recoverable                         │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Accidental overwrite         │ Versioning             │ Previous version preserved,         │
+│ (script re-uploads with      │                        │ retrievable by version ID           │
+│ wrong data)                  │                        │                                     │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Malicious permanent delete   │ MFA Delete             │ Requires physical MFA device +      │
+│ (disgruntled employee)       │                        │ root credentials to delete versions  │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Compliance/legal hold        │ Object Lock            │ WORM — literally cannot delete       │
+│ (SEC, HIPAA, SOX)            │ (Compliance mode)      │ until retention period expires       │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Cost explosion from old      │ Lifecycle Rules        │ Auto-transition/expire non-current   │
+│ versions                     │                        │ versions after N days                │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Region failure               │ Cross-Region           │ Async copy to another region         │
+│                              │ Replication (CRR)      │ (Project 47)                        │
+├──────────────────────────────┼────────────────────────┼─────────────────────────────────────┤
+│ Unauthorized access          │ Bucket Policy + IAM    │ Deny delete actions for non-admin    │
+│ leading to deletion          │                        │ (Project 3)                         │
+└──────────────────────────────┴────────────────────────┴─────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT enable versioning on TEMPORARY/TRANSIENT buckets
+</span>   → Example: ETL staging bucket that holds files for 5 minutes
+   → Versioning adds overhead and cost for data you don't need to keep
+   → Use: lifecycle rule with 1-day expiration instead
+
+2. DO NOT use Object Lock for non-regulated data
+   → QuickCart's CSV dumps don't need SEC-compliant WORM
+   → Object Lock adds operational complexity and cost
+   → Can't be disabled once enabled on the bucket
+
+3. DO NOT use MFA Delete for buckets accessed by automation
+   → Glue jobs, Lambda, Step Functions CANNOT provide MFA tokens
+   → MFA Delete = only root user with physical device can delete
+   → Use for: audit logs, compliance archives
+   → Don't use for: ETL pipelines, active data lakes
+
+4. DO NOT use versioning as a REPLACEMENT for proper data pipeline design
+   → "We have versioning so we don't need idempotent writes"
+   → Wrong — versioning saves you from disasters, not bad architecture
+
+5. DO NOT keep versions indefinitely for high-churn data
+   → A file overwritten 100 times/day = 100 versions/day
+   → 365 days = 36,500 versions of ONE key
+   → MUST have lifecycle rules</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                    S3 VERSIONING — INTERNAL MECHANICS                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  VERSIONING STATES (per bucket):                                            │
+│  ┌───────────────┐     enable     ┌───────────┐    suspend    ┌──────────┐ │
+│  │ Unversioned   │ ──────────────→│  Enabled  │ ────────────→│ Suspended│ │
+│  │ (default)     │                │           │              │          │  │
+│  └───────────────┘                └───────────┘              └──────────┘  │
+│         ▲                              │                          │        │
+│         │          CANNOT go back      │    can re-enable         │        │
+│         └──────────── ✘ ───────────────┘◄─────────────────────────┘        │
+│                                                                             │
+│  VERSION ID MECHANICS:                                                      │
+│                                                                             │
+│  Before versioning enabled:                                                 │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ Key: orders_20250101.csv                         │                       │
+│  │ Version ID: null                                  │                       │
+│  │ Data: [original bytes]                            │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+│  After versioning enabled + first new upload:                               │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ Key: orders_20250101.csv                         │                       │
+│  │                                                   │                       │
+│  │ Version: aaaBBBccc111 (latest) ← GET returns this│                       │
+│  │   Data: [new bytes]                               │                       │
+│  │   IsLatest: true                                  │                       │
+│  │                                                   │                       │
+│  │ Version: null (original — pre-versioning)         │                       │
+│  │   Data: [original bytes]                          │                       │
+│  │   IsLatest: false                                 │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+│  DELETE OPERATION (simple — no version ID specified):                        │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ S3 does NOT remove any data                      │                       │
+│  │ Instead: inserts a DELETE MARKER as latest version│                       │
+│  │                                                   │                       │
+│  │ Version: delMARKER999 (latest) ← DELETE MARKER    │                       │
+│  │   IsLatest: true                                  │                       │
+│  │   Size: 0 bytes                                   │                       │
+│  │                                                   │                       │
+│  │ Version: aaaBBBccc111                             │                       │
+│  │   Data: [new bytes] ← STILL EXISTS                │                       │
+│  │   IsLatest: false                                 │                       │
+│  │                                                   │                       │
+│  │ Version: null                                      │                       │
+│  │   Data: [original bytes] ← STILL EXISTS           │                       │
+│  │                                                   │                       │
+│  │ GET orders_20250101.csv → 404 Not Found           │                       │
+│  │ GET orders_20250101.csv?versionId=aaaBBBccc111    │                       │
+│  │   → 200 OK + [new bytes]  ← RECOVERY!            │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+│  DELETE OPERATION (permanent — specific version ID):                         │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ DELETE orders_20250101.csv?versionId=aaaBBBccc111│                       │
+│  │                                                   │                       │
+│  │ → That SPECIFIC version is PERMANENTLY deleted    │                       │
+│  │ → Other versions unaffected                       │                       │
+│  │ → THIS is what MFA Delete protects against        │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+│  RECOVERY — TWO METHODS:                                                    │
+│                                                                             │
+│  Method 1: Delete the delete marker                                         │
+│  → DELETE key?versionId=delMARKER999                                        │
+│  → Previous version becomes "latest" again                                  │
+│  → Object "reappears" in normal GET                                         │
+│                                                                             │
+│  Method 2: Copy specific version to same key                                │
+│  → COPY source=key?versionId=aaaBBBccc111 → destination=same key           │
+│  → Creates NEW version with old data                                        │
+│  → Object accessible via normal GET                                         │
+│                                                                             │
+│  LIFECYCLE RULES — HOW THEY INTERACT:                                       │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ NoncurrentVersionTransition:                      │                       │
+│  │   After 30 days → move to S3-IA ($0.0125/GB)     │                       │
+│  │                                                   │                       │
+│  │ NoncurrentVersionExpiration:                       │                       │
+│  │   After 90 days → permanently delete              │                       │
+│  │                                                   │                       │
+│  │ Timeline for a non-current version:               │                       │
+│  │                                                   │                       │
+│  │ Day 0        Day 30          Day 90               │                       │
+│  │   │            │               │                  │                       │
+│  │   ▼            ▼               ▼                  │                       │
+│  │ [STANDARD] → [S3-IA] → [PERMANENTLY DELETED]     │                       │
+│  │ $0.023/GB    $0.0125/GB    $0.00/GB               │                       │
+│  │                                                   │                       │
+│  │ ExpiredObjectDeleteMarker: true                   │                       │
+│  │ → Auto-cleans delete markers with no versions     │                       │
+│  │ → Keeps bucket listing clean                      │                       │
+│  │                                                   │                       │
+│  │ AbortIncompleteMultipartUpload: 7 days            │                       │
+│  │ → Failed multipart uploads consume storage        │                       │
+│  │ → This is a HIDDEN cost most people miss          │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+│  STORAGE COST IMPACT:                                                       │
+│  → Each version is stored as a COMPLETE copy (not diff/delta)               │
+│  → 50MB file with 5 versions = 250MB billed                                │
+│  → Lifecycle rules are the ONLY way to control this                         │
+│  → S3 Storage Lens or S3 Analytics can show version cost breakdown          │
+│                                                                             │
+│  MFA DELETE — HOW IT WORKS:                                                 │
+│  ┌──────────────────────────────────────────────────┐                       │
+│  │ Can ONLY be enabled by ROOT account via CLI       │                       │
+│  │ Cannot be enabled via Console or CloudFormation   │                       │
+│  │                                                   │                       │
+│  │ When enabled, these operations require MFA:       │                       │
+│  │   1. Changing bucket versioning state             │                       │
+│  │   2. Permanently deleting a specific version      │                       │
+│  │                                                   │                       │
+│  │ MFA token must be passed as HTTP header:          │                       │
+│  │   x-amz-mfa: arn:aws:iam::ACCOUNT:mfa/device CODE│                      │
+│  │                                                   │                       │
+│  │ Normal DELETE (adds delete marker) does NOT       │                       │
+│  │ require MFA — only permanent version deletion     │                       │
+│  └──────────────────────────────────────────────────┘                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "I enabled versioning but old objects have version ID = null"
+</span>→ Cause: Objects uploaded BEFORE versioning have no version ID
+→ They get version ID "null" (literal string)
+→ A DELETE on these objects puts a delete marker but the "null" version persists
+→ A version-targeted DELETE on versionId=null permanently removes it
+
+PITFALL 2: "Versioning is enabled but storage costs tripled"
+→ Cause: No lifecycle rules — every version kept forever
+→ Upload script re-uploads same file daily (even if unchanged)
+→ 90 days × 62MB/day = 5.58GB current + 5.58GB × N versions
+→ Fix: lifecycle rules to expire non-current versions
+
+PITFALL 3: "I suspended versioning thinking it deletes old versions"
+→ Suspended only STOPS creating new versions
+→ All existing versions REMAIN and continue costing money
+→ Must explicitly delete old versions OR use lifecycle expiration
+
+PITFALL 4: "I deleted the delete marker but file still shows old data"
+→ Cause: Multiple delete markers stacked (deleted the file multiple times)
+→ Must delete ALL delete markers to expose the latest data version
+→ Or: copy the specific version you want back to the same key
+
+PITFALL 5: "Lifecycle rule set to expire in 1 day but versions still exist"
+→ Cause: Lifecycle rules run ONCE per day (not real-time)
+→ S3 processes lifecycle rules asynchronously in batches
+→ May take 24-48 hours for rules to fully execute
+→ Not suitable for real-time cleanup
+
+PITFALL 6: "Cross-region replication not copying delete markers"
+→ By DEFAULT, delete markers are NOT replicated
+→ Must explicitly enable "Delete marker replication" in replication config
+→ Version-targeted deletes are NEVER replicated (safety measure)
+
+PITFALL 7: "MFA Delete locked us out of our own bucket"
+→ Cause: root account MFA device lost/broken
+→ Only root account can disable MFA Delete
+→ Must contact AWS Support with account verification to recover
+→ ALWAYS have backup MFA device for root account</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VERSIONING COST MODEL:
+</span>
+Scenario: QuickCart grows to 200 files/day × 50MB average
+
+WITHOUT lifecycle rules:
+→ Day 1:   200 files × 50MB = 10 GB (current)
+→ Day 30:  10 GB current + 290 GB non-current = 300 GB
+→ Day 365: 10 GB current + 3,640 GB non-current = 3,650 GB
+→ Cost: 3,650 GB × $0.023 = $83.95/month (JUST versions)
+
+WITH lifecycle rules (transition after 30d, expire after 90d):
+→ Day 1:   10 GB at Standard
+→ Day 30:  10 GB Standard + 290 GB transitioning to S3-IA
+→ Day 90:  10 GB Standard + 580 GB S3-IA + older expired
+→ Steady state: ~10 GB Standard + ~600 GB S3-IA
+→ Cost: (10 × $0.023) + (600 × $0.0125) = $0.23 + $7.50 = $7.73/month
+→ SAVINGS: ~91% compared to no lifecycle rules
+
+VERSION LISTING PERFORMANCE:
+→ list_object_versions returns MAX 1000 entries per call
+→ Bucket with millions of versions = many paginated calls
+→ Each version is a separate index entry in S3's metadata store
+→ Heavy versioning + no cleanup = slow listing operations
+
+LIFECYCLE RULE LIMITS:
+→ Max 1000 lifecycle rules per bucket
+→ Each rule can apply to specific prefix or tag filter
+→ Rules evaluated once per day per object
+→ Large buckets (billions of objects) may take days for full evaluation</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO KNOW WHAT'S HAPPENING:
+</span>
+1. Check versioning status:
+   → get_bucket_versioning() → Status: Enabled/Suspended
+   → If empty response → versioning was never enabled
+
+2. List all versions of an object:
+   → list_object_versions(Prefix='specific/key')
+   → Shows every version + delete markers + timestamps
+   → IsLatest=true marks the current version
+
+3. Identify storage consumed by versions:
+   → S3 Storage Lens: dashboard showing current vs non-current bytes
+   → S3 Inventory: CSV/Parquet report of every object + version
+   → aws s3api list-object-versions + sum ContentLength
+
+4. Monitor lifecycle rule execution:
+   → S3 Storage Lens: track transitions and expirations over time
+   → CloudTrail: LifecycleExpiration events logged
+   → No real-time notification when lifecycle deletes a version
+
+5. Audit deletion events:
+   → CloudTrail: DeleteObject event shows requester + IP + key
+   → Enable S3 server access logs for per-request detail
+   → Combine with CloudWatch Logs for alerting (Project 54)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(2)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Enable Versioning on Existing Bucket</h3>
+
+<h3>Step 2: Configure Lifecycle Rules</h3>
+
+<h3>Step 3: Simulate the Disaster — Delete &amp; Recover</h3>
+
+<h3>Step 4: Permanently Delete a Specific Version (For Understanding Only)</h3>
+
+<h3>Step 5: Execution Flow</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT OF DISASTER DRILL:
+</span>
+======================================================================
+🎯 DISASTER SIMULATION &amp; RECOVERY DRILL
+======================================================================
+
+📌 PHASE 1: Upload test file (2 versions)
+📤 Uploading test file: daily_exports/orders/test_recovery_20250115.csv
+   ✅ Uploaded — VersionId: abc123def456...
+📤 Uploading SECOND version
+   ✅ Uploaded v2 — VersionId: ghi789jkl012...
+
+--- State after uploads ---
+  Key                                      VersionId                 IsLatest   Type
+  test_recovery_20250115.csv               ghi789jkl012...           True       OBJECT
+  test_recovery_20250115.csv               abc123def456...           False      OBJECT
+
+💥 PHASE 2: Simulate accidental deletion
+🗑️  SIMULATING ACCIDENTAL DELETE
+   Delete Marker Created: True
+   ✅ File appears DELETED (404) — as intern would see
+
+--- State after deletion ---
+  test_recovery_20250115.csv               mno345pqr678...           True       DELETE MARKER
+  test_recovery_20250115.csv               ghi789jkl012...           False      OBJECT
+  test_recovery_20250115.csv               abc123def456...           False      OBJECT
+
+🔧 PHASE 3: Recover the file
+   Deleting delete marker: mno345pqr678...
+   ✅ FILE RECOVERED!
+
+--- State after recovery ---
+  test_recovery_20250115.csv               ghi789jkl012...           True       OBJECT
+  test_recovery_20250115.csv               abc123def456...           False      OBJECT
+
+✅ DRILL COMPLETE</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 versioning keeps EVERY version of EVERY object
+→ Simple DELETE adds a "delete marker" — does NOT destroy data
+→ Version-targeted DELETE permanently removes a specific version
+→ Recovery: delete the delete marker OR copy a specific version
+→ Lifecycle rules are MANDATORY with versioning to control costs
+→ Versions are FULL copies (not diffs) — each one costs full storage
+→ Versioning state: Unversioned → Enabled → Suspended (never back)
+→ MFA Delete = extra layer for permanent version deletion
+→ Incomplete multipart uploads are hidden storage cost — clean them
+
+CONNECTING TO PROJECT 1:
+━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: we uploaded files to S3 (bucket creation, upload, verify)
+→ Project 2: we protected those files (versioning, lifecycle, recovery)
+→ Together: data is stored AND recoverable
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 3: The intern had access because EVERYONE had full S3 access
+   → How to control WHO can do WHAT on WHICH prefix
+   → Bucket Policies, IAM Policies, prefix-based restrictions
+   → Principle of Least Privilege
+
+→ Project 4: Old versions now transition to S3-IA after 30 days
+   → But what about the CURRENT versions of 6-month-old files?
+   → Storage Classes, Intelligent Tiering, Glacier deep dive</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>✅ S3 bucket with organized prefix structure (Project 1)
+✅ Versioning enabled with lifecycle rules (Project 2)
+
+BUT: The root cause was never addressed
+→ The intern had FULL admin access to the production bucket
+→ Every team member uses the same IAM policy: s3:*
+→ Marketing can delete engineering files
+→ Engineering can delete finance reports
+
+CTO: "Can we make it so interns can only READ data,
+      and only the pipeline service account can WRITE/DELETE?"
+
+YOU: "Yes — that's IAM Policies + S3 Bucket Policies.
+      We need to implement Least Privilege access."
+
+→ Project 3: "Finance Team Wants Only Their Department to Access a Folder"
+→ Introduces: S3 Bucket Policies, IAM Policies, Prefix-Based Access Control</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="7" ========== -->
+<div class="chat-message" data-index="7"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-1.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 2 of 80</span>
+    <span class="nav-project-title">INTERN ACCIDENTALLY DELETES PRODUCTION FILE FROM S3</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-3.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-3.html") window.location = "project-3.html";
+  if (e.key === 'ArrowLeft' && "project-1.html") window.location = "project-1.html";
+});
+</script>
+</body>
+</html>

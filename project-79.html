@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 79: FULL MIGRATION — ON-PREM MARIADB → AWS DATA PLATFORM (MULTI- — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:99%"></div></div>
+<div id="progress-label">99%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 79 of 80</div>
+  <div class="project-title">FULL MIGRATION — ON-PREM MARIADB → AWS DATA PLATFORM (MULTI-ACCOUNT, MULTI-LAYER)</div>
+  <div class="project-tags"><span class="project-tag">MariaDB</span><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — public company, board-approved cloud migration
+</span>Legacy System: On-premises MariaDB cluster in a co-located data center
+
+CURRENT STATE:
+┌──────────────────────────────────────────────────────────────────────────┐
+│                     ON-PREMISES DATA CENTER                              │
+│                                                                          │
+│  MariaDB Primary (10.0.1.10)                                             │
+│  ├── Database: ecommerce (28 tables, 380GB)                              │
+│  │   ├── orders           — 450M rows, 120GB, 12 years                   │
+│  │   ├── order_items      — 1.2B rows, 95GB                              │
+│  │   ├── customers        — 8M rows, 12GB                                │
+│  │   ├── products         — 500K rows, 2GB                               │
+│  │   ├── inventory        — 500K rows, 1GB                               │
+│  │   ├── payments         — 380M rows, 85GB                              │
+│  │   ├── shipping         — 350M rows, 55GB                              │
+│  │   └── ... (21 more reference/lookup tables, 10GB total)               │
+│  │                                                                        │
+│  ├── Database: payments (10 tables, 90GB)                                │
+│  │   ├── transactions     — 500M rows, 65GB                              │
+│  │   ├── refunds          — 45M rows, 15GB                               │
+│  │   └── ... (8 more tables, 10GB total)                                 │
+│  │                                                                        │
+│  └── Database: analytics (7 tables, 30GB)                                │
+│      ├── daily_aggregates — 15M rows, 20GB                               │
+│      └── ... (6 more pre-computed tables, 10GB total)                    │
+│                                                                          │
+│  MariaDB Read Replica (10.0.1.11)                                        │
+│  └── Used by reporting tools — cannot be disrupted                       │
+│                                                                          │
+│  Total: 45 tables, ~500GB, 12 years of history                           │
+│  Daily growth: ~2GB/day (~5M new rows across all tables)                 │
+│  Peak write TPS: 3,000 (during flash sales)                              │
+│  Applications: 4 web apps, 2 mobile apps, 3 internal tools              │
+│  Reporting: 15 analysts using read replica                               │
+└──────────────────────────────────────────────────────────────────────────┘
+
+TARGET STATE (already built in Projects 1-78):
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          AWS DATA PLATFORM                               │
+│                                                                          │
+│  Account A (Ingestion — 111111111111)                                    │
+│  ├── DMS Replication Instance                                            │
+│  ├── S3 Bronze Layer: quickcart-bronze-prod                              │
+│  └── MariaDB on EC2 (operational replica for apps — Project 8)           │
+│                                                                          │
+│  Account B (Processing — 222222222222)                                   │
+│  ├── Glue ETL Jobs (transform bronze → silver → gold)                    │
+│  ├── Glue Data Catalog                                                   │
+│  ├── S3 Silver Layer: quickcart-silver-prod                              │
+│  ├── S3 Gold Layer: quickcart-gold-prod                                  │
+│  └── Lineage System (DynamoDB — Project 77)                              │
+│                                                                          │
+│  Account C (Serving — 333333333333)                                      │
+│  ├── Redshift Serverless (warehouse — Project 67)                        │
+│  ├── Athena (ad-hoc queries — Project 24)                                │
+│  ├── Redshift Spectrum (lake queries — Project 38)                       │
+│  └── SLA Monitoring (Project 78)                                         │
+│                                                                          │
+│  Account D (Governance — 444444444444)                                   │
+│  ├── Lake Formation (column-level security — Project 74)                 │
+│  ├── Lineage Central Store (Project 77)                                  │
+│  └── CloudTrail (audit — Project 77)                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+CONSTRAINTS:
+→ ZERO downtime for the on-prem applications during migration
+→ Data must be consistent — no gaps, no duplicates
+→ 8-week timeline (board deadline)
+→ Budget: $25K for migration, $8K/month ongoing
+→ Team: 3 data engineers, 1 DBA, 1 platform engineer
+→ Compliance: SOX audit trail, PII handling, data residency (us-east-2)
+→ SLA from Day 1 of cutover: 99.9% (Project 78)
+→ Lineage tracking from Day 1 (Project 77)
+→ Data quality validation before cutover (Project 68)</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Decompose migration into PHASES with clear milestones
+</span>
+  PHASE A — NETWORK &amp; CONNECTIVITY (Week 1)
+  → Establish network path: on-prem → AWS
+  → VPN or Direct Connect
+  → Security groups, route tables
+
+  PHASE B — INITIAL FULL LOAD (Week 2-3)
+  → DMS full load: on-prem MariaDB → S3 Bronze (Account A)
+  → 500GB over network — estimate transfer time
+  → Validate row counts match
+
+  PHASE C — CDC REPLICATION (Week 3-4)
+  → DMS CDC: capture ongoing changes from on-prem
+  → Stream changes to S3 Bronze as incremental files
+  → Ensure no data loss during transition
+
+  PHASE D — TRANSFORMATION PIPELINE (Week 4-6)
+  → Glue ETL: Bronze → Silver → Gold (Account B)
+  → Cross-account access: Account B reads Account A's S3 (Project 56)
+  → Lineage emission from Day 1 (Project 77)
+
+  PHASE E — SERVING LAYER (Week 5-6)
+  → Load Gold into Redshift Serverless (Account C)
+  → Create Athena views (Account C)
+  → Redshift Spectrum for lake queries (Account C)
+
+  PHASE F — VALIDATION &amp; QUALITY (Week 6-7)
+  → Data quality rules (Project 68)
+  → Row count reconciliation
+  → Business metric comparison
+  → User acceptance testing
+
+  PHASE G — CUTOVER &amp; MONITORING (Week 7-8)
+  → Switch applications to AWS
+  → Enable SLA monitoring (Project 78)
+  → Decommission on-prem read replica
+  → Keep on-prem primary as fallback for 30 days
+
+Step 2: Identify the CRITICAL PATH
+
+  Network → DMS Setup → Full Load → CDC → ETL → Redshift → Validation → Cutover
+  ↓
+  Any delay in DMS full load delays EVERYTHING
+  ↓
+  Mitigation: start CDC in parallel with full load (DMS supports this)
+
+Step 3: Identify RISKS and mitigations
+
+  ┌──────────────────────────┬────────────────────┬────────────────────────────┐
+  │ Risk                     │ Probability        │ Mitigation                 │
+  ├──────────────────────────┼────────────────────┼────────────────────────────┤
+  │ 500GB transfer too slow  │ MEDIUM             │ Direct Connect or snowball │
+  │ CDC misses transactions  │ LOW                │ DMS validation + reconcile │
+  │ Schema differences break │ HIGH               │ Schema mapping doc upfront │
+  │  Glue jobs               │                    │ (Project 45 evolution)     │
+  │ Redshift can't handle    │ MEDIUM             │ Performance testing Week 5 │
+  │  query patterns          │                    │ (Project 39 optimization)  │
+  │ Applications break at    │ HIGH               │ Blue-green cutover         │
+  │  cutover                 │                    │ (30-day parallel run)      │
+  │ Budget overrun           │ MEDIUM             │ Cost tracking from Day 1   │
+  │                          │                    │ (Project 69 optimization)  │
+  └──────────────────────────┴────────────────────┴────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE MIGRATION ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                 │
+│  ON-PREMISES                          AWS CLOUD                                 │
+│  ══════════                          ═════════                                  │
+│                                                                                 │
+│  ┌──────────────┐    VPN/DX    ┌─────────────────────────────────────────────┐  │
+│  │ MariaDB      │◄═══════════►│  ACCOUNT A (Ingestion)                      │  │
+│  │ Primary      │    ┌────────│                                             │  │
+│  │ (10.0.1.10)  │    │        │  ┌────────────────┐   ┌──────────────────┐  │  │
+│  │              │────┤  DMS   │  │ DMS Replication │──→│ S3 Bronze Layer  │  │  │
+│  │  ecommerce   │    │  CDC   │  │ Instance        │   │                  │  │  │
+│  │  payments    │    │        │  │ (dms.r5.2xlarge)│   │ /raw/ecommerce/  │  │  │
+│  │  analytics   │    └────────│  └────────────────┘   │   /orders/       │  │  │
+│  └──────────────┘             │                        │     /LOAD00001/  │  │  │
+│                               │                        │     /CDC/        │  │  │
+│  ┌──────────────┐             │                        │   /customers/    │  │  │
+│  │ MariaDB      │             │                        │   /payments/     │  │  │
+│  │ Read Replica │             │                        │ /raw/payments/   │  │  │
+│  │ (10.0.1.11)  │             │                        │ /raw/analytics/  │  │  │
+│  │              │             │                        └──────────────────┘  │  │
+│  │ (keep until  │             │                               │              │  │
+│  │  cutover)    │             └───────────────────────────────┼──────────────┘  │
+│  └──────────────┘                                             │                 │
+│                                                               │ Cross-Account   │
+│                                                               │ S3 Access       │
+│                               ┌───────────────────────────────┼──────────────┐  │
+│                               │  ACCOUNT B (Processing)       │              │  │
+│                               │                               ▼              │  │
+│                               │  ┌────────────────────────────────────────┐  │  │
+│                               │  │         GLUE ETL PIPELINES             │  │  │
+│                               │  │                                        │  │  │
+│                               │  │  ┌──────────┐  ┌──────────┐  ┌──────┐ │  │  │
+│                               │  │  │ Crawlers │→│ ETL Jobs │→│ DQ    │ │  │  │
+│                               │  │  │ (schema) │  │ (clean)  │  │ Rules│ │  │  │
+│                               │  │  └──────────┘  └──────────┘  └──────┘ │  │  │
+│                               │  │       │              │           │     │  │  │
+│                               │  │       ▼              ▼           ▼     │  │  │
+│                               │  │  ┌──────────┐  ┌──────────┐  ┌──────┐ │  │  │
+│                               │  │  │ Catalog  │  │ S3 Silver│  │ S3   │ │  │  │
+│                               │  │  │ (Glue DB)│  │ Layer    │  │ Gold │ │  │  │
+│                               │  │  └──────────┘  └──────────┘  └──────┘ │  │  │
+│                               │  └──────────────────────┬─────────────────┘  │  │
+│                               │                         │ Lineage Events     │  │
+│                               │                         ▼                    │  │
+│                               │  ┌─────────────────────────────────────────┐ │  │
+│                               │  │  Lineage DynamoDB (Project 77)          │ │  │
+│                               │  └─────────────────────────────────────────┘ │  │
+│                               └─────────────────────────┬────────────────────┘  │
+│                                                         │ Cross-Account         │
+│                                                         │ Glue Catalog          │
+│                               ┌─────────────────────────┼────────────────────┐  │
+│                               │  ACCOUNT C (Serving)    │                    │  │
+│                               │                         ▼                    │  │
+│                               │  ┌───────────────────────────────────────┐   │  │
+│                               │  │  Redshift Serverless                  │   │  │
+│                               │  │  ├── gold.finance_summary             │   │  │
+│                               │  │  ├── gold.customer_360                │   │  │
+│                               │  │  └── Spectrum → Silver/Gold S3        │   │  │
+│                               │  └───────────────────────────────────────┘   │  │
+│                               │  ┌───────────────────────────────────────┐   │  │
+│                               │  │  Athena Workgroups                    │   │  │
+│                               │  │  ├── analysts-wg (ad-hoc)             │   │  │
+│                               │  │  └── reporting-wg (scheduled)         │   │  │
+│                               │  └───────────────────────────────────────┘   │  │
+│                               │  ┌───────────────────────────────────────┐   │  │
+│                               │  │  SLA Monitoring (Project 78)          │   │  │
+│                               │  │  ├── CloudWatch Alarms                │   │  │
+│                               │  │  ├── Step Functions Recovery          │   │  │
+│                               │  │  └── Incident Tracker                 │   │  │
+│                               │  └───────────────────────────────────────┘   │  │
+│                               └──────────────────────────────────────────────┘  │
+│                                                                                 │
+│                               ┌──────────────────────────────────────────────┐  │
+│                               │  ACCOUNT D (Governance)                      │  │
+│                               │  ├── Lake Formation (column-level ACL)       │  │
+│                               │  ├── Central Lineage Store                   │  │
+│                               │  └── CloudTrail (audit logs)                 │  │
+│                               └──────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Lift-and-shift MariaDB to RDS then build lake
+</span>→ Faster app cutover (RDS compatible with MariaDB)
+→ But: doesn't solve the analytics problem
+→ Still need S3 lake + Redshift anyway
+→ Two migrations instead of one
+
+Option B: DMS direct to Redshift (skip S3 lake)
+→ Simpler — fewer components
+→ But: no raw data preservation (no Bronze layer)
+→ Cannot reprocess from source if transformations change
+→ Violates medallion architecture (Project 44)
+
+Option C: DMS to S3 Bronze → Glue ETL → Silver → Gold → Redshift
+→ Full medallion architecture
+→ Raw data preserved forever
+→ Reprocessable from any layer
+→ More components but proper engineering
+
+Option D: AWS DataSync for bulk + DMS for CDC
+→ DataSync for initial 500GB (faster for bulk)
+→ DMS for ongoing CDC only
+→ Problem: DataSync doesn't understand MariaDB format
+→ Need custom export + DataSync + custom import
+
+DECISION: Option C — DMS to S3 + Glue ETL + Redshift
+→ Reason: complete architecture, reprocessable, proper governance
+→ DMS handles BOTH full load AND CDC in one tool
+→ Glue handles all transformations with lineage
+→ Redshift Serverless for cost-effective serving</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use DMS full-load-and-cdc mode (not sequential)
+</span>   → Starts CDC capture WHILE full load is running
+   → No gap between historical and real-time data
+   → CDC changes are applied after full load completes
+
+2. Target S3 with Parquet format from DMS
+   → DMS can write Parquet directly (since 2022)
+   → Avoids CSV → Parquet conversion step in Glue
+   → Saves processing time and DPU cost
+
+3. Partition DMS output by table AND date
+   → S3 path: /raw/{database}/{table}/year=YYYY/month=MM/day=DD/
+   → Enables partition pruning in Athena/Glue (Project 26)
+   → DMS supports timestamp-based partitioning
+
+4. Run DMS from READ REPLICA, not primary
+   → Avoids any performance impact on production
+   → Read replica handles the full load scan
+   → CDC still comes from primary's binlog (required)
+
+5. Validate row counts at EVERY layer
+   → Source (MariaDB) → Bronze (S3) → Silver → Gold → Redshift
+   → Automated reconciliation job runs daily
+   → Discrepancy &gt; 0.01% triggers alert
+
+6. Build the ENTIRE pipeline before starting DMS
+   → Glue jobs, Redshift tables, Athena views — all ready
+   → DMS starts flowing → data appears in Bronze → pipeline processes automatically
+   → No manual handoff between phases
+
+7. Maintain parallel run for 30 days after cutover
+   → On-prem still receives writes (dual-write or app-level routing)
+   → Compare AWS results with on-prem daily
+   → Rollback plan: switch apps back to on-prem if issues found
+
+8. Tag EVERYTHING with migration context
+   → migration-phase: full-load | cdc | cutover | post-cutover
+   → source-system: on-prem-mariadb
+   → Enables cost tracking per migration phase</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT run DMS full load against PRIMARY in production hours
+</span>   → 500GB table scan causes I/O contention
+   → Use read replica for full load
+   → CDC binlog reading has minimal impact on primary
+
+2. DO NOT skip the Bronze layer and transform directly from DMS
+   → Raw data must be preserved (audit, reprocessing, debugging)
+   → If Glue job has a bug, you need to reprocess from raw
+   → Bronze is your safety net — NEVER skip it
+
+3. DO NOT migrate all 45 tables at once
+   → Start with smallest tables (reference/lookup) — validate process
+   → Then medium tables (customers, products) — validate quality
+   → Then large tables (orders, transactions) — validate performance
+   → Batch approach reduces risk
+
+4. DO NOT assume on-prem schema matches what Glue expects
+   → MariaDB ENUM, SET, GEOMETRY types have no direct Parquet equivalent
+   → TIMESTAMP vs DATETIME vs DATE — timezone handling differs
+   → Run schema compatibility check BEFORE DMS starts
+
+5. DO NOT forget to enable binary logging on MariaDB primary
+   → CDC requires binlog in ROW format (not STATEMENT or MIXED)
+   → Check: SHOW VARIABLES LIKE 'binlog_format' → must be ROW
+   → Change requires MariaDB restart (plan with DBA)
+
+6. DO NOT cutover on a Friday
+   → Murphy's Law: anything that can break will break
+   → Cutover on Tuesday/Wednesday — full team available for 3 days
+   → Weekend = minimal support
+
+7. DO NOT decommission on-prem until 30-day parallel validation passes
+   → Keep on-prem primary running as hot standby
+   → Rollback plan must be tested and documented
+   → Board approval required before decommission</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use                      │ Why                              │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Initial bulk load (500GB)        │ DMS Full Load mode       │ Handles table scan + S3 write    │
+│                                  │                          │ with parallelism automatically   │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Ongoing changes after full load  │ DMS CDC mode             │ Reads MariaDB binlog, streams    │
+│                                  │                          │ inserts/updates/deletes to S3    │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Initial + Ongoing combined       │ DMS full-load-and-cdc    │ No gap — CDC starts during load  │
+│                                  │                          │ Changes applied after load done   │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ &gt; 1TB and slow network           │ AWS Snowball + DMS CDC   │ Snowball ships physical device   │
+│                                  │                          │ DMS handles only CDC after       │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Transform raw to clean           │ Glue ETL (Project 34)    │ DynamicFrame, schema evolution   │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Merge CDC changes into Silver    │ Glue + Merge pattern     │ Staging + DELETE/INSERT          │
+│                                  │ (Project 65)             │ or Iceberg MERGE                 │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Serve aggregated data            │ Redshift Serverless      │ Pay-per-query, auto-scales       │
+│                                  │ (Project 67)             │                                  │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Ad-hoc exploration of lake data  │ Athena (Project 24)      │ Serverless SQL on S3             │
+├──────────────────────────────────┼──────────────────────────┼──────────────────────────────────┤
+│ Column-level access control      │ Lake Formation            │ Tag-based, cross-account         │
+│                                  │ (Project 74)             │                                  │
+└──────────────────────────────────┴──────────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use DMS for transformations
+</span>   → DMS is a REPLICATION tool, not an ETL tool
+   → It can do basic column mapping and filtering
+   → Complex transforms (joins, aggregations, derivations) → Glue
+
+2. DO NOT use Glue for the initial 500GB bulk load
+   → DMS is optimized for database → S3 bulk transfer
+   → Glue would require JDBC connection (slow for 500GB)
+   → DMS parallelizes table reads automatically
+
+3. DO NOT use Redshift for Bronze/Silver storage
+   → Redshift is expensive for raw data storage
+   → S3 at $0.023/GB vs Redshift at $0.25/GB (RA3)
+   → Use Redshift ONLY for Gold (aggregated, query-optimized)
+
+4. DO NOT use real-time streaming (Kinesis) for this migration
+   → Batch CDC (every 15 minutes) is sufficient
+   → Real-time adds complexity without business value here
+   → If sub-minute latency needed later → add Kinesis (Project 72)
+
+5. DO NOT use AWS SCT (Schema Conversion Tool) for S3 target
+   → SCT is for database-to-database schema conversion
+   → Our target is S3 (no schema enforcement)
+   → Schema is handled by Glue Catalog + Crawlers</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────┐
+</span>│                   MIGRATION — INTERNAL MECHANICS                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 1: DMS FULL LOAD MECHANICS                                        │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  STEP 1: DMS connects to MariaDB source (read replica)                  │
+│  STEP 2: For each table in scope:                                       │
+│    → Executes: SELECT * FROM table (with optional WHERE)                │
+│    → Reads in chunks (LOB chunk size configurable)                      │
+│    → Converts MariaDB types → Parquet types                             │
+│    → Writes to S3 in parallel files:                                    │
+│      s3://bronze/raw/ecommerce/orders/LOAD00001/                        │
+│        part-00000.parquet (64MB)                                        │
+│        part-00001.parquet (64MB)                                        │
+│        ...                                                               │
+│  STEP 3: DMS writes _CONTROL file when table load completes             │
+│  STEP 4: Full load statistics published to CloudWatch                   │
+│                                                                         │
+│  PARALLELISM:                                                            │
+│  → DMS loads multiple tables simultaneously                              │
+│  → MaxFullLoadSubTasks controls parallelism (default 8)                  │
+│  → Each table gets its own thread                                        │
+│  → Large tables are NOT split (single-threaded per table)                │
+│  → For 120GB orders table: ~30 min on dms.r5.2xlarge over DX            │
+│                                                                         │
+│  ESTIMATED TRANSFER TIME:                                                │
+│  → 500GB over Direct Connect (1Gbps): ~1.5 hours (theoretical)          │
+│  → 500GB over VPN (100Mbps): ~12 hours                                   │
+│  → With DMS overhead (conversion, writes): multiply by 1.5-2x            │
+│  → Realistic estimate: 3-6 hours (DX) or 18-24 hours (VPN)              │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 2: DMS CDC MECHANICS                                              │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  HOW CDC WORKS WITH MARIADB:                                             │
+│  1. MariaDB writes every row change to binary log (binlog)               │
+│  2. DMS connects as a replication client (like a read replica)           │
+│  3. DMS reads binlog events in real-time                                 │
+│  4. Converts events to CDC records:                                      │
+│     ┌──────────────────────────────────────────────────┐                │
+│     │ {                                                 │                │
+│     │   "Op": "U",              ← I=Insert,U=Update,   │                │
+│     │                              D=Delete              │                │
+│     │   "before": {...},        ← previous values       │                │
+│     │   "after": {...},         ← new values             │                │
+│     │   "timestamp": "2025-01-15T03:00:01Z",            │                │
+│     │   "transaction_id": "trx_12345"                    │                │
+│     │ }                                                  │                │
+│     └──────────────────────────────────────────────────┘                │
+│  5. Batches CDC records and writes to S3:                                │
+│     s3://bronze/raw/ecommerce/orders/CDC/                                │
+│       2025/01/15/03/  ← hour-partitioned                                 │
+│         cdc-00001.parquet                                                │
+│         cdc-00002.parquet                                                │
+│                                                                         │
+│  CDC FILE FREQUENCY:                                                     │
+│  → DMS buffers CDC records in memory                                     │
+│  → Writes to S3 when buffer is full OR timer expires                     │
+│  → CdcMaxBatchInterval: 60 seconds (configurable)                        │
+│  → CdcMinFileSize: 32000 KB (configurable)                               │
+│  → Result: new S3 file every 1-5 minutes during active changes           │
+│                                                                         │
+│  BINLOG REQUIREMENTS:                                                    │
+│  → binlog_format = ROW (not STATEMENT or MIXED)                          │
+│  → binlog_row_image = FULL (captures all columns, not just changed)      │
+│  → log_bin = ON                                                          │
+│  → binlog retention: ≥ 24 hours (DMS needs to catch up after restart)    │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 3: FULL-LOAD-AND-CDC MODE (Combined)                              │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  TIMELINE:                                                               │
+│  T=0:   DMS starts reading binlog position (saves checkpoint)            │
+│  T=0:   DMS starts full load (SELECT * FROM each table)                  │
+│  T=3h:  Full load completes for all tables                               │
+│  T=3h:  DMS applies cached CDC changes (from T=0 to T=3h)               │
+│  T=3.5h: CDC caught up — now streaming in real-time                      │
+│  T=∞:   Continuous CDC streaming until task stopped                      │
+│                                                                         │
+│  WHY THIS IS SAFE:                                                       │
+│  → Binlog position captured BEFORE full load starts                      │
+│  → ALL changes during full load are captured in CDC                      │
+│  → After full load, CDC changes are applied in order                     │
+│  → Result: S3 has complete, consistent snapshot + all changes            │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 4: GLUE CDC MERGE MECHANICS (Project 65 applied)                  │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  Bronze has TWO types of data:                                           │
+│  1. LOAD files (historical full load)                                    │
+│  2. CDC files (ongoing changes: I/U/D)                                   │
+│                                                                         │
+│  Glue ETL processes them differently:                                    │
+│                                                                         │
+│  INITIAL RUN (after full load):                                          │
+│  → Read all LOAD files                                                   │
+│  → Clean, transform, write to Silver as Parquet                          │
+│  → This is the baseline Silver dataset                                   │
+│                                                                         │
+│  SUBSEQUENT RUNS (CDC):                                                  │
+│  → Read new CDC files (using Job Bookmark — Project 33)                  │
+│  → For each CDC record:                                                  │
+│    → Op=I (Insert): add new row to Silver                                │
+│    → Op=U (Update): find existing row by PK, replace with new values     │
+│    → Op=D (Delete): remove row from Silver                               │
+│  → MERGE pattern (Project 65):                                           │
+│    → Load CDC into staging                                               │
+│    → DELETE from Silver WHERE pk IN (staging PKs)                        │
+│    → INSERT INTO Silver SELECT * FROM staging WHERE Op != 'D'            │
+│    → This handles I/U/D correctly                                        │
+│                                                                         │
+│  ═══════════════════════════════════════════════════                     │
+│  PART 5: CUTOVER MECHANICS                                              │
+│  ═══════════════════════════════════════════════════                     │
+│                                                                         │
+│  PRE-CUTOVER VALIDATION:                                                 │
+│  1. Row count reconciliation (source vs all layers)                      │
+│  2. Business metric comparison (revenue, order count)                    │
+│  3. Data quality score &gt; 99.5% (Project 68)                              │
+│  4. SLA monitoring green for 7 consecutive days                          │
+│  5. User acceptance sign-off                                             │
+│                                                                         │
+│  CUTOVER SEQUENCE:                                                       │
+│  T-24h:  Final validation run                                            │
+│  T-2h:   Stop application writes to on-prem (maintenance window)         │
+│  T-1h:   Wait for DMS CDC to drain (0 latency)                          │
+│  T-30m:  Run final reconciliation                                        │
+│  T-0:    Switch application connection strings to AWS                    │
+│  T+15m:  Verify applications healthy on AWS                              │
+│  T+1h:   Resume full operations                                         │
+│  T+24h:  First full day on AWS — verify SLA                              │
+│  T+30d:  Decommission on-prem (after parallel validation)                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "DMS full load took 48 hours instead of expected 6"
+</span>→ Cause: VPN bandwidth (100Mbps) instead of Direct Connect
+→ 500GB ÷ 100Mbps = 11 hours theoretical + 2x overhead = 22+ hours
+→ Fix: provision Direct Connect (1Gbps) — reduces to 3-6 hours
+→ Alternative: AWS Snowball for initial load, DMS for CDC only
+
+PITFALL 2: "CDC files have duplicates — same row appears twice"
+→ Cause: DMS retry after network blip re-sends some CDC records
+→ Fix: CDC merge logic must be IDEMPOTENT
+→ Use primary key to deduplicate: last CDC record for each PK wins
+→ ORDER BY timestamp DESC, take first
+
+PITFALL 3: "MariaDB ENUM type becomes garbage in Parquet"
+→ Cause: DMS doesn't map ENUM to string cleanly
+→ Fix: DMS table mapping rule to cast ENUM to VARCHAR before transfer
+→ Or: handle in Glue ETL with explicit type mapping
+
+PITFALL 4: "Glue job OOMs processing 120GB orders table"
+→ Cause: trying to read entire table into memory
+→ Fix: process in partitions (by date range)
+→ Use pushdown predicate: read only year=2024 partition per run
+→ Scale DPU: 40 DPU for large tables (Project 69 cost optimization)
+
+PITFALL 5: "Redshift COPY from Silver S3 is slow — 2 hours for 120GB"
+→ Cause: Silver has too many small files (Project 62 problem)
+→ Fix: Glue compaction job before COPY
+→ Target: 128MB-512MB files for optimal Redshift COPY
+→ Also: use COPY with MANIFEST for parallel loading (Project 21)
+
+PITFALL 6: "CDC stops working after MariaDB failover"
+→ Cause: binlog position changed when replica promoted to primary
+→ DMS can't find the old binlog position on new primary
+→ Fix: enable GTID (Global Transaction ID) on MariaDB
+→ GTID survives failover — DMS resumes from correct position
+
+PITFALL 7: "Cutover weekend — applications error rate spikes 500%"
+→ Cause: application connection strings pointed to wrong endpoint
+→ Or: Redshift cold start (first queries slow on Serverless)
+→ Fix: pre-warm Redshift by running representative queries
+→ Use DNS CNAME for database endpoint — change once, all apps update</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MIGRATION SCALE:
+</span>→ Current: 500GB, 45 tables, 5M rows/day growth
+→ Year 2: 1.5TB, 60 tables, 15M rows/day
+→ Year 3: 4TB, 80 tables, 40M rows/day
+
+DMS SCALING:
+→ dms.r5.2xlarge: handles 500GB initial + 5M rows/day CDC easily
+→ Year 2: may need dms.r5.4xlarge for higher CDC throughput
+→ Multiple DMS tasks can run in parallel for different table groups
+→ CDC latency target: &lt; 5 minutes (achievable with proper sizing)
+
+GLUE SCALING:
+→ Initial: 10-20 DPU per job, 15 jobs
+→ Year 2: 20-40 DPU per job, 30 jobs
+→ Year 3: consider Glue Auto Scaling (dynamic DPU allocation)
+→ Small file compaction becomes critical at Year 2+ (Project 62)
+
+REDSHIFT SCALING:
+→ Initial: Serverless with 32 RPU base
+→ Year 2: may need 64-128 RPU for concurrent dashboards
+→ Year 3: consider provisioned RA3 nodes for predictable workloads
+→ Spectrum handles growth automatically (queries S3 directly)
+
+COST PROJECTION:
+→ Month 1 (migration): ~$3K (DMS + DX + compute)
+→ Ongoing monthly: ~$6K
+   → S3: 500GB × $0.023 = $12 (growing)
+   → Glue: 15 jobs × 10 DPU × 0.44/DPU-hr × 0.5hr = $33/day = $1K/month
+   → Redshift Serverless: 32 RPU × $0.375/RPU-hr × 8hr/day = $96/day = $2.9K/month
+   → DMS: dms.r5.2xlarge = $1.2K/month
+   → Other (Lambda, DynamoDB, SNS, CloudWatch): ~$100/month
+→ Year 2: ~$10K/month (data growth + more jobs)
+→ Year 3: ~$18K/month (optimize per Project 69)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(79)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Module 1: Network &amp; DMS Infrastructure Setup</h3>
+
+<hr>
+<h3>Module 2: DMS Monitoring &amp; Validation</h3>
+
+<hr>
+<h3>Module 3: Bronze → Silver → Gold ETL Pipeline (Cross-Account)</h3>
+
+<hr>
+<h3>Module 4: Gold Layer Builder + Redshift Loader</h3>
+
+<hr>
+<h3>Module 5: Pre-Cutover Validation Suite</h3>
+
+<hr>
+<h3>Module 6: Cutover Execution Runbook</h3>
+
+<hr>
+<h3>Module File Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>migration/
+</span>├── 01_dms_infrastructure.py       # DMS instance, endpoints, replication task
+├── 02_dms_monitor.py              # Real-time monitoring + row count validation
+├── 03_etl_pipeline.py             # Glue: Bronze → Silver (full load + CDC merge)
+├── 04_gold_builder.py             # Gold CTAS + Redshift COPY
+├── 05_cutover_validation.py       # Pre-cutover validation suite (8 checks)
+└── 06_cutover_execution.py        # Cutover runbook (9-step sequence)</code></pre></div>
+<hr>
+<h3>8-Week Migration Timeline</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────┐
+</span>│                    8-WEEK MIGRATION TIMELINE                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  WEEK 1: NETWORK + INFRASTRUCTURE                                        │
+│  ├── Day 1-2: Provision Direct Connect / VPN                             │
+│  ├── Day 3:   Create DMS instance + endpoints (Module 1)                 │
+│  ├── Day 4:   Test connectivity source → target                          │
+│  └── Day 5:   Create S3 buckets, IAM roles, cross-account (Proj 56)     │
+│                                                                          │
+│  WEEK 2: FULL LOAD + PIPELINE BUILD                                      │
+│  ├── Day 1:   Start DMS full-load-and-cdc (Module 1)                     │
+│  ├── Day 2-3: Full load runs (~6-24 hours depending on network)          │
+│  ├── Day 3:   Deploy Glue crawlers + ETL jobs (Module 3)                 │
+│  ├── Day 4:   Validate full load row counts (Module 2)                   │
+│  └── Day 5:   First Bronze → Silver → Gold pipeline run (Module 3+4)     │
+│                                                                          │
+│  WEEK 3: CDC + PIPELINE STABILIZATION                                    │
+│  ├── Day 1-2: Verify CDC streaming correctly                             │
+│  ├── Day 3:   Run CDC merge pipeline (Module 3 cdc mode)                 │
+│  ├── Day 4:   Deploy Glue Workflow orchestration (Project 35)            │
+│  └── Day 5:   End-to-end test: insert on-prem → appears in Redshift     │
+│                                                                          │
+│  WEEK 4: SERVING LAYER                                                   │
+│  ├── Day 1:   Deploy Redshift Serverless (Project 67)                    │
+│  ├── Day 2:   Load Gold → Redshift (Module 4)                            │
+│  ├── Day 3:   Create Athena views + Spectrum external tables             │
+│  ├── Day 4:   Performance testing (Project 39 optimization)              │
+│  └── Day 5:   Connect dashboards to Redshift                             │
+│                                                                          │
+│  WEEK 5: GOVERNANCE + MONITORING                                         │
+│  ├── Day 1:   Deploy Lake Formation permissions (Project 74)             │
+│  ├── Day 2:   Deploy Lineage system (Project 77)                         │
+│  ├── Day 3:   Deploy SLA monitoring (Project 78)                         │
+│  ├── Day 4:   Deploy Data Quality rules (Project 68)                     │
+│  └── Day 5:   End-to-end monitoring test                                 │
+│                                                                          │
+│  WEEK 6: VALIDATION                                                      │
+│  ├── Day 1-3: Daily reconciliation runs (Module 2)                       │
+│  ├── Day 3:   Business metric comparison (Module 5)                      │
+│  ├── Day 4:   User acceptance testing (analysts run queries)             │
+│  └── Day 5:   Fix any issues found during validation                     │
+│                                                                          │
+│  WEEK 7: PRE-CUTOVER                                                     │
+│  ├── Day 1:   Run full validation suite (Module 5)                       │
+│  ├── Day 2:   Test rollback procedure                                    │
+│  ├── Day 3:   SLA monitoring must be green 7+ days                       │
+│  ├── Day 4:   Cutover rehearsal (dry run with test traffic)              │
+│  └── Day 5:   Final go/no-go decision meeting                            │
+│                                                                          │
+│  WEEK 8: CUTOVER + STABILIZATION                                         │
+│  ├── Day 1:   Buffer day (fix any last issues)                           │
+│  ├── Day 2:   CUTOVER DAY (Tuesday) — Module 6                           │
+│  ├── Day 3-5: Post-cutover monitoring                                    │
+│  └── Day 5:   Week 1 post-cutover report to board                       │
+│                                                                          │
+│  POST-CUTOVER (30 days):                                                 │
+│  ├── Daily reconciliation continues                                      │
+│  ├── Weekly SLA report to board                                          │
+│  └── Day 30: Approve on-prem decommission                               │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Migration is NOT a single event — it's a PIPELINE of phases
+→ DMS full-load-and-cdc mode eliminates the gap between historical and real-time
+→ DMS writes Parquet directly to S3 — no intermediate CSV conversion needed
+→ CDC merge requires IDEMPOTENT logic: staging → delete → insert (Project 65)
+→ ALWAYS migrate from read replica — never impact production primary
+→ binlog_format = ROW is MANDATORY for CDC (DBA must verify before Day 1)
+→ Validation at EVERY layer: Source → Bronze → Silver → Gold → Redshift
+→ Business metric comparison is more important than row counts
+   → Row counts can match but revenue can differ (type casting, filtering)
+→ Cutover is a 9-step ORCHESTRATED procedure, not a "flip the switch"
+→ 30-day parallel run is insurance — worth every penny
+→ The ENTIRE platform (Projects 1-78) comes together in this migration:
+   → S3 storage (Project 1)
+   → IAM cross-account (Projects 56-61)
+   → Glue ETL (Projects 31-35)
+   → CDC merge (Project 65)
+   → Medallion architecture (Project 44)
+   → Redshift optimization (Project 39)
+   → Athena queries (Project 24)
+   → Lake Formation security (Project 74)
+   → Lineage tracking (Project 77)
+   → SLA monitoring (Project 78)
+
+HOW THIS CONNECTS TO ALL PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Every project was a BUILDING BLOCK for this migration
+→ No single project is sufficient alone
+→ The value is in the INTEGRATION — knowing which tool for which problem
+→ This is what a senior data engineer does: assemble the pieces
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 80: "Capstone: Design &amp; Defend a Complete Data Platform in Interview"
+→ You've BUILT everything — now you must EXPLAIN it
+→ Whiteboard design, trade-off analysis, cost estimation
+→ The interview is not about code — it's about JUDGMENT
+→ "Why DMS instead of Glue JDBC for bulk load?"
+→ "Why Serverless Redshift instead of provisioned?"
+→ "What happens if DMS fails mid-migration?"
+→ "How would you handle 50TB instead of 500GB?"
+→ Every answer references a specific project and its rationale</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO FINAL PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart is fully on AWS
+</span>→ 500GB migrated with zero downtime
+→ 45 tables flowing through Bronze → Silver → Gold
+→ CDC keeping data fresh within 5 minutes
+→ SLA at 99.94% for first month on AWS
+→ Lineage tracing every column to its MariaDB origin
+→ Board approved on-prem decommission at Day 30
+
+THEN: You walk into a senior data engineer interview at another company
+
+INTERVIEWER: "We have a similar problem.
+              On-prem PostgreSQL, 2TB, 200 tables,
+              multi-region requirement, real-time analytics.
+
+              You have 45 minutes.
+
+              Design the complete platform on a whiteboard.
+              Defend every decision.
+              Estimate costs.
+              Identify failure modes.
+              Tell me what you'd do in Week 1 vs Week 8."
+
+YOU: "I've done exactly this. Let me walk you through it..."
+
+→ Project 80: "Capstone: Design &amp; Defend a Complete Data Platform
+               Architecture in Interview"
+
+THIS IS THE FINAL PROJECT — IT USES EVERYTHING:
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                    CAPSTONE KNOWLEDGE MAP                            │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  STORAGE DECISIONS (Projects 1-4):                                   │
+│  "Why S3 over EBS? Why Parquet over CSV? Why partition by date?"     │
+│  → You KNOW the internal mechanics of S3 key-value store             │
+│  → You KNOW storage class transitions save 60% cost                  │
+│  → You KNOW 11 nines durability but 0 nines against human delete     │
+│                                                                      │
+│  COMPUTE DECISIONS (Projects 5-6, 8-9):                              │
+│  "Why EC2 with IAM Role? Why MariaDB on EC2 vs RDS?"                │
+│  → You KNOW Instance Profiles eliminate hardcoded credentials        │
+│  → You KNOW when managed service (RDS) beats self-hosted             │
+│                                                                      │
+│  SECURITY DECISIONS (Projects 7, 56-61, 70, 74):                    │
+│  "How do 4 accounts share data securely?"                            │
+│  → You KNOW IAM policy evaluation logic                              │
+│  → You KNOW AssumeRole + ExternalID for cross-account                │
+│  → You KNOW Lake Formation for column-level ACL                      │
+│  → You KNOW Secrets Manager for credential rotation                  │
+│                                                                      │
+│  INGESTION DECISIONS (Projects 17-21, 31, 42, 65):                   │
+│  "How does data flow from source to warehouse?"                      │
+│  → You KNOW DMS for bulk + CDC                                       │
+│  → You KNOW Glue JDBC for database extraction                        │
+│  → You KNOW CDC merge pattern (staging → delete → insert)            │
+│  → You KNOW Job Bookmarks for idempotent processing                  │
+│                                                                      │
+│  TRANSFORMATION DECISIONS (Projects 25, 33-35, 44-45):              │
+│  "How do you clean, transform, and organize data?"                   │
+│  → You KNOW DynamicFrame transforms                                  │
+│  → You KNOW Glue Workflows for orchestration                         │
+│  → You KNOW Medallion Architecture (Bronze/Silver/Gold)              │
+│  → You KNOW schema evolution handling                                │
+│                                                                      │
+│  SERVING DECISIONS (Projects 10-11, 38-40, 63, 67):                 │
+│  "Why Redshift? Why Serverless? How to optimize?"                    │
+│  → You KNOW distribution keys and sort keys                          │
+│  → You KNOW Spectrum for lake queries without loading                 │
+│  → You KNOW WLM queues for multi-tenant workloads                    │
+│  → You KNOW materialized views for dashboard performance             │
+│                                                                      │
+│  QUERY DECISIONS (Projects 16, 24, 26, 36-37, 46):                  │
+│  "How do analysts access data?"                                      │
+│  → You KNOW Athena serverless pricing ($5/TB scanned)                │
+│  → You KNOW partition pruning cuts cost 90%                          │
+│  → You KNOW CTAS for materializing expensive queries                 │
+│  → You KNOW federated queries for cross-source joins                 │
+│                                                                      │
+│  MESSAGING DECISIONS (Projects 12-14, 17-18, 27-28, 50-51):         │
+│  "How do services communicate?"                                      │
+│  → You KNOW SNS fan-out to multiple SQS queues                       │
+│  → You KNOW DLQ for failed message quarantine                        │
+│  → You KNOW message filtering for routing                            │
+│  → You KNOW S3 events → SNS/SQS for pipeline triggers               │
+│                                                                      │
+│  ORCHESTRATION DECISIONS (Projects 35, 41, 55, 66):                  │
+│  "How do you chain everything together?"                             │
+│  → You KNOW Glue Workflows for ETL chains                            │
+│  → You KNOW Step Functions for complex state machines                 │
+│  → You KNOW EventBridge for event-driven architecture                │
+│  → You KNOW when cron is enough vs when you need orchestration       │
+│                                                                      │
+│  OPTIMIZATION DECISIONS (Projects 39, 62, 69):                       │
+│  "How do you keep costs under control?"                              │
+│  → You KNOW small file compaction saves query time                   │
+│  → You KNOW Redshift RA3 + pause schedules                           │
+│  → You KNOW Glue DPU tuning and auto-scaling                         │
+│  → You KNOW S3 Intelligent Tiering for cold data                     │
+│                                                                      │
+│  QUALITY DECISIONS (Project 68):                                     │
+│  "How do you ensure data is correct?"                                │
+│  → You KNOW DQDL rules for automated validation                      │
+│  → You KNOW pass/fail gates before Gold layer                        │
+│  → You KNOW quality metrics feed SLA dashboard                       │
+│                                                                      │
+│  GOVERNANCE DECISIONS (Projects 71, 73-74, 77):                      │
+│  "How do you manage data at scale across teams?"                     │
+│  → You KNOW Data Mesh with domain ownership                          │
+│  → You KNOW Lake Formation for centralized permissions               │
+│  → You KNOW column-level lineage across 5+ hops                     │
+│  → You KNOW lineage + quality = complete governance                  │
+│                                                                      │
+│  RELIABILITY DECISIONS (Projects 47, 75, 78):                        │
+│  "What happens when things break?"                                   │
+│  → You KNOW composite alarms reduce alert fatigue                    │
+│  → You KNOW Step Functions retry/catch for auto-recovery             │
+│  → You KNOW tiered escalation (info → warning → critical → emergency)│
+│  → You KNOW multi-region DR with cross-region replication            │
+│  → You KNOW SLA calculation and board reporting                      │
+│                                                                      │
+│  MIGRATION DECISIONS (Project 79):                                   │
+│  "How do you actually move from on-prem to AWS?"                     │
+│  → You KNOW DMS full-load-and-cdc mode                               │
+│  → You KNOW 8-week phased migration plan                             │
+│  → You KNOW pre-cutover validation suite                             │
+│  → You KNOW 30-day parallel run as safety net                        │
+│  → You KNOW rollback procedure and when to abort                     │
+│                                                                      │
+│  CI/CD DECISIONS (Project 76):                                       │
+│  "How do you deploy and version pipelines?"                          │
+│  → You KNOW CodePipeline for Glue job deployment                     │
+│  → You KNOW CloudFormation/CDK for infrastructure                    │
+│  → You KNOW Glue job versioning and rollback                         │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+THE CAPSTONE IS NOT ABOUT BUILDING — IT'S ABOUT DEFENDING:
+
+INTERVIEWER QUESTIONS YOU'LL FACE:
+
+  ARCHITECTURE:
+  → "Draw the complete architecture on the whiteboard"
+  → "Why 4 accounts instead of 1?"
+  → "Why S3 as the center of everything?"
+  → "What if we need real-time instead of batch?"
+
+  TRADE-OFFS:
+  → "Why Redshift Serverless over Provisioned?"
+  → "Why Glue over Spark on EMR?"
+  → "Why DMS over custom CDC with Debezium?"
+  → "Why Parquet over ORC or Delta?"
+
+  FAILURE MODES:
+  → "What happens if DMS goes down during migration?"
+  → "What if a Glue job writes corrupted data to Gold?"
+  → "What if cross-account IAM role expires?"
+  → "What if Redshift runs out of space during COPY?"
+
+  COST:
+  → "Estimate monthly cost for 500GB growing 2GB/day"
+  → "How would you cut cost by 40%?"
+  → "What's the most expensive component and why?"
+
+  SCALING:
+  → "This works for 500GB — what about 50TB?"
+  → "What changes at 500TB?"
+  → "What if you need sub-second latency?"
+
+  TEAM:
+  → "How would you staff this? 3 engineers or 10?"
+  → "What skills does the team need?"
+  → "How do you onboard a new engineer to this platform?"</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="23" ========== -->
+<div class="chat-message" data-index="23"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-78.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 79 of 80</span>
+    <span class="nav-project-title">FULL MIGRATION — ON-PREM MARIADB → AWS DATA PLATFORM (MULTI-ACCOUNT, MULTI-LAYER)</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-80.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-80.html") window.location = "project-80.html";
+  if (e.key === 'ArrowLeft' && "project-78.html") window.location = "project-78.html";
+});
+</script>
+</body>
+</html>

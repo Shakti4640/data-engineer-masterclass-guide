@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 51: ROUTE DIFFERENT MESSAGE TYPES TO DIFFERENT SQS QUEUES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:64%"></div></div>
+<div id="progress-label">64%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 51 of 80</div>
+  <div class="project-title">ROUTE DIFFERENT MESSAGE TYPES TO DIFFERENT SQS QUEUES</div>
+  <div class="project-tags"><span class="project-tag">SQS</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now processing 500K+ orders/day
+</span>Team: 8 engineers, 3 data engineers
+
+CURRENT ARCHITECTURE (from Project 14):
+→ Single SNS topic: "quickcart-pipeline-events"
+→ Fan-out to 3 SQS queues
+→ ALL queues receive ALL messages
+→ Each consumer filters in application code what it cares about
+
+THE PAIN:
+→ Order Processing Queue receives ETL events it ignores (waste)
+→ ETL Trigger Queue receives alert events it ignores (waste)
+→ Alert Queue receives data load events it ignores (waste)
+
+REAL NUMBERS:
+→ 200,000 messages/day published to SNS topic
+→ Fan-out to 3 queues = 600,000 SQS messages/day
+→ Each queue only CARES about ~60,000 messages
+→ 80% of messages per queue are received, inspected, then DISCARDED
+→ Application code does: if msg["type"] != "etl": continue
+→ Wasted compute: EC2 workers polling, parsing, discarding
+→ Wasted SQS cost: charged per request even for discarded messages
+
+CTO: "Why are we paying to deliver messages nobody wants?"
+YOU: "We need SNS Message Filtering — route at the broker level,
+      not the application level"
+
+MESSAGE TYPES IN THE SYSTEM:
+┌─────────────────────┬───────────────────────────────────────┐
+│ Type                │ Example Events                        │
+├─────────────────────┼───────────────────────────────────────┤
+│ etl_event           │ file_landed, glue_job_started,        │
+│                     │ glue_job_completed, glue_job_failed   │
+├─────────────────────┼───────────────────────────────────────┤
+│ order_event         │ order_placed, order_shipped,          │
+│                     │ order_cancelled, order_refunded       │
+├─────────────────────┼───────────────────────────────────────┤
+│ alert_event         │ pipeline_failed, threshold_breached,  │
+│                     │ sla_missed, disk_full                 │
+├─────────────────────┼───────────────────────────────────────┤
+│ data_quality_event  │ dq_check_passed, dq_check_failed,    │
+│                     │ schema_drift_detected                 │
+└─────────────────────┴───────────────────────────────────────┘
+
+DESIRED STATE:
+→ ETL Queue ONLY receives etl_event messages
+→ Order Queue ONLY receives order_event messages
+→ Alert Queue receives alert_event AND data_quality_event (both critical)
+→ Audit Queue receives EVERYTHING (compliance requirement)
+→ Filtering happens at SNS level — zero wasted delivery</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the difference from Project 14
+</span>→ Project 14: Fan-out = same message to ALL subscribers
+→ Project 51: Filtered fan-out = SPECIFIC messages to SPECIFIC subscribers
+→ Filtering happens INSIDE SNS before delivery — not in consumer code
+
+Step 2: Understand SNS Message Attributes
+→ SNS messages have TWO parts:
+   a) Message Body — the actual payload (JSON string)
+   b) Message Attributes — key-value metadata OUTSIDE the body
+→ Filter policies operate on Message Attributes (default)
+→ Since 2022: can also filter on Message Body (payload-based filtering)
+
+Step 3: Design the attribute schema
+→ We need attributes that SNS can filter on
+→ Key attributes:
+   - event_type: "etl_event" | "order_event" | "alert_event" | "data_quality_event"
+   - severity: "info" | "warning" | "critical"
+   - source_system: "glue" | "order_mgmt" | "monitoring" | "data_quality"
+   - environment: "prod" | "staging" | "dev"
+
+Step 4: Design filter policies per queue
+→ ETL Queue:        event_type = ["etl_event"]
+→ Order Queue:      event_type = ["order_event"]
+→ Alert Queue:      event_type = ["alert_event", "data_quality_event"]
+→ Audit Queue:      NO filter (receives everything)
+
+Step 5: Understand filter policy scope
+→ FilterPolicyScope = "MessageAttributes" (default, faster)
+→ FilterPolicyScope = "MessageBody" (newer, filters on JSON body)
+→ We use MessageAttributes — standard, well-supported</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+Publishers (Glue, Order System, Monitoring, DQ Engine)
+    │
+    │ publish with MessageAttributes
+    │   event_type = "etl_event"
+    │   severity   = "info"
+    │   source     = "glue"
+    ▼
+┌──────────────────────────────────────┐
+│  SNS Topic: quickcart-all-events     │
+│                                      │
+│  Subscription 1: ETL Queue           │
+│    FilterPolicy: event_type=etl_event│
+│                                      │
+│  Subscription 2: Order Queue         │
+│    FilterPolicy: event_type=         │
+│                  order_event         │
+│                                      │
+│  Subscription 3: Alert Queue         │
+│    FilterPolicy: event_type=         │
+│      [alert_event, data_quality_event]│
+│      OR severity=critical            │
+│                                      │
+│  Subscription 4: Audit Queue         │
+│    FilterPolicy: (none — gets ALL)   │
+└──────────┬───┬───┬───┬───────────────┘
+           │   │   │   │
+           ▼   ▼   ▼   ▼
+         ETL  ORD  ALR  AUDIT
+         SQS  SQS  SQS  SQS
+           │   │   │   │
+           ▼   ▼   ▼   ▼
+         Glue  App  PagerDuty  Compliance
+         Trigger    Lambda     Archive
+
+MESSAGE FLOW EXAMPLE:
+→ Glue job fails → publish event_type="etl_event", severity="critical"
+→ SNS evaluates filter policies:
+   - ETL Queue filter matches event_type="etl_event" → ✅ DELIVERED
+   - Order Queue filter does NOT match → ❌ NOT DELIVERED
+   - Alert Queue filter matches severity="critical" → ✅ DELIVERED
+   - Audit Queue has no filter → ✅ DELIVERED
+→ Result: 3 out of 4 queues receive it — exactly the right ones</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Application-level filtering (current — Project 14)
+</span>→ All queues get all messages
+→ Consumer code checks: if event_type != "etl": skip
+→ PROBLEMS: wasted SQS cost, wasted compute, added latency
+
+Option B: Separate SNS topics per event type
+→ quickcart-etl-events topic → ETL queue
+→ quickcart-order-events topic → Order queue
+→ PROBLEMS: publishers must know which topic to use
+→ Adding new event types = new topics = more infra to manage
+→ Cross-cutting concerns (severity=critical) require dual publishing
+
+Option C: SNS Message Filtering (this project) ✅
+→ Single topic, multiple subscriptions with filter policies
+→ SNS evaluates filters server-side before delivery
+→ Publishers don't know/care about subscribers
+→ Subscribers declare what they want
+→ True pub/sub decoupling
+
+Option D: EventBridge rules (Project 66)
+→ More powerful content-based routing
+→ But heavier, more expensive at high volume
+→ Better for orchestration than simple routing
+
+DECISION: Option C — SNS Message Filtering
+→ Reason: simplest, cheapest, zero-code routing
+→ Filtering is FREE — no extra SNS charge
+→ Perfect fit for attribute-based routing</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Define a CONSISTENT attribute schema across ALL publishers
+</span>   → Document: event_type, severity, source_system, environment
+   → Enforce via shared Python module / schema definition
+   → Inconsistent attributes = messages slip through filters
+
+2. Always include a "catch-all" subscriber (Audit Queue)
+   → No filter policy = receives everything
+   → Guarantees no message is silently lost
+   → Essential for compliance and debugging
+
+3. Use STRING data type for attributes (most compatible)
+   → SNS supports: String, Number, Binary, String.Array
+   → Filter policies work best with String values
+   → Avoid Binary — not filterable
+
+4. Test filter policies BEFORE production deployment
+   → Publish test messages with various attribute combinations
+   → Verify each queue receives exactly what's expected
+   → Verify queues do NOT receive what they shouldn't
+
+5. Use filter policy with OR logic for multi-type subscribers
+   → Alert Queue needs: alert_event OR data_quality_event
+   → FilterPolicy: {"event_type": ["alert_event", "data_quality_event"]}
+   → Array = OR condition
+
+6. Set up DLQ on each filtered queue (from Project 50)
+   → Failed processing should not cause message loss
+   → DLQ per queue — not one shared DLQ
+
+7. Monitor FilteredMessagesDropped metric
+   → CloudWatch: NumberOfNotificationsFilteredOut-NoMessageAttributes
+   → High count = publishers forgetting to set attributes</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT filter on message body by default
+</span>   → Body-based filtering is slower (SNS must parse JSON body)
+   → Use MessageAttributes — purpose-built for this
+   → Body filtering only when you don't control publisher code
+
+2. DO NOT create overly complex filter policies
+   → Max filter policy size: 256 KB
+   → Max 5 attribute names per policy
+   → Max 150 values across all attribute names
+   → Complex policies = hard to debug, easy to misconfigure
+
+3. DO NOT assume unmatched messages go to a DLQ
+   → If no subscription matches → message is SILENTLY DROPPED by SNS
+   → SNS does NOT have a built-in "unmatched message" DLQ
+   → That's why the catch-all Audit Queue is critical
+
+4. DO NOT mix filtered and unfiltered subscriptions carelessly
+   → A subscription with NO filter policy = receives EVERYTHING
+   → If you add a filter policy with empty object {} = receives NOTHING
+   → Empty filter {} ≠ no filter
+
+5. DO NOT forget to set MessageAttributes when publishing
+   → Message published WITHOUT attributes:
+     - Subscriptions with filters → WILL NOT receive it
+     - Subscriptions without filters → WILL receive it
+   → Silent data loss if publisher forgets attributes
+
+6. DO NOT use Number type for enum-like values
+   → event_type is categorical → use String
+   → Number type only for: price &gt; 100, quantity &gt;= 5 (numeric comparisons)
+
+7. DO NOT hardcode filter policies in console
+   → Use Infrastructure as Code (boto3, CloudFormation, CDK)
+   → Console changes are not tracked, not reproducible</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────┬────────────────────┬──────────────────────────────────────────┐
+</span>│ Scenario                          │ Use                │ Why                                      │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Route by simple attributes        │ SNS Filter Policy  │ Free, fast, server-side, no code         │
+│ (type, severity, source)          │ (this project)     │                                          │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Route by complex JSON body        │ SNS Body-based     │ When publishers can't add attributes     │
+│ patterns                          │ filtering          │ (3rd party systems)                      │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Route by content + trigger        │ EventBridge        │ Rules engine, transforms, 200+ targets   │
+│ Lambda/Step Functions             │ (Project 66)       │                                          │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Complex routing with              │ SQS + application  │ When filter logic exceeds SNS            │
+│ business logic (DB lookups)       │ code               │ capabilities (joins, lookups)            │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Exactly-once ordered routing      │ SNS FIFO +         │ Filter + ordering guarantee              │
+│                                   │ SQS FIFO           │ (message groups preserved)               │
+├───────────────────────────────────┼────────────────────┼──────────────────────────────────────────┤
+│ Fan-out with NO filtering needed  │ SNS without filter │ All subscribers need all messages        │
+│ (Project 14 pattern)              │ (Project 14)       │                                          │
+└───────────────────────────────────┴────────────────────┴──────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE SNS MESSAGE FILTERING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need content-based transformation (not just routing)
+</span>   → SNS filters: YES/NO delivery decision only
+   → Cannot modify message before delivery
+   → Use: EventBridge input transformer, or Lambda between SNS and SQS
+
+2. When filter logic requires external data lookups
+   → "Route to Queue A if customer is in VIP table in DynamoDB"
+   → SNS cannot query databases
+   → Use: Lambda subscriber that does lookup then forwards
+
+3. When you have &gt;150 possible values for one attribute
+   → SNS filter policy hard limit: 150 values across all attributes combined
+   → Use: EventBridge or application-level routing
+
+4. When routing must be dynamic (changes per message)
+   → SNS filter policies are STATIC per subscription
+   → Changing filter = API call to update subscription
+   → Use: Lambda-based routing for dynamic decisions
+
+5. When message ordering matters across filtered queues
+   → Standard SNS + Standard SQS: no ordering guarantee
+   → Even FIFO: ordering is per-message-group, not cross-queue
+   → Use: single queue + application routing if strict order needed</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                SNS MESSAGE FILTERING — INTERNAL MECHANICS                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  STEP 1: PUBLISHER SENDS MESSAGE                                            │
+│  ═══════════════════════════════                                            │
+│  sns.publish(                                                               │
+│      TopicArn = "arn:aws:sns:...:quickcart-all-events",                     │
+│      Message  = '{"order_id": "ORD-123", "status": "shipped"}',            │
+│      MessageAttributes = {                                                  │
+│          "event_type": {"DataType": "String", "StringValue": "order_event"},│
+│          "severity":   {"DataType": "String", "StringValue": "info"}        │
+│      }                                                                      │
+│  )                                                                          │
+│                                                                             │
+│  → Message arrives at SNS service endpoint                                  │
+│  → SNS stores message + attributes in memory (not persisted in SNS)         │
+│  → Processing begins IMMEDIATELY (sub-millisecond)                          │
+│                                                                             │
+│  STEP 2: SNS EVALUATES EACH SUBSCRIPTION                                    │
+│  ════════════════════════════════════════                                    │
+│  For EACH subscription on this topic:                                       │
+│                                                                             │
+│    Subscription 1: ETL Queue                                                │
+│    FilterPolicy: {"event_type": ["etl_event"]}                              │
+│    Message has:   event_type = "order_event"                                │
+│    Evaluation:    "order_event" IN ["etl_event"]? → NO                      │
+│    Result:        ❌ SKIP — message NOT delivered to ETL Queue               │
+│                                                                             │
+│    Subscription 2: Order Queue                                              │
+│    FilterPolicy: {"event_type": ["order_event"]}                            │
+│    Message has:   event_type = "order_event"                                │
+│    Evaluation:    "order_event" IN ["order_event"]? → YES                   │
+│    Result:        ✅ DELIVER to Order Queue                                  │
+│                                                                             │
+│    Subscription 3: Alert Queue                                              │
+│    FilterPolicy: {"event_type": ["alert_event", "data_quality_event"]}      │
+│    Message has:   event_type = "order_event"                                │
+│    Evaluation:    "order_event" IN ["alert_event","data_quality_event"]? → NO│
+│    Result:        ❌ SKIP                                                    │
+│                                                                             │
+│    Subscription 4: Audit Queue                                              │
+│    FilterPolicy: (none)                                                     │
+│    Evaluation:    No filter = always match                                  │
+│    Result:        ✅ DELIVER to Audit Queue                                  │
+│                                                                             │
+│  STEP 3: FILTER POLICY EVALUATION RULES                                     │
+│  ══════════════════════════════════════                                      │
+│                                                                             │
+│  RULE 1: String exact match                                                 │
+│  Policy:  {"event_type": ["order_event"]}                                   │
+│  Matches: event_type = "order_event"                                        │
+│  Logic:   value IN [list]                                                   │
+│                                                                             │
+│  RULE 2: String prefix match                                                │
+│  Policy:  {"event_type": [{"prefix": "etl_"}]}                              │
+│  Matches: event_type = "etl_event", "etl_started", "etl_anything"           │
+│  Logic:   value.startsWith(prefix)                                          │
+│                                                                             │
+│  RULE 3: Numeric exact match                                                │
+│  Policy:  {"price": [{"numeric": ["=", 100]}]}                              │
+│  Matches: price = 100                                                       │
+│                                                                             │
+│  RULE 4: Numeric range                                                      │
+│  Policy:  {"price": [{"numeric": ["&gt;", 0, "&lt;=", 100]}]}                     │
+│  Matches: 0 &lt; price &lt;= 100                                                  │
+│                                                                             │
+│  RULE 5: Anything-but (exclusion)                                           │
+│  Policy:  {"event_type": [{"anything-but": ["test_event"]}]}                │
+│  Matches: any event_type EXCEPT "test_event"                                │
+│                                                                             │
+│  RULE 6: Exists / not-exists                                                │
+│  Policy:  {"severity": [{"exists": true}]}                                  │
+│  Matches: any message that HAS the severity attribute (any value)           │
+│  Policy:  {"severity": [{"exists": false}]}                                 │
+│  Matches: any message MISSING the severity attribute                        │
+│                                                                             │
+│  RULE 7: Multiple attributes = AND logic                                    │
+│  Policy:  {"event_type": ["etl_event"], "severity": ["critical"]}           │
+│  Matches: event_type="etl_event" AND severity="critical"                    │
+│  Logic:   ALL attributes must match                                         │
+│                                                                             │
+│  RULE 8: Multiple values per attribute = OR logic                           │
+│  Policy:  {"event_type": ["alert_event", "data_quality_event"]}             │
+│  Matches: event_type="alert_event" OR event_type="data_quality_event"       │
+│  Logic:   ANY value in the array can match                                  │
+│                                                                             │
+│  COMBINED: AND between attributes, OR within attribute values               │
+│                                                                             │
+│  STEP 4: DELIVERY MECHANICS                                                 │
+│  ════════════════════════════                                                │
+│  → Matched subscriptions: SNS pushes message to SQS via internal API        │
+│  → SQS receives: message body + message attributes + SNS metadata           │
+│  → Unmatched subscriptions: message SILENTLY not delivered                   │
+│  → No error, no log, no DLQ for unmatched (by design)                       │
+│  → CloudWatch metric: NumberOfNotificationsFilteredOut                       │
+│                                                                             │
+│  STEP 5: FILTER POLICY SCOPE (since 2022)                                   │
+│  ════════════════════════════════════════                                    │
+│  FilterPolicyScope = "MessageAttributes" (default)                          │
+│  → Filters on MessageAttributes dictionary                                  │
+│  → FASTER — attributes are indexed metadata                                 │
+│  → Publisher MUST set MessageAttributes explicitly                          │
+│                                                                             │
+│  FilterPolicyScope = "MessageBody"                                          │
+│  → Filters on JSON fields inside the message body                           │
+│  → SLOWER — SNS must parse JSON body                                        │
+│  → Useful when publisher doesn't support MessageAttributes                  │
+│  → Policy syntax identical, but targets body fields                         │
+│                                                                             │
+│  PERFORMANCE:                                                               │
+│  → Filter evaluation: &lt;1ms per subscription                                 │
+│  → No throughput penalty — same publish rate with/without filters            │
+│  → Filtering is FREE — no additional SNS charges                            │
+│  → You SAVE money: fewer SQS deliveries = fewer SQS requests               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Messages disappearing — queue receives nothing"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Publisher publishes WITHOUT MessageAttributes
+→ Filter policy requires event_type = "etl_event"
+→ Message has NO event_type attribute → filter does NOT match
+→ SNS silently drops delivery to this subscription
+→ Fix: ALWAYS set MessageAttributes when publishing
+→ Detection: monitor NumberOfNotificationsFilteredOut-NoMessageAttributes
+
+PITFALL 2: "Filter policy set but queue still gets everything"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: filter policy was set on wrong subscription ARN
+→ Or: filter policy was set but not confirmed yet
+→ Debug: aws sns get-subscription-attributes --subscription-arn &lt;arn&gt;
+→ Verify: "FilterPolicy" key exists in output
+
+PITFALL 3: "Data type mismatch — String vs Number"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Publisher sets: severity = {"DataType": "Number", "StringValue": "1"}
+→ Filter policy: {"severity": ["1"]}  (string match)
+→ DOES NOT MATCH — Number "1" ≠ String "1"
+→ Fix: use consistent DataType across publisher and filter
+→ Best practice: use String for everything except numeric ranges
+
+PITFALL 4: "Empty filter policy {} means no filter"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ WRONG: {} means "filter that matches nothing" → receives NOTHING
+→ No filter at all = subscription attribute "FilterPolicy" absent
+→ This is a critical distinction
+→ To remove filter: delete the FilterPolicy attribute entirely
+
+PITFALL 5: "Cross-account filtered subscription not receiving"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ From Project 59: cross-account SNS→SQS needs queue policy
+→ Filter policies work the same cross-account
+→ But: SQS queue policy must allow sns:SendMessage from topic ARN
+→ If policy is missing: even matched messages fail silently
+
+PITFALL 6: "Raw message delivery breaks attribute forwarding"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ From Project 14: RawMessageDelivery = true
+→ With raw delivery: SQS receives message body directly
+→ MessageAttributes ARE still forwarded as SQS message attributes
+→ But: SNS metadata envelope is stripped
+→ Filter still works — filtering happens BEFORE delivery format
+
+PITFALL 7: "Attribute name is case-sensitive"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Publisher sets: "Event_Type" = "etl_event"
+→ Filter policy: {"event_type": ["etl_event"]}
+→ NO MATCH — "Event_Type" ≠ "event_type"
+→ Fix: standardize on lowercase_snake_case everywhere</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT STATE:
+</span>→ 200K messages/day through single topic
+→ 4 subscriptions with filters
+→ SNS handles this trivially
+
+AT 10M MESSAGES/DAY:
+→ SNS soft limit: 30,000 publishes/second (adjustable)
+→ 10M/day = ~115/second average → well within limits
+→ Filter evaluation: &lt;1ms × 4 subscriptions = &lt;4ms overhead
+→ No scaling concern
+
+AT 100M MESSAGES/DAY:
+→ ~1,157 publishes/second average
+→ Peak: maybe 5,000/second
+→ Still within default limits
+→ Consider: request limit increase if bursts exceed 30K/sec
+
+SUBSCRIPTION SCALING:
+→ Max subscriptions per topic: 12,500,000 (soft limit)
+→ Each subscription can have its own filter policy
+→ Filter evaluation is O(n) where n = number of subscriptions
+→ At 100+ subscriptions: consider separate topics by domain
+
+FILTER POLICY LIMITS:
+→ Max policy size: 256 KB per subscription
+→ Max attribute names in policy: 5
+→ Max total values across all attributes: 150
+→ Max nesting depth: attribute → condition → value (3 levels)
+
+COST IMPACT:
+→ Without filtering (Project 14 pattern):
+  200K msgs × 4 queues = 800K SQS deliveries
+  SQS cost: 800K × $0.40/million = $0.32/day
+
+→ With filtering (this project):
+  200K msgs × avg 2 matching queues = 400K SQS deliveries
+  SQS cost: 400K × $0.40/million = $0.16/day
+  
+→ Savings: 50% SQS cost + eliminated wasted consumer compute
+→ At scale (100M msgs/day): savings = thousands of dollars/month
+
+FIFO VARIANT:
+→ SNS FIFO topic → SQS FIFO queue with filters
+→ Works identically but adds ordering + dedup
+→ FIFO throughput: 300 publishes/sec (with batching: 3,000/sec)
+→ Use only when ordering matters (Project 13 distinction applies)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY FILTERS ARE WORKING:
+</span>
+1. Subscription-level verification:
+   → aws sns get-subscription-attributes --subscription-arn &lt;arn&gt;
+   → Check "FilterPolicy" and "FilterPolicyScope" values
+   → Confirm policy JSON matches your intent
+
+2. Publish test messages with known attributes:
+   → Publish event_type="etl_event" → verify ONLY ETL Queue receives
+   → Publish event_type="order_event" → verify ONLY Order Queue receives
+   → Publish with NO attributes → verify ONLY Audit Queue receives
+
+3. CloudWatch metrics per subscription:
+   → NumberOfMessagesPublished (topic-level)
+   → NumberOfNotificationsDelivered (per subscription)
+   → NumberOfNotificationsFilteredOut (per subscription)
+   → NumberOfNotificationsFilteredOut-NoMessageAttributes
+   → NumberOfNotificationsFilteredOut-InvalidAttributes
+
+4. SQS queue depth monitoring:
+   → ApproximateNumberOfMessages on each queue
+   → After filtering: each queue should show LOWER depth than total published
+   → Audit Queue depth ≈ total published (no filter)
+
+5. End-to-end tracing:
+   → Add unique message_id in body
+   → Publish → check each queue → verify presence/absence
+   → Automate as integration test in CI/CD
+
+6. CloudTrail:
+   → sns:Subscribe with FilterPolicy → logged
+   → sns:SetSubscriptionAttributes → logged
+   → Shows WHO changed filters and WHEN</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(51)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Infrastructure Setup — Topic + Filtered Queues</h3>
+
+<h3>Step 2: Publisher Module — Publish with MessageAttributes</h3>
+
+<h3>Step 3: Consumer Verification — Check What Each Queue Actually Received</h3>
+
+<h3>Step 4: Advanced Filter Patterns — Numeric, Prefix, Anything-But, Exists</h3>
+
+<h3>Step 5: Update Filter Policy on Existing Subscription (Without Recreating)</h3>
+
+<h3>Step 6: Body-Based Filtering (When Publisher Can't Set Attributes)</h3>
+
+<h3>Step 7: CloudWatch Monitoring for Filter Effectiveness</h3>
+
+<h3>Step 8: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Set up infrastructure (topic + queues + filtered subscriptions)</span><span>
+</span>python 51_01_setup_filtered_infrastructure.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Publish test events with various MessageAttributes</span><span>
+</span>python 51_02_event_publisher.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Verify each queue received ONLY the correct messages</span><span>
+</span>python 51_03_verify_filtered_routing.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Reference: all available filter patterns</span><span>
+</span>python 51_04_advanced_filter_patterns.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Update filter policies on live subscriptions</span><span>
+</span>python 51_05_update_filter_policy.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Demo body-based filtering for 3rd party publishers</span><span>
+</span>python 51_06_body_based_filtering.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Monitor filter metrics + create alarms + calculate savings</span><span>
+</span>python 51_07_monitor_filter_metrics.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Cleanup</span><span>
+</span>python 51_08_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT FROM VERIFICATION (Step 3):
+</span>
+============================================================
+🔍 VERIFYING FILTERED MESSAGE ROUTING
+============================================================
+
+📥 Draining: quickcart-etl-queue
+
+  📊 Results for quickcart-etl-queue:
+     Expected count: 2
+     Actual count:   2
+     Expected events: ['file_landed', 'glue_job_failed']
+     Actual events:   ['file_landed', 'glue_job_failed']
+     ✅ PASS — correct messages routed
+
+📥 Draining: quickcart-order-queue
+
+  📊 Results for quickcart-order-queue:
+     Expected count: 2
+     Actual count:   2
+     Expected events: ['order_placed', 'order_shipped']
+     Actual events:   ['order_placed', 'order_shipped']
+     ✅ PASS — correct messages routed
+
+📥 Draining: quickcart-alert-queue
+
+  📊 Results for quickcart-alert-queue:
+     Expected count: 3
+     Actual count:   3
+     Expected events: ['pipeline_failed', 'dq_check_failed', 'schema_drift_detected']
+     Actual events:   ['pipeline_failed', 'dq_check_failed', 'schema_drift_detected']
+     ✅ PASS — correct messages routed
+
+📥 Draining: quickcart-audit-queue
+
+  📊 Results for quickcart-audit-queue:
+     Expected count: 7
+     Actual count:   7
+     Expected events: ['file_landed', 'glue_job_failed', 'order_placed', ...]
+     Actual events:   ['file_landed', 'glue_job_failed', 'order_placed', ...]
+     ✅ PASS — correct messages routed
+
+============================================================
+🎉 ALL QUEUES PASSED — FILTER ROUTING IS CORRECT
+============================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SNS Message Filtering routes messages at BROKER level, not application level
+→ Filter policies use MessageAttributes (metadata) not message body (by default)
+→ Multiple values in one attribute = OR logic
+→ Multiple attributes = AND logic
+→ Operators: exact, prefix, suffix, anything-but, numeric range, exists
+→ No filter policy = receives everything (catch-all)
+→ Empty filter policy {} = receives NOTHING (dangerous!)
+→ Filtering is FREE — saves SQS cost and consumer compute
+→ Always include a catch-all subscriber for compliance/debugging
+→ Monitor NumberOfNotificationsFilteredOut-NoMessageAttributes
+→ Body-based filtering available when you can't control publisher attributes
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 12: SNS basics — topic, subscription, publish
+→ Project 13: SQS fundamentals — queue types, visibility timeout
+→ Project 14: SNS→SQS fan-out — same message to all (unfiltered)
+→ Project 27: EC2 SQS consumer — long polling, delete after process
+→ Project 50: DLQ — failed messages quarantined (applies per filtered queue)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 52: "Pipeline Load Spikes — EC2 Workers Must Scale Automatically"
+  - SQS-based auto scaling: scale EC2 workers based on queue depth
+  - Each filtered queue can have its OWN auto scaling group
+  - ETL queue scales independently from Order queue
+  - Filter routing + auto scaling = intelligent resource allocation
+  
+  Example:
+  - ETL Queue has 50,000 messages → scale to 10 ETL workers
+  - Order Queue has 2,000 messages → scale to 2 order workers
+  - Alert Queue has 5 messages → 1 worker is enough
+  - WITHOUT filtering: all workers process all types → waste
+  - WITH filtering: right workers for right work at right scale</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has intelligent message routing:
+</span>→ Each queue receives ONLY what it needs
+→ No wasted compute processing irrelevant messages
+→ Monitoring alerts when publishers forget attributes
+
+BUT: During Black Friday, ETL Queue suddenly has 500,000 messages
+→ Single EC2 worker processing at 100 messages/second
+→ Backlog: 500,000 / 100 = 5,000 seconds = 83 minutes to drain
+→ SLA requires: process within 15 minutes
+→ Manual solution: SSH in, start more workers
+→ 3 AM on Black Friday: nobody is awake to SSH
+
+CTO: "Can't we automatically spin up more workers when queue grows?"
+YOU: "That's exactly what SQS-based Auto Scaling does."
+
+→ Project 52: "Pipeline Load Spikes — EC2 Workers Must Scale Automatically"
+→ Introduces: EC2 Auto Scaling Group, Launch Template, 
+   CloudWatch Alarms on ApproximateNumberOfMessages,
+   Scale-out and scale-in policies tied to queue depth</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-50.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 51 of 80</span>
+    <span class="nav-project-title">ROUTE DIFFERENT MESSAGE TYPES TO DIFFERENT SQS QUEUES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-52.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-52.html") window.location = "project-52.html";
+  if (e.key === 'ArrowLeft' && "project-50.html") window.location = "project-50.html";
+});
+</script>
+</body>
+</html>

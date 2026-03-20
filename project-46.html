@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 46: QUERY MARIADB LIVE FROM ATHENA WITHOUT ETL — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:57%"></div></div>
+<div id="progress-label">57%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 46 of 80</div>
+  <div class="project-title">QUERY MARIADB LIVE FROM ATHENA WITHOUT ETL</div>
+  <div class="project-tags"><span class="project-tag">MariaDB</span><span class="project-tag">Athena</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — 20 months old, scaling rapidly
+</span>Team: 5-person data team, growing analytics demand
+
+CURRENT STATE (built through Projects 1–45):
+→ Medallion data lake: Bronze → Silver → Gold (Project 44)
+→ CDC pipeline: MariaDB → Bronze → Silver → Gold (nightly, Project 42)
+→ Schema evolution handled gracefully (Project 45)
+→ Athena queries Gold zone for dashboards (Projects 24, 26)
+→ All automated via Step Functions (Project 41)
+
+THE LATENCY PROBLEM:
+
+  Timeline of a data point's journey:
+  
+  11:30 AM — Customer places order in mobile app
+              → Row inserted into MariaDB orders table
+  
+  12:00 AM — CDC extraction runs (Project 42)
+              → Row extracted to Bronze (12.5 hours after insertion)
+  
+  12:30 AM — Bronze→Silver ETL (Project 44)
+              → Row cleaned and written to Silver
+  
+  01:00 AM — Silver→Gold ETL (Project 44)
+              → Row included in aggregations
+  
+  01:05 AM — Gold available in Athena
+              → Analyst can finally query this order
+  
+  TOTAL LATENCY: 13.5 hours (11:30 AM → 01:05 AM next day)
+
+THREE SCENARIOS WHERE THIS IS UNACCEPTABLE:
+
+  Scenario A: "Real-time fraud investigation"
+  → Security team: "We detected suspicious orders in the last hour.
+    We need to query MariaDB NOW to see all orders from this IP address.
+    We can't wait until tomorrow."
+  
+  Scenario B: "Flash sale monitoring"
+  → Marketing team: "We launched a 2-hour flash sale at 2 PM.
+    We need to see order volume IN REAL TIME to decide whether
+    to extend the sale. Gold zone data is from last night."
+  
+  Scenario C: "Ad-hoc exploration of source data"
+  → Analytics engineer: "I'm building a new Gold table.
+    I need to explore the MariaDB schema interactively.
+    I don't want to build a full ETL pipeline just to explore."
+
+CTO: "Our analysts know SQL. MariaDB has the data RIGHT NOW.
+      Can't we just let Athena query MariaDB directly?
+      Skip the entire pipeline for ad-hoc queries?"
+
+YOU: "Yes — that's Athena Federated Query.
+      Athena sends your SQL to MariaDB via a Lambda connector.
+      Results come back as if it were an S3 table.
+      Zero pipeline. Zero latency. But with trade-offs."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Athena Federated Query architecture
+</span>
+  NORMAL ATHENA (Projects 16, 24, 26):
+  ┌──────────┐      ┌──────────────┐      ┌──────┐
+  │ Athena   │─────→│ Glue Catalog │─────→│  S3  │
+  │ (SQL)    │      │ (schema)     │      │(data)│
+  └──────────┘      └──────────────┘      └──────┘
+
+  FEDERATED ATHENA (this project):
+  ┌──────────┐      ┌──────────────┐      ┌──────────────┐      ┌─────────┐
+  │ Athena   │─────→│ Data Source  │─────→│ Lambda       │─────→│ MariaDB │
+  │ (SQL)    │      │ Catalog      │      │ Connector    │      │ (live)  │
+  └──────────┘      └──────────────┘      └──────────────┘      └─────────┘
+
+  How it works:
+  1. Analyst writes: SELECT * FROM mariadb.quickcart.orders WHERE order_date = '2025-01-15'
+  2. Athena recognizes "mariadb" as a federated data source (not Glue Catalog)
+  3. Athena invokes the Lambda connector with the query
+  4. Lambda connector:
+     a. Connects to MariaDB via JDBC
+     b. Pushes down the WHERE clause (predicate pushdown)
+     c. Executes: SELECT * FROM orders WHERE order_date = '2025-01-15'
+     d. Reads results from MariaDB
+     e. Converts to Apache Arrow format
+     f. Writes Arrow batches to S3 spill bucket (if results &gt; Lambda memory)
+     g. Returns results to Athena
+  5. Athena presents results to analyst as normal query output
+
+Step 2: Evaluate trade-offs
+
+  ┌─────────────────────────┬─────────────────────────┬──────────────────────────┐
+  │ Factor                  │ Athena on S3 (normal)   │ Athena Federated (this)  │
+  ├─────────────────────────┼─────────────────────────┼──────────────────────────┤
+  │ Data freshness          │ Hours/days old           │ Real-time (live query)   │
+  │ Query performance       │ Fast (columnar Parquet)  │ Slower (row-based JDBC)  │
+  │ Cost per query          │ $5/TB scanned in S3     │ $5/TB + Lambda cost      │
+  │ Load on source          │ Zero (reads S3)          │ Direct load on MariaDB   │
+  │ Concurrent queries      │ Unlimited (S3)           │ Limited (MariaDB conns)  │
+  │ Data types              │ Parquet native types     │ JDBC type conversion     │
+  │ Complex joins           │ Fast (Athena engine)     │ Slow (cross-source join) │
+  │ Setup complexity        │ Low (S3 + Catalog)       │ Medium (Lambda + VPC)    │
+  │ Schema management       │ Glue Catalog             │ Auto-discovered from DB  │
+  └─────────────────────────┴─────────────────────────┴──────────────────────────┘
+
+Step 3: Design the solution
+
+  Components needed:
+  1. Lambda function running the MySQL connector
+  2. Lambda in same VPC as MariaDB (for network access)
+  3. S3 spill bucket (for large result sets that exceed Lambda memory)
+  4. Athena data source catalog entry
+  5. IAM roles for Lambda and Athena
+  6. Secrets Manager for MariaDB credentials (no hardcoded passwords)
+
+Step 4: Decide connector approach
+
+  Option A: AWS pre-built MySQL connector (Athena Query Federation SDK)
+  → AWS provides ready-made connectors for MySQL/MariaDB
+  → Deploy via SAR (Serverless Application Repository)
+  → Zero custom code
+  → DECISION: ✅ Use this
+
+  Option B: Custom Lambda connector
+  → Write your own using Athena Federation SDK
+  → Full control over query translation
+  → Needed for exotic data sources
+  → DECISION: Overkill for MariaDB</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │                        ATHENA FEDERATED QUERY                         │
+  │                                                                        │
+  │  Analyst's SQL:                                                        │
+  │  SELECT o.order_id, o.total_amount, c.name, c.tier                    │
+  │  FROM "mariadb_source".quickcart.orders o                              │
+  │  JOIN "quickcart_gold".customer_360 c                                  │ ← CROSS-SOURCE
+  │    ON o.customer_id = c.customer_id                                    │    JOIN!
+  │  WHERE o.order_date = CURRENT_DATE                                     │
+  │  AND c.segment = 'platinum'                                            │
+  │                                                                        │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │ Athena Engine                                                    │   │
+  │  │                                                                   │   │
+  │  │  Table: "mariadb_source".quickcart.orders                        │   │
+  │  │  → Route to Lambda connector                                     │   │
+  │  │  → Pushdown: WHERE order_date = '2025-01-15'                    │   │
+  │  │                                                                   │   │
+  │  │  Table: "quickcart_gold".customer_360                            │   │
+  │  │  → Route to Glue Catalog → S3 (normal path)                    │   │
+  │  │                                                                   │   │
+  │  │  JOIN: performed in Athena engine (after both sources return)    │   │
+  │  └──────────────┬───────────────────────────┬───────────────────────┘   │
+  │                 │                           │                           │
+  │                 ▼                           ▼                           │
+  │  ┌──────────────────────┐    ┌──────────────────────────────┐         │
+  │  │ Lambda Connector     │    │ S3 Gold Zone                  │         │
+  │  │ (MySQL/MariaDB)      │    │ (Parquet — Project 44)        │         │
+  │  │                      │    │                                │         │
+  │  │ → Connects to MariaDB│    │ → Athena scans Parquet        │         │
+  │  │ → Pushes WHERE clause│    │ → Partition pruning           │         │
+  │  │ → Returns Arrow data │    │ → Columnar read               │         │
+  │  │ → Spills to S3 if    │    │                                │         │
+  │  │   results &gt; memory   │    │                                │         │
+  │  └──────────┬───────────┘    └──────────────────────────────┘         │
+  │             │                                                          │
+  │             ▼                                                          │
+  │  ┌──────────────────────┐                                              │
+  │  │ MariaDB (EC2)        │                                              │
+  │  │ VPC: 10.0.1.0/24     │                                              │
+  │  │ Port: 3306           │                                              │
+  │  │                      │                                              │
+  │  │ LIVE production data │                                              │
+  │  └──────────────────────┘                                              │
+  └────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Give analysts direct MariaDB access (MySQL Workbench)
+</span>→ Simple: just create read-only MariaDB user
+→ Problem: analysts must learn MySQL syntax (not standard SQL)
+→ Problem: can't JOIN with S3/Gold zone data
+→ Problem: no query cost tracking, no workgroup isolation
+→ Problem: one bad query can lock MariaDB tables
+→ VERDICT: Dangerous for production database
+
+Option B: Create a MariaDB read replica, give analysts access to replica
+→ Better: queries don't impact production
+→ Problem: still can't join with S3 data
+→ Problem: managing another database instance
+→ Problem: no unified SQL interface
+→ VERDICT: Good isolation, but not integrated with data lake
+
+Option C: Run hourly CDC (reduce latency from 13.5h to 1h)
+→ Reduce CDC interval from nightly to hourly
+→ Problem: 1 hour still too slow for real-time fraud investigation
+→ Problem: 24× more Glue job runs = 24× more cost
+→ Problem: doesn't solve ad-hoc exploration use case
+→ VERDICT: Helps latency, doesn't solve all scenarios
+
+Option D: Athena Federated Query via Lambda connector
+→ ✅ Real-time: queries live MariaDB data
+→ ✅ Unified: same Athena interface as S3/Gold queries
+→ ✅ Cross-source JOINs: MariaDB + S3 in single query
+→ ✅ Managed: Lambda auto-scales, no server management
+→ ✅ Secure: credentials in Secrets Manager, VPC networking
+→ Trade-off: slower than native Athena on S3, loads MariaDB
+→ VERDICT: Best for ad-hoc + real-time queries
+
+DECISION: Option D — Athena Federated Query
+→ Use for: ad-hoc exploration, real-time investigations, urgent queries
+→ NOT for: scheduled dashboards (use Gold zone — Project 44)
+→ NOT for: heavy analytical workloads (use Redshift — Project 10)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Store MariaDB credentials in Secrets Manager
+</span>   → Never hardcode in Lambda environment variables
+   → Lambda connector reads from Secrets Manager at runtime
+   → Secrets can be rotated without redeploying Lambda (Project 70)
+
+2. Deploy Lambda in the SAME VPC as MariaDB
+   → Lambda needs network access to MariaDB on port 3306
+   → Place Lambda in private subnet with route to MariaDB subnet
+   → Security group: allow Lambda SG → MariaDB SG on port 3306
+
+3. Create a READ-ONLY MariaDB user for federated queries
+   → GRANT SELECT ON quickcart.* TO 'athena_reader'@'%'
+   → No INSERT, UPDATE, DELETE permissions
+   → Prevents accidental data modification via federated query
+
+4. Configure S3 spill bucket for large results
+   → Lambda memory: max 10 GB
+   → If query returns &gt; Lambda memory: spills to S3 temporarily
+   → Spill bucket lifecycle: delete after 1 day
+
+5. Use Athena Workgroups to control federated query access
+   → Workgroup "federated-adhoc": allowed to use federated sources
+   → Workgroup "dashboard-prod": only allowed Glue Catalog (S3)
+   → Prevents dashboards from accidentally querying MariaDB live
+
+6. Enable predicate pushdown
+   → WHERE clauses pushed to MariaDB (not filtered in Lambda)
+   → Without pushdown: Lambda reads ENTIRE table → filters in memory
+   → With pushdown: MariaDB reads only matching rows → much faster
+
+7. Set Lambda concurrency limit
+   → Each concurrent Lambda = one MariaDB connection
+   → MariaDB max_connections: 151 (default)
+   → Lambda reserved concurrency: 10 (prevents connection exhaustion)
+   → 10 concurrent federated queries max</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use federated queries for scheduled dashboards
+</span>   → Dashboard refreshes every 15 minutes → 96 queries/day on MariaDB
+   → Each query scans production database
+   → Use Gold zone in S3 for dashboards (faster, cheaper, no DB load)
+   → Federated = ad-hoc only
+
+2. DO NOT run SELECT * without WHERE on large tables
+   → SELECT * FROM mariadb.quickcart.orders (5.2M rows)
+   → Lambda tries to read 5.2M rows via JDBC → timeout
+   → MariaDB under heavy read load → production app slows down
+   → ALWAYS use WHERE clause to limit results
+
+3. DO NOT join large federated tables with large S3 tables
+   → JOIN mariadb.orders (5.2M) WITH gold.customer_360 (500K)
+   → Lambda reads 5.2M rows → Athena reads 500K rows → JOIN in engine
+   → Extremely slow and expensive
+   → Better: filter federated side first (WHERE), then join
+
+4. DO NOT deploy Lambda outside the VPC
+   → Lambda outside VPC cannot reach MariaDB on private IP
+   → Common mistake: Lambda works in test (public RDS) but fails in prod (private EC2)
+   → Always deploy in same VPC with proper subnet + security group
+
+5. DO NOT share MariaDB production credentials with Lambda
+   → Create a SEPARATE read-only user for federated queries
+   → If Lambda credentials are compromised: read-only limits damage
+   → Production app user has INSERT/UPDATE → never share with Lambda
+
+6. DO NOT skip the spill bucket configuration
+   → Without spill bucket: queries returning &gt; Lambda memory FAIL
+   → Error: "Spill bucket not configured" or OutOfMemoryError
+   → Always configure even if you think results will be small
+
+7. DO NOT set Lambda timeout too short
+   → Default Lambda timeout: 3 seconds → federated query ALWAYS fails
+   → Federated queries need: 30–300 seconds depending on data volume
+   → Set timeout to 900 seconds (15 minutes) for safety</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬───────────────────────────────┬──────────────────────────────┐
+</span>│ Query Pattern                        │ Best Tool                     │ Why                          │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ Dashboard (scheduled, high frequency)│ Athena on S3 Gold zone        │ Fast, cheap, no DB load      │
+│                                      │ (Projects 24, 26, 44)         │                              │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ Ad-hoc exploration (one-time)        │ Athena Federated Query        │ Real-time, no pipeline needed│
+│                                      │ (THIS PROJECT)                │                              │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ Heavy analytics (joins, GROUP BY)    │ Redshift (Project 10)         │ MPP engine, fastest for      │
+│                                      │                               │ complex aggregations         │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ Real-time fraud investigation        │ Athena Federated + Gold JOIN  │ Live data + historical       │
+│                                      │ (THIS PROJECT)                │ context in single query      │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ ML feature engineering (large scale) │ Glue ETL on Silver zone       │ Distributed processing,      │
+│                                      │ (Project 44)                  │ no DB load                   │
+├──────────────────────────────────────┼───────────────────────────────┼──────────────────────────────┤
+│ Cross-source exploration             │ Athena Federated              │ Join MariaDB + S3 + Redshift │
+│ (MariaDB + S3 + Redshift)           │ (THIS + Project 64)           │ in single SQL                │
+└──────────────────────────────────────┴───────────────────────────────┴──────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ATHENA FEDERATED QUERY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When query runs more than 10 times per day on same data
+</span>   → Repeated federated queries = repeated MariaDB load
+   → Better: ETL once → query S3 unlimited times
+   → Rule of thumb: if query frequency &gt; 10/day, build a pipeline
+
+2. When query scans &gt; 1 million rows from source
+   → JDBC row-by-row read is inherently slow
+   → 1M rows via JDBC: ~30-60 seconds
+   → 1M rows from Parquet on S3: ~2-5 seconds
+   → For large scans: use ETL pipeline
+
+3. When source database is at capacity
+   → MariaDB CPU at 80% → federated queries push it to 100%
+   → Production app starts timing out
+   → Use read replica for federated queries if DB is stressed
+
+4. When you need sub-second query response
+   → Federated query minimum: ~3-5 seconds (Lambda cold start + JDBC)
+   → For sub-second: use DynamoDB, ElastiCache, or Redshift materialized views
+
+5. When query requires complex JOINs across multiple federated sources
+   → JOIN mariadb.orders WITH postgres.inventory WITH mongodb.sessions
+   → Each source returns full result set → Athena joins in memory
+   → Extremely slow for large tables
+   → Better: ETL all sources to S3, join there
+
+6. When data must be transformed before querying
+   → Federated query returns RAW data (no cleaning, no dedup)
+   → If you need: type casting, null handling, deduplication
+   → Use the ETL pipeline (Bronze → Silver → Gold)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                 INTERNAL MECHANICS: ATHENA FEDERATED QUERY                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ Query Execution Flow (step by step)                                         │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                        │
+│                                                                                 │
+│  User submits:                                                                  │
+│  SELECT * FROM "mariadb_source".quickcart.orders                               │
+│  WHERE order_date = '2025-01-15' AND status = 'completed'                      │
+│                                                                                 │
+│  Step 1: Athena parses SQL                                                      │
+│  → Identifies catalog: "mariadb_source" (not "AwsDataCatalog")                 │
+│  → Recognizes this is a FEDERATED source                                        │
+│  → Looks up Lambda function ARN for "mariadb_source"                           │
+│                                                                                 │
+│  Step 2: Athena invokes Lambda — METADATA call                                 │
+│  → Request type: "ListSchemas" or "ListTables" or "GetTable"                   │
+│  → Lambda connects to MariaDB via JDBC                                          │
+│  → Executes: SHOW DATABASES or SHOW TABLES or DESCRIBE orders                  │
+│  → Returns schema metadata to Athena (column names, types)                     │
+│                                                                                 │
+│  Step 3: Athena plans the query                                                 │
+│  → Creates execution plan with predicate pushdown                              │
+│  → Determines: WHERE order_date = '2025-01-15' can be pushed                   │
+│  → Determines: AND status = 'completed' can be pushed                          │
+│  → Plans: partition the read into N splits (parallel reads)                    │
+│                                                                                 │
+│  Step 4: Athena invokes Lambda — SPLIT call                                    │
+│  → Request type: "GetSplits"                                                    │
+│  → Lambda determines how to parallelize the read                               │
+│  → For MySQL: typically 1 split per query (no partitioning)                    │
+│  → Returns split metadata to Athena                                            │
+│                                                                                 │
+│  Step 5: Athena invokes Lambda — READ call (per split)                         │
+│  → Request type: "ReadRecords"                                                  │
+│  → Lambda receives: table name, column list, WHERE predicates                  │
+│  → Lambda constructs SQL:                                                       │
+│    SELECT order_id, customer_id, ... FROM orders                               │
+│    WHERE order_date = '2025-01-15' AND status = 'completed'                    │
+│  → Lambda executes against MariaDB via JDBC                                    │
+│  → Reads results row by row                                                    │
+│  → Converts to Apache Arrow format (columnar, in memory)                       │
+│  → If Arrow batch &gt; Lambda memory limit:                                        │
+│    → Writes overflow to S3 spill bucket                                        │
+│    → Returns S3 reference to Athena                                            │
+│  → If Arrow batch fits in memory:                                               │
+│    → Returns Arrow batch directly to Athena                                    │
+│                                                                                 │
+│  Step 6: Athena combines results                                                │
+│  → Receives Arrow data from all splits                                          │
+│  → Applies any remaining filters not pushed down                               │
+│  → Applies ORDER BY, LIMIT, aggregations                                       │
+│  → Writes final results to Athena output location (S3)                         │
+│  → Returns results to user                                                      │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Predicate Pushdown — What Gets Pushed                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                     │
+│                                                                                 │
+│  PUSHED (executed in MariaDB):                                                  │
+│  ┌─────────────────────────────────────────────────────────┐                   │
+│  │ WHERE column = 'value'           (equality)             │                   │
+│  │ WHERE column &gt; 100               (comparison)           │                   │
+│  │ WHERE column BETWEEN 1 AND 100   (range)                │                   │
+│  │ WHERE column IN ('a', 'b', 'c')  (set membership)       │                   │
+│  │ WHERE column IS NULL              (null check)           │                   │
+│  │ WHERE column LIKE 'abc%'         (prefix LIKE)          │                   │
+│  │ LIMIT 1000                        (row limit)            │                   │
+│  └─────────────────────────────────────────────────────────┘                   │
+│                                                                                 │
+│  NOT PUSHED (executed in Athena after full read):                               │
+│  ┌─────────────────────────────────────────────────────────┐                   │
+│  │ WHERE column LIKE '%abc%'        (contains LIKE)        │                   │
+│  │ WHERE UPPER(column) = 'ABC'      (function on column)   │                   │
+│  │ WHERE col1 + col2 &gt; 100          (computed expression)  │                   │
+│  │ HAVING COUNT(*) &gt; 5              (aggregate filter)     │                   │
+│  │ Complex subqueries                                       │                   │
+│  └─────────────────────────────────────────────────────────┘                   │
+│                                                                                 │
+│  WHY THIS MATTERS:                                                              │
+│  → Pushed predicate: MariaDB reads 1,000 matching rows → fast                 │
+│  → Non-pushed predicate: Lambda reads ALL rows → filters locally → slow        │
+│  → ALWAYS write pushable WHERE clauses for federated queries                   │
+│                                                                                 │
+│                                                                                 │
+│  ❸ Lambda Connector Architecture                                               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                             │
+│                                                                                 │
+│  AWS provides pre-built connectors via SAR (Serverless App Repository):         │
+│  → AthenaJdbcConnector (supports MySQL, MariaDB, PostgreSQL, etc.)             │
+│  → AthenaCloudwatchConnector, AthenaDynamoDBConnector, etc.                    │
+│                                                                                 │
+│  The MySQL/MariaDB connector:                                                   │
+│  → Java-based Lambda function                                                   │
+│  → Implements Athena Federation SDK interfaces:                                │
+│    - MetadataHandler: ListSchemas, ListTables, GetTable                        │
+│    - RecordHandler: ReadRecords                                                │
+│    - CompositeHandler: routes requests to appropriate handler                  │
+│  → Uses JDBC DriverManager to connect to MariaDB                              │
+│  → Connection pooling within Lambda execution context                          │
+│  → Supports SSL/TLS for encrypted connections                                  │
+│                                                                                 │
+│  Lambda memory and performance:                                                 │
+│  → 512 MB: handles ~100K rows per batch                                        │
+│  → 3 GB: handles ~500K rows per batch                                          │
+│  → 10 GB (max): handles ~2M rows per batch                                    │
+│  → Beyond Lambda memory: spills to S3 (slower but unlimited)                   │
+│                                                                                 │
+│                                                                                 │
+│  ❹ Pricing Model                                                               │
+│  ━━━━━━━━━━━━━━━                                                               │
+│                                                                                 │
+│  Athena:                                                                        │
+│  → $5.00 per TB of data scanned                                                │
+│  → For federated: "data scanned" = data returned by Lambda                     │
+│  → 1,000 rows × 1 KB/row = 1 MB scanned → $0.000005                          │
+│  → 1M rows × 1 KB/row = 1 GB scanned → $0.005                                │
+│                                                                                 │
+│  Lambda:                                                                        │
+│  → $0.20 per 1M requests                                                       │
+│  → $0.0000166667 per GB-second of compute                                      │
+│  → Typical federated query: 3-10 Lambda invocations                            │
+│  → 3 GB memory × 30 seconds = 90 GB-seconds = $0.0015                         │
+│                                                                                 │
+│  Total per query (small):                                                       │
+│  → Athena: $0.000005 + Lambda: $0.0015 = ~$0.002                              │
+│  → 500 queries/month = $1.00                                                   │
+│                                                                                 │
+│  Total per query (large — 1M rows):                                             │
+│  → Athena: $0.005 + Lambda: $0.05 = ~$0.055                                   │
+│  → 100 queries/month = $5.50                                                   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Lambda timeout — query never returns"
+</span>→ Cause: query without WHERE scans entire table
+→ Lambda default timeout: 3 seconds → always fails for DB queries
+→ Fix: set Lambda timeout to 900 seconds (15 min)
+→ Fix: ALWAYS use WHERE clause to limit data
+
+PITFALL 2: "Lambda can't connect to MariaDB"
+→ Cause #1: Lambda not in same VPC as MariaDB
+→ Cause #2: Security group doesn't allow Lambda → MariaDB on 3306
+→ Cause #3: Lambda subnet has no NAT gateway (can't reach Secrets Manager)
+→ Debug: test JDBC connection from Lambda with simple test event
+→ Fix: VPC configuration must be exact (subnet, SG, route table)
+
+PITFALL 3: "Secrets Manager access denied from Lambda"
+→ Cause: Lambda execution role lacks secretsmanager:GetSecretValue
+→ Or: Lambda in VPC without VPC endpoint for Secrets Manager
+→ Fix: add VPC endpoint for secretsmanager OR add NAT gateway
+
+PITFALL 4: "Federated query returns different types than expected"
+→ Cause: MariaDB TINYINT(1) → connector returns BOOLEAN
+→ MariaDB DECIMAL(10,2) → connector may return DOUBLE (precision loss)
+→ Fix: cast in Athena SQL: CAST(column AS DECIMAL(10,2))
+→ Or: configure type mapping in connector properties
+
+PITFALL 5: "Federated query scans 5M rows — takes 5 minutes"
+→ Cause: no predicate pushdown (WHERE clause not pushable)
+→ Example: WHERE YEAR(order_date) = 2025 → function on column → not pushed
+→ Fix: rewrite as WHERE order_date &gt;= '2025-01-01' AND order_date &lt; '2026-01-01'
+→ This is an equality/range predicate → pushed to MariaDB
+
+PITFALL 6: "MariaDB CPU spikes to 100% during federated query"
+→ Cause: federated query reads large result set via JDBC
+→ MariaDB sorts and transfers millions of rows
+→ Fix: limit concurrent federated queries (Lambda reserved concurrency)
+→ Fix: use read replica for federated queries (separate from production)
+
+PITFALL 7: "Cross-source JOIN is extremely slow"
+→ Cause: JOIN between 5M MariaDB rows and 500K S3 rows
+→ Athena must read ALL 5M rows from Lambda, ALL 500K from S3
+→ Then hash-join in Athena engine
+→ Fix: filter federated side FIRST (subquery or CTE with WHERE)
+→ Example: WITH recent_orders AS (SELECT * FROM mariadb...orders WHERE date = today)
+           SELECT * FROM recent_orders JOIN gold.customer_360 ...</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT USAGE:
+</span>→ 3-5 federated queries per day (ad-hoc only)
+→ Lambda concurrency: 1-2 at a time
+→ MariaDB impact: negligible
+→ Cost: ~$0.01/day
+
+SCALING TO 50 QUERIES/DAY:
+→ Lambda concurrency: up to 5 at peak
+→ MariaDB additional load: ~5% CPU increase
+→ Cost: ~$0.10/day
+→ Still manageable
+
+SCALING TO 500 QUERIES/DAY:
+→ Lambda concurrency: up to 20 at peak
+→ MariaDB additional load: ~30% CPU increase → CONCERNING
+→ Solutions:
+  a) Route federated queries to MariaDB read replica
+  b) Reduce Lambda concurrency limit to 10
+  c) Convert most-frequent queries to ETL pipeline
+→ Rule: if a specific query runs &gt; 10×/day → build a pipeline for it
+
+LAMBDA LIMITS:
+→ Memory: 128 MB – 10,240 MB (10 GB)
+→ Timeout: max 900 seconds (15 minutes)
+→ Payload: 6 MB (synchronous), 256 KB (async)
+→ Concurrent executions: 1000 per account (default)
+→ Reserved concurrency for connector: set to 10-20
+
+MARIADB CONNECTION LIMITS:
+→ max_connections: 151 (default)
+→ Each Lambda invocation: 1 connection
+→ Reserved concurrency 10 → max 10 connections used
+→ Production app needs: ~50-100 connections
+→ Safe headroom: 151 - 100 (app) - 10 (federated) = 41 spare
+
+CROSS-ACCOUNT (Project 64):
+→ Athena in Account A can query MariaDB in Account B
+→ Requires: cross-account Lambda invocation or shared VPC
+→ Adds latency: ~200ms for cross-account Lambda call</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR FEDERATED QUERIES:
+</span>
+1. Athena Query History
+   → Athena console → Query history → filter by data source
+   → Shows: query text, execution time, data scanned, cost
+   → Identify: slow queries, expensive queries, frequent queries
+
+2. Lambda CloudWatch Metrics
+   → Invocations: how many times connector was called
+   → Duration: how long each invocation took
+   → Errors: failed invocations (connection timeout, OOM)
+   → ConcurrentExecutions: peak concurrent federated queries
+   → Alert: if Duration &gt; 60 seconds → query is too broad
+   → Alert: if Errors &gt; 0 → connection or configuration issue
+
+3. MariaDB Performance Impact
+   → Monitor: Threads_connected, Questions, Slow_queries
+   → Compare: before vs after enabling federated queries
+   → Alert: if Threads_connected &gt; 120 (approaching max)
+   → Alert: if Slow_queries increases after enabling federated
+
+4. Cost Tracking
+   → Athena workgroup: separate workgroup for federated queries
+   → Cost tag: "QueryType=Federated" on workgroup
+   → Monthly report: federated query cost vs S3 query cost
+   → Decision: if federated cost &gt; ETL cost → build pipeline
+
+5. Query Pattern Analysis
+   → Which tables are queried most via federated?
+   → Which WHERE clauses are used?
+   → Insight: if same query runs 20×/day → candidate for ETL pipeline
+   → Insight: if query has no WHERE → educate user on pushdown</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(46)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Store MariaDB Credentials in Secrets Manager</h3>
+
+<h3>Step 2: Deploy Lambda Connector via CloudFormation</h3>
+
+<h3>Step 3: Register Athena Data Source Catalog</h3>
+
+<h3>Step 4: Run Federated Queries</h3>
+
+<h3>Step 5: Federated Query Monitoring and Guardrails</h3>
+
+<h3>Step 6: Cleanup Script</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Store MariaDB credentials in Secrets Manager</span><span>
+</span>python 46_01_create_secret.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Also: run the SQL on MariaDB to create read-only user</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Deploy Lambda connector + spill bucket + IAM role</span><span>
+</span>python 46_02_deploy_connector.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Register Athena data source + create workgroup</span><span>
+</span>python 46_03_register_athena_data_source.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># USAGE (analysts run queries in Athena console)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Demo: run sample federated queries</span><span>
+</span>python 46_04_run_federated_queries.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONITORING (weekly)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 46_05_federated_monitoring.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CLEANUP (when no longer needed)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 46_06_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Federated Query Demo):
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║  ATHENA FEDERATED QUERY DEMONSTRATION                                 ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+──────────────────────────────────────────────────────────────────────────
+📋 Query 1: Today's orders (live from MariaDB — predicate pushdown)
+──────────────────────────────────────────────────────────────────────────
+   SQL: SELECT order_id, customer_id, total_amount, status, order_date ...
+   ✅ Status: SUCCEEDED
+   ⏱  Total time: 4.2s
+   ⏱  Engine time: 3100ms
+   📊 Data scanned: 0.45 MB
+   💰 Est. cost: $0.000002
+
+   Results (20 rows shown):
+   order_id        | customer_id     | total_amount    | status          | order_date
+   ────────────────────────────────────────────────────────────────────────
+   ORD-20250115-01 | CUST-004821     | 89.99           | pending         | 2025-01-15
+   ORD-20250115-02 | CUST-012447     | 249.50          | completed       | 2025-01-15
+   ...
+
+──────────────────────────────────────────────────────────────────────────
+📋 Query 3: Cross-source JOIN — today's orders from high-value customers
+──────────────────────────────────────────────────────────────────────────
+   SQL: SELECT o.order_id, o.total_amount, o.status, c.segment, c.lifetime...
+   ✅ Status: SUCCEEDED
+   ⏱  Total time: 7.8s
+   ⏱  Engine time: 6200ms
+   📊 Data scanned: 2.34 MB
+   💰 Est. cost: $0.000012
+
+   Results (15 rows shown):
+   order_id        | total_amount    | status          | segment         | lifetime_value
+   ────────────────────────────────────────────────────────────────────────
+   ORD-20250115-47 | 899.99          | completed       | platinum        | 12847.50
+   ORD-20250115-23 | 449.00          | shipped         | gold            | 3421.00
+   ...
+
+⚡ PERFORMANCE COMPARISON: Federated vs S3 Gold
+──────────────────────────────────────────────────────────────────────────
+Metric                    Federated            S3 Gold
+──────────────────────────────────────────────────────────────────────────
+Duration                  5.3s                 1.2s
+Data Scanned              1.82 MB              0.34 MB
+Est. Cost                 $0.000009            $0.000002
+Data Freshness            Real-time            Last night
+DB Load                   Yes (MariaDB)        None (S3)
+──────────────────────────────────────────────────────────────────────────
+
+💡 TAKEAWAY:
+   → Federated: slower but REAL-TIME data
+   → S3 Gold: faster but data is hours/days old
+   → Use federated for: ad-hoc, investigation, exploration
+   → Use S3 Gold for: dashboards, reports, scheduled queries</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Athena Federated Query: SQL-query live databases through Athena
+→ Architecture: Athena → Lambda Connector → JDBC → MariaDB → Arrow → Results
+→ Predicate pushdown: WHERE clauses sent to MariaDB (critical for performance)
+→ Non-pushed predicates: functions on columns, LIKE '%abc%', computed expressions
+→ Lambda in VPC: must be in same VPC as MariaDB for network access
+→ Secrets Manager: credentials stored securely, read by Lambda at runtime
+→ Spill bucket: handles results larger than Lambda memory
+→ Reserved concurrency: protects MariaDB from connection exhaustion
+→ Cross-source JOINs: combine live MariaDB data with S3 Gold zone in one query
+→ Separate workgroup: tracks federated costs independently from S3 queries
+→ Monitoring: weekly analysis identifies queries that should become ETL pipelines
+
+DECISION FRAMEWORK:
+━━━━━━━━━━━━━━━━━━
+  "Should I use federated query or build a pipeline?"
+  
+  → Query runs &lt; 10×/day → Federated ✅
+  → Query runs &gt; 10×/day → Build ETL pipeline
+  → Need real-time data → Federated ✅
+  → Can tolerate hours-old data → S3 Gold zone
+  → Query scans &lt; 100K rows → Federated ✅
+  → Query scans &gt; 1M rows → ETL pipeline
+  → One-time investigation → Federated ✅
+  → Recurring dashboard → S3 Gold zone
+
+DATA ACCESS PATTERNS NOW AVAILABLE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ┌────────────────────────────────────────────────────────────┐
+  │ Access Pattern          │ Tool           │ Latency         │
+  ├────────────────────────────────────────────────────────────┤
+  │ Scheduled dashboards    │ Athena on Gold │ Hours (batch)   │
+  │ Ad-hoc exploration      │ Athena Federated│ Seconds (live) │
+  │ Heavy analytics         │ Redshift       │ Minutes (batch) │
+  │ App serving             │ MariaDB direct │ Milliseconds    │
+  │ Real-time investigation │ Athena Federated│ Seconds (live) │
+  │ ML feature engineering  │ Glue on Silver │ Minutes (batch) │
+  └────────────────────────────────────────────────────────────┘
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 9: MariaDB tables (source being queried)
+→ Project 16: Athena basics (now extended with federation)
+→ Project 24: Athena on Glue Catalog (normal path, still used for Gold)
+→ Project 44: Gold zone (used alongside federated for different patterns)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 47: Replicate S3 Data to Another Region for DR
+   (Now that our data lake is production-critical with multiple
+    access patterns, what happens if us-east-2 goes down?
+    We need cross-region replication for disaster recovery.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The data platform now serves multiple access patterns:
+</span>→ Batch: Athena on S3 Gold zone (dashboards)
+→ Real-time: Athena Federated Query (ad-hoc)
+→ Analytics: Redshift (heavy aggregations)
+→ App: MariaDB (low-latency OLTP)
+
+But ALL of this runs in a SINGLE AWS REGION: us-east-2 (Ohio).
+
+Then AWS has a regional incident:
+→ February 2025: us-east-2 S3 has intermittent availability issues
+→ Duration: 4 hours
+→ Impact on QuickCart:
+  - Athena queries fail (can't read S3)
+  - Glue ETL jobs fail (can't write S3)
+  - Dashboards show "Data unavailable"
+  - Redshift COPY fails (can't read from S3)
+  
+CTO: "Our ENTIRE data platform went down because ONE region had issues.
+      We need disaster recovery. If us-east-2 fails, we need our data
+      available in another region within 15 minutes."
+
+→ Project 47: "Replicate S3 Data to Another Region for DR"
+→ Introduces: S3 Cross-Region Replication, Same-Region Replication,
+  Replication Time Control, RTO/RPO definitions</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-45.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 46 of 80</span>
+    <span class="nav-project-title">QUERY MARIADB LIVE FROM ATHENA WITHOUT ETL</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-47.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-47.html") window.location = "project-47.html";
+  if (e.key === 'ArrowLeft' && "project-45.html") window.location = "project-45.html";
+});
+</script>
+</body>
+</html>

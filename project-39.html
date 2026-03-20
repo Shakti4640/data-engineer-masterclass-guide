@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 39: REDSHIFT QUERIES ARE SLOW — OPTIMIZE TABLE DESIGN — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:49%"></div></div>
+<div id="progress-label">49%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 39 of 80</div>
+  <div class="project-title">REDSHIFT QUERIES ARE SLOW — OPTIMIZE TABLE DESIGN</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — BI dashboards struggling with performance
+</span>Current State (after Projects 31-38):
+→ Redshift cluster: 2 × ra3.xlplus nodes
+→ Local tables: analytics.fact_orders (45M rows), dim_customers (2M), dim_products (50K)
+→ Spectrum: ext_gold.*, ext_silver.* (Project 38)
+→ Tableau dashboards connect to Redshift
+→ Pipeline refreshes nightly at 2 AM (Project 35)
+
+THE PERFORMANCE COMPLAINTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Complaint 1 — INCONSISTENT JOIN SPEED:
+→ Query: SELECT o.*, c.customer_name, c.tier
+         FROM fact_orders o JOIN dim_customers c ON o.customer_id = c.customer_id
+         WHERE o.order_date &gt; '2025-01-01'
+→ Monday: 0.8 seconds
+→ Tuesday: 6.2 seconds
+→ Wednesday: 0.5 seconds
+→ Thursday: 12.1 seconds (!)
+→ CEO refreshes dashboard in a meeting → 12 second wait → embarrassing
+
+Complaint 2 — AGGREGATION SLOW ON SOME COLUMNS:
+→ Fast: GROUP BY order_date → 0.3 seconds
+→ Slow: GROUP BY customer_city → 4.8 seconds
+→ Slow: GROUP BY product_category → 3.2 seconds
+→ Same table, same row count — why different speeds?
+
+Complaint 3 — TABLE GROWING BUT QUERIES GETTING SLOWER:
+→ Month 1: 15M rows, queries: 0.5s
+→ Month 3: 30M rows, queries: 1.2s
+→ Month 6: 45M rows, queries: 3.8s
+→ Linear growth in rows → exponential growth in query time
+→ "Shouldn't Redshift handle this easily?"
+
+Complaint 4 — VACUUM NEVER RAN:
+→ DELETE + INSERT pattern from Project 32 (staging merge)
+→ Every night: DELETE matching rows + INSERT new rows
+→ Deleted rows not physically removed → "ghost rows"
+→ Table has 45M live rows but 90M physical rows (50% bloat)
+→ Every query scans ghost rows → 2x slower than necessary
+
+→ Data engineer investigates with EXPLAIN and finds:
+   - EVEN distribution → all JOINs require network shuffle
+   - No SORTKEY → full table scan for date-filtered queries
+   - Statistics outdated → optimizer chooses wrong join strategy
+   - 50% table bloat from un-vacuumed deletes</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Redshift's physical data model
+</span>→ DATA DISTRIBUTION: how rows are spread across nodes/slices
+→ SORT ORDER: how rows are ordered within each slice
+→ COMPRESSION: how column data is encoded on disk
+→ ZONE MAPS: min/max metadata per block for skip-scanning
+→ STATISTICS: table metadata used by query optimizer
+
+Step 2: Diagnose the current problems
+→ Run EXPLAIN on slow queries → identify scan types
+→ Check SVV_TABLE_INFO → see distribution, sort, bloat
+→ Check STL_ALERT_EVENT_LOG → Redshift's own recommendations
+→ Check table bloat: tbl_rows vs estimated_visible_rows
+
+Step 3: Fix in priority order
+→ FIX 1: DISTKEY — eliminate JOIN shuffles (biggest win)
+→ FIX 2: SORTKEY — enable zone map skip-scanning
+→ FIX 3: VACUUM — reclaim space from deleted rows
+→ FIX 4: ANALYZE — refresh statistics for optimizer
+→ FIX 5: ENCODING — optimize column compression
+
+Step 4: Dependencies from previous projects
+→ Project 10, 11: Redshift cluster and initial table design
+→ Project 21: COPY loading patterns
+→ Project 32: Staging + merge loading (causes bloat)
+→ Project 38: Spectrum mixed queries (local table optimization critical)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION: REDESIGN TABLES WITH PROPER DISTKEY, SORTKEY, AND MAINTENANCE
+</span>
+BEFORE (current — poorly designed):
+┌─────────────────────────────────────────────────────────────┐
+│ fact_orders (45M rows)                                      │
+│   DISTSTYLE EVEN    ← rows round-robin across all slices    │
+│   NO SORTKEY        ← no ordering, full scan always         │
+│   NO VACUUM         ← 50% ghost rows                       │
+│   STALE STATISTICS  ← optimizer guesses wrong               │
+│                                                             │
+│ dim_customers (2M rows)                                     │
+│   DISTSTYLE EVEN    ← not co-located with fact_orders       │
+│   NO SORTKEY                                                │
+│                                                             │
+│ dim_products (50K rows)                                     │
+│   DISTSTYLE EVEN    ← should be ALL (small table)           │
+│   NO SORTKEY                                                │
+└─────────────────────────────────────────────────────────────┘
+
+AFTER (optimized):
+┌─────────────────────────────────────────────────────────────┐
+│ fact_orders (45M rows)                                      │
+│   DISTKEY(customer_id) ← co-located with dim_customers      │
+│   SORTKEY(order_date)  ← zone maps skip old dates           │
+│   VACUUM'd             ← no ghost rows                      │
+│   ANALYZED             ← optimizer has fresh stats           │
+│   ENCODED              ← optimal compression per column     │
+│                                                             │
+│ dim_customers (2M rows)                                     │
+│   DISTKEY(customer_id) ← co-located with fact_orders        │
+│   SORTKEY(signup_date)                                      │
+│                                                             │
+│ dim_products (50K rows)                                     │
+│   DISTSTYLE ALL        ← copied to every node (small table) │
+│   SORTKEY(category)                                         │
+└─────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Add DISTKEY and SORTKEY to existing tables (ALTER TABLE)
+</span>→ Redshift supports ALTER TABLE ... ALTER DISTSTYLE
+→ Redshift supports ALTER TABLE ... ALTER SORTKEY
+→ Pros: no data movement, no downtime
+→ Cons: slow for large tables (rebuilds internally), limited options
+
+Option B: Create new optimized tables, migrate data (DEEP COPY)
+→ CREATE new_table (DISTKEY, SORTKEY) → INSERT INTO new_table SELECT * FROM old
+→ Rename: old → old_backup, new → original name
+→ Pros: clean table, optimal encoding, fresh zone maps
+→ Cons: requires downtime (brief rename window), temporary 2x storage
+
+Option C: Use CTAS for migration (CREATE TABLE AS)
+→ CREATE TABLE new_fact_orders DISTKEY(customer_id) SORTKEY(order_date)
+   AS SELECT * FROM fact_orders
+→ Similar to Option B but single statement
+→ Pros: simpler syntax, automatic encoding
+→ Cons: same downtime concern
+
+Option D: Alter existing + VACUUM FULL + ANALYZE (minimal change)
+→ ALTER DISTSTYLE + ALTER SORTKEY on existing tables
+→ Run VACUUM FULL to reclaim space and resort
+→ Run ANALYZE to refresh statistics
+→ Pros: least disruption
+→ Cons: ALTER DISTSTYLE on 45M rows takes time
+
+DECISION: Option C (CTAS deep copy) for initial optimization
+→ Cleanest result — fresh table with optimal design
+→ Then: ongoing VACUUM + ANALYZE maintenance
+→ Schedule maintenance after nightly load completes</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Choose DISTKEY based on most common JOIN column
+</span>   → fact_orders JOINs with dim_customers ON customer_id → DISTKEY(customer_id)
+   → dim_customers JOINs with fact_orders ON customer_id → DISTKEY(customer_id)
+   → MATCHING DISTKEY = co-located join = NO network shuffle
+   → This is the SINGLE BIGGEST performance win
+
+2. Choose SORTKEY based on most common WHERE filter column
+   → Dashboards filter: WHERE order_date &gt; CURRENT_DATE - 90
+   → SORTKEY(order_date) → zone maps know min/max per block
+   → Blocks outside date range SKIPPED entirely
+   → 90-day filter on 2-year table → skip 82% of blocks
+
+3. Use DISTSTYLE ALL for small dimension tables
+   → dim_products: 50K rows × 200 bytes = 10 MB
+   → DISTSTYLE ALL: copy to EVERY node
+   → JOIN with fact_orders: no network transfer (product data local)
+   → Rule: ALL for tables &lt; 5M rows that are frequently joined
+
+4. Run VACUUM after every nightly merge load
+   → Project 32 does DELETE + INSERT (staging merge)
+   → Deleted rows become ghost rows
+   → VACUUM reclaims space + resorts data
+   → Schedule: VACUUM FULL fact_orders; after load completes
+
+5. Run ANALYZE after VACUUM
+   → ANALYZE updates statistics used by query optimizer
+   → Stale statistics → optimizer chooses wrong join strategy
+   → Schedule: ANALYZE fact_orders; after VACUUM
+
+6. Use COMPOUND SORTKEY for multiple filter columns
+   → COMPOUND SORTKEY(order_date, status)
+   → First column gets most benefit
+   → Useful when queries filter by date AND status
+
+7. Use EXPLAIN to verify optimization worked
+   → Before: DS_DIST_ALL_NONE or DS_DIST_BOTH → network shuffle
+   → After: DS_DIST_NONE → co-located join (no shuffle)
+   → Before: seq scan → full table scan
+   → After: range-restricted scan → zone map pruning</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use DISTKEY on a high-cardinality unique column
+</span>   → DISTKEY(order_id) → 45M unique values → even distribution BUT
+   → No other table joins on order_id → no co-location benefit
+   → DISTKEY should be a JOIN column, not a unique identifier
+
+2. DO NOT use DISTKEY on a skewed column
+   → If 80% of orders have customer_id = 'GUEST'
+   → DISTKEY(customer_id) → 80% of rows on one slice
+   → One slice overloaded, others idle → worse than EVEN
+   → Check: SELECT customer_id, COUNT(*) GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+   → If top value &gt; 5% of total → consider different DISTKEY
+
+3. DO NOT use DISTSTYLE ALL for large tables
+   → ALL copies entire table to every node
+   → 45M row fact table × 4 nodes = 180M rows stored
+   → 4x storage cost, 4x slower COPY loads
+   → ALL only for small tables (&lt; 5M rows)
+
+4. DO NOT skip VACUUM indefinitely
+   → Every DELETE + INSERT creates ghost rows
+   → After 30 days without VACUUM: table could be 50%+ bloat
+   → Queries scan ghost rows → 2x slower
+   → Schedule VACUUM weekly at minimum, daily for heavy-write tables
+
+5. DO NOT run VACUUM during peak query hours
+   → VACUUM FULL acquires exclusive lock briefly
+   → Dashboard queries may queue behind VACUUM
+   → Schedule VACUUM at 3-4 AM (after load, before business hours)
+
+6. DO NOT set SORTKEY on a column you never filter by
+   → SORTKEY(product_name) → useless if no query filters by name
+   → SORTKEY(order_date) → valuable because 90% of queries filter by date
+   → SORTKEY adds insert overhead → only use on high-value filter columns
+
+7. DO NOT assume ANALYZE runs automatically
+   → Redshift auto-analyzes AFTER COPY but NOT after INSERT...SELECT
+   → Project 32 uses Glue write → Redshift COPY internally
+   → But staging merge uses INSERT...SELECT → no auto-analyze
+   → Always run ANALYZE explicitly after merge operations
+
+8. DO NOT change DISTKEY/SORTKEY on production tables during business hours
+   → ALTER DISTSTYLE on 45M rows takes 10-30 minutes
+   → Table partially unavailable during redistribution
+   → Do it during maintenance window (weekend or 3 AM)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬─────────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Distribution Style  │ Why                              │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Large fact table joined          │ DISTKEY(join_column) │ Co-locates matching rows         │
+│ frequently with dimension        │                     │ Eliminates network shuffle       │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Small dimension table (&lt; 5M     │ DISTSTYLE ALL       │ Copied to all nodes              │
+│ rows) joined with many tables    │                     │ Every join is local              │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Staging/temp tables              │ DISTSTYLE EVEN      │ Balanced load, no join needed    │
+│ (write-heavy, rarely joined)     │                     │                                  │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Table with highly skewed join    │ DISTSTYLE EVEN      │ Avoids hotspot on one slice      │
+│ column (one value dominates)     │                     │ Accept shuffle cost              │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Table never joined with others   │ DISTSTYLE EVEN      │ No co-location benefit           │
+│ (standalone aggregations)        │ or DISTKEY on       │ Or optimize for self-joins       │
+│                                  │ GROUP BY column     │                                  │
+└──────────────────────────────────┴─────────────────────┴──────────────────────────────────┘
+
+┌──────────────────────────────────┬─────────────────────┬──────────────────────────────────┐
+│ Scenario                         │ Sort Key Type       │ Why                              │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Single dominant filter column    │ SORTKEY(column)     │ Maximum zone map effectiveness   │
+│ (e.g., order_date)              │                     │                                  │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Two common filter columns        │ COMPOUND SORTKEY    │ First column primary benefit     │
+│ with one more important          │ (col1, col2)        │ Second column secondary          │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Multiple equally important       │ INTERLEAVED         │ Equal benefit for all columns    │
+│ filter columns (rare)            │ SORTKEY(c1,c2,c3)   │ More VACUUM overhead             │
+│                                  │                     │ Generally avoid — use COMPOUND   │
+├──────────────────────────────────┼─────────────────────┼──────────────────────────────────┤
+│ Table with no common filters     │ No SORTKEY          │ Sort overhead without benefit    │
+│ (full scans always)              │                     │                                  │
+└──────────────────────────────────┴─────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│         REDSHIFT TABLE DESIGN — INTERNAL MECHANICS                               │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  DISTRIBUTION — HOW ROWS SPREAD ACROSS NODES:                                    │
+│  ═════════════════════════════════════════════                                    │
+│                                                                                  │
+│  CLUSTER: 2 nodes × 2 slices each = 4 slices                                    │
+│                                                                                  │
+│  DISTSTYLE EVEN (current — round-robin):                                         │
+│  ┌────────────────────────────────────────────────────────┐                      │
+│  │ fact_orders: 45M rows                                  │                      │
+│  │                                                        │                      │
+│  │ Node 1:                    Node 2:                     │                      │
+│  │ ┌──────────┬──────────┐   ┌──────────┬──────────┐     │                      │
+│  │ │ Slice 0  │ Slice 1  │   │ Slice 2  │ Slice 3  │     │                      │
+│  │ │ 11.25M   │ 11.25M   │   │ 11.25M   │ 11.25M   │     │                      │
+│  │ │ rows     │ rows     │   │ rows     │ rows     │     │                      │
+│  │ └──────────┴──────────┘   └──────────┴──────────┘     │                      │
+│  │                                                        │                      │
+│  │ dim_customers: 2M rows                                 │                      │
+│  │ ┌──────────┬──────────┐   ┌──────────┬──────────┐     │                      │
+│  │ │ Slice 0  │ Slice 1  │   │ Slice 2  │ Slice 3  │     │                      │
+│  │ │ 500K     │ 500K     │   │ 500K     │ 500K     │     │                      │
+│  │ └──────────┴──────────┘   └──────────┴──────────┘     │                      │
+│  │                                                        │                      │
+│  │ JOIN fact_orders.customer_id = dim_customers.customer_id│                     │
+│  │ → Customer C001 orders are on Slice 0                  │                      │
+│  │ → Customer C001 record is on Slice 2                   │                      │
+│  │ → MUST SHUFFLE data across network to match them       │                      │
+│  │ → 45M rows transferred between nodes = SLOW            │                      │
+│  │                                                        │                      │
+│  │ EXPLAIN shows: DS_DIST_ALL_NONE or DS_BCAST_INNER      │                      │
+│  │ (= network redistribution happening)                   │                      │
+│  └────────────────────────────────────────────────────────┘                      │
+│                                                                                  │
+│  DISTKEY(customer_id) (optimized — co-located):                                  │
+│  ┌────────────────────────────────────────────────────────┐                      │
+│  │ fact_orders: DISTKEY(customer_id)                      │                      │
+│  │ dim_customers: DISTKEY(customer_id)                    │                      │
+│  │                                                        │                      │
+│  │ → HASH(customer_id) determines which slice gets row    │                      │
+│  │ → Same customer_id → same slice in BOTH tables         │                      │
+│  │                                                        │                      │
+│  │ Node 1:                    Node 2:                     │                      │
+│  │ ┌──────────┬──────────┐   ┌──────────┬──────────┐     │                      │
+│  │ │ Slice 0  │ Slice 1  │   │ Slice 2  │ Slice 3  │     │                      │
+│  │ │ Orders   │ Orders   │   │ Orders   │ Orders   │     │                      │
+│  │ │ for      │ for      │   │ for      │ for      │     │                      │
+│  │ │ cust     │ cust     │   │ cust     │ cust     │     │                      │
+│  │ │ A-F      │ G-M      │   │ N-S      │ T-Z      │     │                      │
+│  │ │ +        │ +        │   │ +        │ +        │     │                      │
+│  │ │ Cust     │ Cust     │   │ Cust     │ Cust     │     │                      │
+│  │ │ A-F      │ G-M      │   │ N-S      │ T-Z      │     │                      │
+│  │ └──────────┴──────────┘   └──────────┴──────────┘     │                      │
+│  │                                                        │                      │
+│  │ JOIN: Each slice joins its OWN data locally            │                      │
+│  │ → ZERO network transfer                                │                      │
+│  │ → 4 slices work in parallel                            │                      │
+│  │ → EXPLAIN shows: DS_DIST_NONE (no redistribution)      │                      │
+│  │ → 10-50x faster than EVEN for this JOIN                │                      │
+│  └────────────────────────────────────────────────────────┘                      │
+│                                                                                  │
+│  DISTSTYLE ALL (for small tables):                                               │
+│  ┌────────────────────────────────────────────────────────┐                      │
+│  │ dim_products: DISTSTYLE ALL (50K rows)                 │                      │
+│  │                                                        │                      │
+│  │ Node 1:                    Node 2:                     │                      │
+│  │ ┌──────────┬──────────┐   ┌──────────┬──────────┐     │                      │
+│  │ │ Slice 0  │ Slice 1  │   │ Slice 2  │ Slice 3  │     │                      │
+│  │ │ ALL 50K  │ ALL 50K  │   │ ALL 50K  │ ALL 50K  │     │                      │
+│  │ │ products │ products │   │ products │ products │     │                      │
+│  │ └──────────┴──────────┘   └──────────┴──────────┘     │                      │
+│  │                                                        │                      │
+│  │ → Every slice has complete copy of dim_products        │                      │
+│  │ → JOIN with ANY table = always local                   │                      │
+│  │ → Storage: 4 × 50K = 200K rows (trivial for 50K)      │                      │
+│  │ → EXPLAIN shows: DS_DIST_ALL_NONE (no redistribution)  │                      │
+│  └────────────────────────────────────────────────────────┘                      │
+│                                                                                  │
+│  SORT KEY — HOW ZONE MAPS ENABLE SKIP-SCANNING:                                 │
+│  ═══════════════════════════════════════════════                                  │
+│                                                                                  │
+│  WITHOUT SORTKEY:                                                                │
+│  ┌─────────────────────────────────────────────────────┐                         │
+│  │ Data stored in insertion order (random dates)       │                         │
+│  │                                                     │                         │
+│  │ Block 1: orders from Jan, Mar, Jul, Feb, Nov, ...   │                         │
+│  │ Block 2: orders from Dec, Jan, Apr, Aug, Feb, ...   │                         │
+│  │ Block 3: orders from Jun, Jan, Oct, Mar, Sep, ...   │                         │
+│  │ ...                                                 │                         │
+│  │ Block 100: orders from Feb, Jul, Jan, Nov, ...      │                         │
+│  │                                                     │                         │
+│  │ Zone Maps (min/max per block):                      │                         │
+│  │ Block 1: order_date min=Jan, max=Nov                │                         │
+│  │ Block 2: order_date min=Jan, max=Dec                │                         │
+│  │ Block 3: order_date min=Jan, max=Oct                │                         │
+│  │ → EVERY block overlaps with every date range        │                         │
+│  │ → WHERE order_date &gt; '2025-01-01' → scan ALL blocks │                         │
+│  │ → Zone maps USELESS → full table scan               │                         │
+│  └─────────────────────────────────────────────────────┘                         │
+│                                                                                  │
+│  WITH SORTKEY(order_date):                                                       │
+│  ┌─────────────────────────────────────────────────────┐                         │
+│  │ Data physically sorted by order_date                │                         │
+│  │                                                     │                         │
+│  │ Block 1: orders from 2023-01-01 to 2023-03-15       │                         │
+│  │ Block 2: orders from 2023-03-16 to 2023-06-30       │                         │
+│  │ Block 3: orders from 2023-07-01 to 2023-09-28       │                         │
+│  │ ...                                                 │                         │
+│  │ Block 95: orders from 2025-01-01 to 2025-01-15      │ ← ONLY THIS NEEDED     │
+│  │ Block 96-100: (future data)                         │                         │
+│  │                                                     │                         │
+│  │ Zone Maps (min/max per block):                      │                         │
+│  │ Block 1: order_date min=2023-01-01, max=2023-03-15  │                         │
+│  │ Block 95: order_date min=2025-01-01, max=2025-01-15 │                         │
+│  │                                                     │                         │
+│  │ WHERE order_date &gt; '2025-01-01':                    │                         │
+│  │ → Block 1-94: max &lt; 2025-01-01 → SKIP              │                         │
+│  │ → Block 95: min = 2025-01-01 → SCAN                │                         │
+│  │ → Scanned: 1 block out of 100 → 99% skip rate      │                         │
+│  │ → 100x faster than without SORTKEY                  │                         │
+│  └─────────────────────────────────────────────────────┘                         │
+│                                                                                  │
+│  VACUUM — WHY DELETED ROWS CAUSE PROBLEMS:                                       │
+│  ═════════════════════════════════════════                                        │
+│                                                                                  │
+│  Redshift uses MVCC (Multi-Version Concurrency Control):                         │
+│  → DELETE doesn't physically remove rows                                         │
+│  → Marks them as "deleted" (invisible to queries)                                │
+│  → But they still occupy disk space                                              │
+│  → Every scan reads them and then discards                                       │
+│                                                                                  │
+│  After 30 days of DELETE + INSERT (Project 32 pattern):                           │
+│  ┌─────────────────────────────────────────────────────┐                         │
+│  │ Table: fact_orders                                  │                         │
+│  │ Live rows:    45,000,000                            │                         │
+│  │ Ghost rows:   42,000,000 (marked deleted)           │                         │
+│  │ Total on disk: 87,000,000                           │                         │
+│  │ Bloat: 48%                                          │                         │
+│  │                                                     │                         │
+│  │ Every query scans 87M rows, discards 42M            │                         │
+│  │ → Almost 2x slower than necessary                   │                         │
+│  └─────────────────────────────────────────────────────┘                         │
+│                                                                                  │
+│  VACUUM FULL:                                                                    │
+│  → Physically removes ghost rows                                                 │
+│  → Reclaims disk space                                                           │
+│  → Re-sorts data by SORTKEY                                                      │
+│  → Rebuilds zone maps                                                            │
+│  → Result: 45M rows, 0 ghost rows, perfectly sorted                              │
+│                                                                                  │
+│  ANALYZE — WHY STATISTICS MATTER:                                                │
+│  ════════════════════════════════                                                │
+│                                                                                  │
+│  Query optimizer decisions based on statistics:                                   │
+│  ┌─────────────────────────────────────────────────────┐                         │
+│  │                                                     │                         │
+│  │ WITH accurate stats:                                │                         │
+│  │ → "fact_orders has 45M rows, dim_customers has 2M"  │                         │
+│  │ → "customer_id has 2M distinct values"              │                         │
+│  │ → Optimizer: "broadcast dim_customers (smaller)"    │                         │
+│  │ → Result: fast join (2M rows broadcast, not 45M)    │                         │
+│  │                                                     │                         │
+│  │ WITH stale stats (table says 15M rows, actually 45M)│                         │
+│  │ → Optimizer: "both tables are similar size"         │                         │
+│  │ → Optimizer: "hash redistribute both"               │                         │
+│  │ → Result: 45M + 2M rows shuffled across network     │                         │
+│  │ → 10x slower than optimal plan                      │                         │
+│  │                                                     │                         │
+│  └─────────────────────────────────────────────────────┘                         │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Changed DISTKEY but query is still slow"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: DISTKEY set on fact table but NOT on dimension table
+→ Co-location requires MATCHING DISTKEY on BOTH tables
+→ Fix: Set DISTKEY(customer_id) on BOTH fact_orders AND dim_customers
+
+→ Cause B: Data skew — one customer_id has 40% of orders
+→ One slice has 40% of data → overloaded
+→ Check: SELECT customer_id, COUNT(*) FROM fact_orders GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+→ Fix: Choose a more evenly distributed DISTKEY column
+
+PITFALL 2: "SORTKEY set but zone maps not helping"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Data loaded after SORTKEY change is UNSORTED
+→ New data appended at end → not in sort order
+→ VACUUM needed to re-sort the unsorted region
+→ Check: SELECT "table", unsorted FROM svv_table_info WHERE "table" = 'fact_orders'
+→ If unsorted &gt; 20% → run VACUUM SORT ONLY fact_orders
+
+PITFALL 3: "VACUUM runs for 6 hours and blocks queries"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: VACUUM FULL on 90M row table (50% bloat) takes hours
+→ During VACUUM: table partially locked → queries may slow down
+→ Fix: Run VACUUM more frequently (daily) so less work each time
+→ Fix: Use VACUUM DELETE ONLY (faster — only removes ghosts, no resort)
+→ Then: VACUUM SORT ONLY (resort without delete phase)
+→ Split into two smaller operations
+
+PITFALL 4: "After CTAS deep copy, old views break"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CTAS creates new table with different OID
+→ Views reference table by OID, not name
+→ Rename new table → views still point to old OID
+→ Fix: DROP and recreate views after table swap
+→ Or: Use ALTER TABLE instead of CTAS (preserves OID)
+
+PITFALL 5: "ANALYZE says 'Table has not been modified since last ANALYZE'"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Redshift tracks modification flag per table
+→ After COPY: flag set → ANALYZE runs
+→ After INSERT...SELECT: flag may not set in all cases
+→ Fix: Use ANALYZE table_name PREDICATE COLUMNS to force
+
+PITFALL 6: "Query slower AFTER adding SORTKEY"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Query doesn't filter on SORTKEY column
+→ SORTKEY adds insert overhead but no scan benefit without filtering
+→ GROUP BY customer_city → SORTKEY(order_date) doesn't help
+→ Fix: Only SORTKEY on columns that appear in WHERE clauses</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PERFORMANCE IMPROVEMENT ESTIMATES:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌────────────────────────────────────────┬───────────┬───────────┬───────────┐
+│ Optimization                           │ Before    │ After     │ Speedup   │
+├────────────────────────────────────────┼───────────┼───────────┼───────────┤
+│ DISTKEY co-location (JOIN)             │ 6.2 sec   │ 0.3 sec   │ 20x       │
+│ SORTKEY zone maps (date filter)        │ 3.8 sec   │ 0.2 sec   │ 19x       │
+│ VACUUM (remove 50% ghost rows)         │ 3.8 sec   │ 1.9 sec   │ 2x        │
+│ ANALYZE (fresh statistics)             │ 12.1 sec  │ 0.8 sec   │ 15x       │
+│ DISTSTYLE ALL (small dim join)         │ 2.1 sec   │ 0.1 sec   │ 21x       │
+│ ALL COMBINED                           │ 12.1 sec  │ 0.15 sec  │ 80x       │
+└────────────────────────────────────────┴───────────┴───────────┴───────────┘
+
+MAINTENANCE SCHEDULE:
+━━━━━━━━━━━━━━━━━━━━
+┌────────────────────┬──────────────┬──────────────┬──────────────────────┐
+│ Operation          │ Frequency    │ Duration     │ When                 │
+├────────────────────┼──────────────┼──────────────┼──────────────────────┤
+│ VACUUM DELETE ONLY │ Daily        │ 5-15 min     │ After nightly load   │
+│ VACUUM SORT ONLY   │ Weekly       │ 15-45 min    │ Sunday 4 AM          │
+│ VACUUM FULL        │ Monthly      │ 30-120 min   │ First Sunday 3 AM    │
+│ ANALYZE            │ Daily        │ 2-5 min      │ After VACUUM         │
+│ Table redesign     │ Quarterly    │ 30-60 min    │ Maintenance window   │
+└────────────────────┴──────────────┴──────────────┴──────────────────────┘</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(39)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Diagnostic — Analyze Current Table Design</h3>
+
+<h3>Part 2: Optimize — Redesign Tables</h3>
+
+<h3>Part 3: Maintenance — Ongoing VACUUM and ANALYZE</h3>
+
+<h3>Part 4: Performance Benchmarking — Before vs After</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME OPTIMIZATION (maintenance window — Saturday 3 AM)              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. Run diagnostics:                                                     │
+│    $ python 39_01_diagnose_table_design.py                              │
+│    → Copy SQL → run on Redshift Query Editor                            │
+│    → Identify: EVEN distribution, no SORTKEY, bloat %, stale stats      │
+│                                                                         │
+│ 2. Run BEFORE benchmarks:                                               │
+│    $ python 39_04_benchmark.py                                          │
+│    → Copy SQL → run on Redshift → record times                          │
+│    → CRITICAL: capture baseline before any changes                      │
+│                                                                         │
+│ 3. Run optimization (CTAS deep copy):                                   │
+│    $ python 39_02_optimize_tables.py                                    │
+│    → Copy SQL → run on Redshift Query Editor                            │
+│    → Creates optimized tables → swaps names → recreates views           │
+│    → Duration: 30-60 minutes for 45M row fact table                     │
+│                                                                         │
+│ 4. Run AFTER benchmarks:                                                │
+│    → Same benchmark queries → record times                              │
+│    → Compare before/after → document improvements                       │
+│    → Expected: 10-80x speedup on most queries                           │
+│                                                                         │
+│ 5. Verify everything works:                                             │
+│    → Test Tableau dashboards                                            │
+│    → Test Spectrum mixed queries                                        │
+│    → Test all views                                                     │
+│                                                                         │
+│ 6. Drop backup tables (after 24h):                                      │
+│    → DROP TABLE analytics.fact_orders_backup                            │
+│    → DROP TABLE analytics.dim_customers_backup                          │
+│    → DROP TABLE analytics.dim_products_backup                           │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ONGOING DAILY MAINTENANCE (automated — add to workflow)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Add maintenance step to Glue Workflow (Project 35):                     │
+│                                                                         │
+│  02:00 → Job 1: MariaDB → Bronze                                       │
+│  02:11 → Crawler A: Bronze                                              │
+│  02:13 → Job 2: Bronze → Silver                                         │
+│  02:38 → Crawler B: Silver                                              │
+│  02:40 → Job 3: Silver → Redshift (DELETE + INSERT merge)               │
+│  02:47 → Job 4: Gold CTAS (Project 36)                                  │
+│  02:50 → Job 5: Redshift Maintenance ← NEW                             │
+│          → VACUUM DELETE ONLY fact_orders                                │
+│          → VACUUM DELETE ONLY dim_customers                              │
+│          → ANALYZE fact_orders                                           │
+│          → ANALYZE dim_customers                                         │
+│          → ANALYZE dim_products                                          │
+│  02:55 ✅ WORKFLOW COMPLETED (7 steps)                                   │
+│                                                                         │
+│ Weekly (Sunday 4 AM — separate scheduled job):                           │
+│  → VACUUM SORT ONLY fact_orders                                          │
+│  → VACUUM SORT ONLY dim_customers                                        │
+│  → ANALYZE VERBOSE all tables                                            │
+│                                                                         │
+│ Monthly (First Sunday 3 AM):                                             │
+│  → VACUUM FULL all tables                                                │
+│  → Full ANALYZE                                                          │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ EXPECTED PERFORMANCE IMPROVEMENTS                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ ┌────────────────────────────────┬──────────┬──────────┬──────────┐     │
+│ │ Query Type                     │ Before   │ After    │ Speedup  │     │
+│ ├────────────────────────────────┼──────────┼──────────┼──────────┤     │
+│ │ Simple JOIN (fact × dim)       │ 6.2s     │ 0.3s     │ 20x     │     │
+│ │ Date-filtered aggregation      │ 3.8s     │ 0.2s     │ 19x     │     │
+│ │ Three-way JOIN                 │ 12.1s    │ 0.4s     │ 30x     │     │
+│ │ Mixed (Local + Spectrum)       │ 15.0s    │ 2.0s     │ 7.5x    │     │
+│ │ Heavy aggregation              │ 8.0s     │ 0.5s     │ 16x     │     │
+│ │ Window function                │ 18.0s    │ 1.5s     │ 12x     │     │
+│ ├────────────────────────────────┼──────────┼──────────┼──────────┤     │
+│ │ Dashboard total load time      │ 15-20s   │ 1-3s     │ 10x     │     │
+│ └────────────────────────────────┴──────────┴──────────┴──────────┘     │
+│                                                                         │
+│ CEO refreshes dashboard in meeting → 1.5 seconds → no more waiting      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+OPTIMIZATION DECISION CHEAT SHEET:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  "Which DISTKEY should I use?"
+  → What's the most common JOIN between your fact and dimension?
+  → fact_orders JOIN dim_customers ON customer_id → DISTKEY(customer_id) on BOTH
+  → Can only have ONE DISTKEY per table → choose the most important JOIN
+
+  "Which SORTKEY should I use?"
+  → What column appears in WHERE clause most often?
+  → WHERE order_date &gt; ... → SORTKEY(order_date)
+  → Two columns? → COMPOUND SORTKEY(order_date, status)
+  → First column gets 90% of benefit
+
+  "EVEN, KEY, or ALL?"
+  → Table &lt; 5M rows AND frequently joined → ALL
+  → Table &gt; 5M rows AND frequently joined → KEY (DISTKEY on join column)
+  → Table rarely joined → EVEN (default, simplest)
+  → Staging/temp tables → EVEN (write-optimized)
+
+  "How often should I VACUUM?"
+  → DELETE + INSERT every night → VACUUM DELETE ONLY daily
+  → Lots of new data → VACUUM SORT ONLY weekly
+  → Heavy maintenance → VACUUM FULL monthly
+
+  "How often should I ANALYZE?"
+  → After every VACUUM
+  → After every COPY load
+  → After every INSERT...SELECT merge
+  → When in doubt → ANALYZE (it's fast and never hurts)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ DISTKEY co-location eliminates JOIN shuffles (20x speedup on joins)
+→ SORTKEY enables zone map skip-scanning (19x speedup on filtered queries)
+→ DISTSTYLE ALL for small dimensions → every join is local (zero shuffle)
+→ VACUUM removes ghost rows from DELETE+INSERT pattern (2x improvement)
+→ ANALYZE refreshes statistics → optimizer chooses correct join strategy
+→ COMPOUND SORTKEY(col1, col2) benefits first column most
+→ DISTKEY must MATCH on BOTH sides of a JOIN for co-location
+→ Skewed DISTKEY is worse than EVEN → check data distribution first
+→ CTAS deep copy is cleanest optimization path (fresh encoding + zone maps)
+→ Views must be recreated after table rename (reference by OID)
+→ Daily VACUUM DELETE + ANALYZE is essential for DELETE+INSERT tables
+→ Weekly VACUUM SORT maintains zone map effectiveness
+→ EXPLAIN reveals: DS_DIST_NONE (good) vs DS_DIST_ALL_NONE (shuffle)
+→ Disable result cache during benchmarking for honest measurements
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 10, 11: Redshift cluster + initial table design
+→ Project 21: COPY loading (triggers auto-ANALYZE)
+→ Project 32: Staging merge pattern (creates ghost rows → needs VACUUM)
+→ Project 38: Spectrum mixed queries (local optimization critical for joins)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 40: Redshift WLM — prioritize dashboard queries over ETL
+   (now that tables are fast, manage CONCURRENT query resources)
+→ Project 49: Redshift Stored Procedures — encapsulate maintenance logic
+   (wrap VACUUM + ANALYZE in stored procedure for scheduling)
+→ Project 63: Redshift Materialized Views — cache complex queries
+   (auto-refresh views for sub-second repeated queries)
+→ Project 67: Redshift Serverless — different optimization model
+   (serverless auto-manages distribution for you)
+→ Project 69: Cost optimization — right-size cluster after optimization
+   (faster queries → can potentially downsize cluster)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's Redshift is now blazing fast:
+</span>→ Dashboards load in 1-3 seconds (was 15-20 seconds)
+→ JOINs are co-located (no network shuffle)
+→ Date filters skip 95%+ of data via zone maps
+→ Daily maintenance keeps tables healthy
+
+BUT: A new problem emerges at 9:00 AM:
+→ 8 analysts open Tableau simultaneously
+→ Each dashboard runs 5 queries → 40 concurrent queries
+→ Nightly ETL job (Project 32) runs late → still loading at 9 AM
+→ ETL COPY command takes priority → analyst queries queue
+→ Analysts wait 30 seconds for dashboards (queries queued behind ETL)
+
+BI manager: "Dashboards are fast when I'm the only one using them.
+But at 9 AM when everyone opens Tableau, they're slow again.
+And when the ETL is running, everything grinds to a halt."
+
+CTO: "That's a concurrency problem, not a table design problem.
+      We need Workload Management (WLM) to prioritize dashboards
+      over ETL loads."
+
+→ Project 40: "Multiple Teams Compete for Redshift Resources"
+→ Introduces: WLM Queues, Concurrency Scaling, Priority,
+              Short Query Acceleration, Query Monitoring Rules</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="41" ========== -->
+<div class="chat-message" data-index="41"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-38.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 39 of 80</span>
+    <span class="nav-project-title">REDSHIFT QUERIES ARE SLOW — OPTIMIZE TABLE DESIGN</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-40.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-40.html") window.location = "project-40.html";
+  if (e.key === 'ArrowLeft' && "project-38.html") window.location = "project-38.html";
+});
+</script>
+</body>
+</html>

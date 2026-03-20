@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 53: NON-TECHNICAL ANALYST WANTS TO CLEAN DATA WITHOUT CODE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:66%"></div></div>
+<div id="progress-label">66%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 53 of 80</div>
+  <div class="project-title">NON-TECHNICAL ANALYST WANTS TO CLEAN DATA WITHOUT CODE</div>
+  <div class="project-tags"><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — growing data team
+</span>Team: 8 engineers, 3 data engineers, 2 business analysts
+
+MEET SARAH — Senior Business Analyst:
+→ Expert in Excel, Tableau, SQL (basic)
+→ Zero Python knowledge
+→ No AWS console access
+→ No CLI experience
+→ Responsible for customer data quality in reports
+
+THE DATA QUALITY ISSUES SARAH FOUND:
+→ customers_20250115.csv in S3 (from Project 1)
+
+ISSUE 1: Duplicate customer records
+  → CUST-000042 appears 3 times with slight name variations
+  → "John Smith", "john smith", "JOHN SMITH"
+
+ISSUE 2: Phone numbers in 7 different formats
+  → "555-1234", "(555) 123-4567", "5551234567", "+1-555-123-4567"
+  → Downstream Redshift queries can't group by phone
+
+ISSUE 3: State codes inconsistent
+  → "California", "CA", "ca", "Calif.", "calif"
+  → Reports show 47 "states" instead of 50
+
+ISSUE 4: Email validation
+  → Some emails missing "@"
+  → Some have spaces: "john @example.com"
+  → Some are clearly fake: "[email&#160;protected]"
+
+ISSUE 5: Missing values
+  → 12% of records have NULL city
+  → 8% have NULL signup_date
+  → Reports show "Unknown" for these — CTO hates it
+
+SARAH'S CURRENT WORKFLOW (painful):
+1. Ask data engineer to download CSV from S3
+2. Open in Excel (crashes if &gt;500K rows)
+3. Manually write VLOOKUP/IF formulas
+4. Save cleaned file
+5. Ask data engineer to upload back to S3
+6. Turnaround: 2-3 days per cleaning cycle
+
+CTO: "Sarah should be able to clean data HERSELF without 
+      bothering engineers. There must be a tool for this."
+YOU: "AWS Glue DataBrew — visual, no-code data preparation.
+      Sarah connects to S3, builds cleaning recipes in a UI,
+      schedules them, and outputs clean data back to S3."
+
+REQUIREMENTS:
+→ Sarah must be able to use it WITHOUT Python/CLI
+→ Must read from S3 (existing data lake — Project 1)
+→ Must write cleaned data back to S3 (for Athena/Redshift — Projects 16, 21)
+→ Must be repeatable (same cleaning applied to tomorrow's file)
+→ Must be schedulable (run every night after file lands)
+→ Data engineers must be able to SET UP and AUTOMATE via code
+→ Budget: &lt; $50/month</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what Glue DataBrew IS
+</span>→ Visual data preparation service (no code)
+→ Think: "Excel formulas as a managed AWS service"
+→ Reads from S3, databases, Data Catalog
+→ Provides 250+ built-in transformations
+→ Outputs cleaned data to S3 in any format (CSV, Parquet, JSON)
+→ Fully managed — no servers, no clusters, no infrastructure
+
+Step 2: Understand DataBrew components
+→ DATASET: pointer to your data (S3 path, Glue Catalog table)
+→ PROJECT: interactive workspace where you explore + build recipes
+→ RECIPE: ordered list of transformation steps (reusable, versionable)
+→ PROFILE JOB: statistical analysis of your data (find quality issues)
+→ RECIPE JOB: apply recipe to full dataset and write output
+
+Step 3: Design the workflow
+→ Phase A: DATA ENGINEER sets up Dataset + Project (via boto3)
+→ Phase B: SARAH opens DataBrew console, explores data, builds recipe
+→ Phase C: DATA ENGINEER automates recipe job on schedule (via boto3)
+→ Sarah never touches code. Engineer never manually cleans data.
+
+Step 4: Understand DataBrew vs alternatives
+→ DataBrew: visual, no-code, for analysts
+→ Glue ETL (Project 25): code-based, for engineers
+→ Glue Crawlers (Project 23): schema discovery, not transformation
+→ Athena CTAS (Project 36): SQL-based transformation, needs SQL skill
+
+Step 5: Plan the recipe steps
+→ Step 1: Remove exact duplicate rows
+→ Step 2: Standardize case (lowercase email, proper case name)
+→ Step 3: Standardize phone format → E.164 (+15551234567)
+→ Step 4: Map state variations to 2-letter codes
+→ Step 5: Validate email format → flag invalid
+→ Step 6: Fill missing city with "Unknown" (or impute from zip)
+→ Step 7: Fill missing signup_date with file date
+→ Step 8: Output as Parquet to S3 Silver zone (Project 44 medallion)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+S3 Bronze Zone                   DataBrew                         S3 Silver Zone
+(raw CSVs from Project 1)                                       (cleaned Parquet)
+                                                                  
+daily_exports/                  ┌──────────────────────┐        cleaned/
+  customers/                    │   DataBrew PROJECT    │          customers/
+    customers_20250115.csv ────→│                       │────→      year=2025/
+    customers_20250116.csv      │   Sarah's workspace   │            month=01/
+                                │   (visual UI)         │              customers_20250115.parquet
+                                │                       │
+                                │   ┌──────────────┐    │
+                                │   │   RECIPE      │    │
+                                │   │ 1. Dedup      │    │
+                                │   │ 2. Lowercase  │    │
+                                │   │ 3. Phone fmt  │    │
+                                │   │ 4. State map  │    │
+                                │   │ 5. Email valid│    │
+                                │   │ 6. Fill nulls │    │
+                                │   └──────────────┘    │
+                                └──────────┬───────────┘
+                                           │
+                                    PROFILE JOB                   
+                                    (data quality stats)          
+                                           │                      
+                                           ▼                      
+                                    S3: profile-results/          
+                                    (quality reports for Sarah)   
+
+AUTOMATION LAYER (data engineer manages):
+┌─────────────────────────────────────────────────────────────────┐
+│  boto3 scripts:                                                  │
+│  → Create Dataset pointing to S3                                 │
+│  → Create Profile Job (discover quality issues)                  │
+│  → Create Recipe Job (apply Sarah's recipe to full dataset)      │
+│  → Schedule Recipe Job (run nightly at 3 AM)                     │
+│  → IAM role for DataBrew to access S3                            │
+└─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue ETL with PySpark (Project 25 approach)
+</span>→ Data engineer writes transformation code
+→ Sarah can't modify rules without engineer help
+→ Every change = code review + deploy cycle
+→ Not suitable for business-owned data quality rules
+
+Option B: Athena CTAS with SQL (Project 36 approach)
+→ Sarah knows basic SQL but not complex regex, CASE statements
+→ Phone number normalization in SQL is ugly and error-prone
+→ No visual preview — must run full query to see results
+
+Option C: Download → Excel → Upload (current painful workflow)
+→ 2-3 day turnaround per cycle
+→ Crashes on large files
+→ Not reproducible, not auditable
+→ Engineer time wasted on file transfers
+
+Option D: Glue DataBrew (this project) ✅
+→ Sarah opens visual UI → sees data → clicks transformations
+→ 250+ built-in transforms — no regex writing needed
+→ Recipe is saved, versioned, reusable
+→ Engineer schedules automated execution
+→ Output goes directly to S3 in any format
+→ $0.48/node/hour — profile job on 500K rows ≈ $0.50
+
+Option E: Third-party tools (Trifacta, Alteryx)
+→ More powerful but expensive ($1000+/month)
+→ Not AWS-native — requires data export/import
+→ Licensing complexity
+
+DECISION: Option D — Glue DataBrew
+→ Reason: AWS-native, visual, no-code, cheap, integrates with S3/Glue Catalog
+→ Sarah owns the recipes. Engineers own the automation.
+→ Clear separation of concerns.</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a dedicated IAM role for DataBrew
+</span>   → Needs: s3:GetObject (read source), s3:PutObject (write output)
+   → Needs: glue:GetTable, glue:GetDatabase (if using Catalog)
+   → Needs: logs:CreateLogGroup, logs:PutLogEvents (execution logs)
+   → Principle of least privilege — only buckets DataBrew needs
+
+2. Run a Profile Job FIRST before building recipes
+   → Profile reveals: nulls, duplicates, outliers, distributions
+   → Sarah sees the ACTUAL quality issues with statistics
+   → Informs which recipe steps are needed
+   → Costs pennies — runs on a sample
+
+3. Use Glue Data Catalog as Dataset source (not raw S3 path)
+   → Catalog table already exists from Project 23 (Crawler)
+   → DataBrew inherits schema, partitioning, metadata
+   → Changes in source schema auto-reflected
+
+4. Version recipes
+   → Recipe v1: basic dedup + lowercase
+   → Recipe v2: add phone normalization
+   → Recipe v3: add state mapping
+   → Can rollback to any version if new rules break something
+
+5. Output as Parquet (not CSV)
+   → Downstream Athena queries 10x faster (Project 26)
+   → Redshift COPY 5x faster (Project 21)
+   → 70% less storage than CSV
+   → Add partition columns (year, month, day) in output
+
+6. Separate Profile Job output from Recipe Job output
+   → Profile results → s3://bucket/databrew-profiles/
+   → Cleaned data → s3://bucket/cleaned/customers/
+   → Don't mix metadata with actual data
+
+7. Schedule Recipe Jobs to run AFTER source data lands
+   → Source file lands at midnight (Project 29)
+   → DataBrew Recipe Job runs at 2 AM
+   → Downstream Glue ETL runs at 4 AM (Project 35)
+   → Clear dependency chain
+
+8. Tag all DataBrew resources for cost tracking
+   → Environment=Production, Team=Analytics, Owner=Sarah
+   → DataBrew costs show up in Cost Explorer under these tags</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT give Sarah direct S3 console access
+</span>   → She only needs DataBrew console access
+   → DataBrew's IAM role handles S3 access
+   → Sarah's IAM user/role needs: databrew:* only
+   → S3 access via DataBrew role, not her credentials
+
+2. DO NOT use DataBrew for complex multi-table JOINs
+   → DataBrew works on single datasets
+   → JOINs are limited (can join two datasets but awkward)
+   → For complex joins: use Glue ETL (Project 34) or Athena (Project 37)
+
+3. DO NOT run Profile Jobs on full dataset every time
+   → Profile on 500K rows takes ~5 min, costs ~$0.50
+   → Profile on 50M rows takes ~45 min, costs ~$5.00
+   → Use sampling: profile 10% or first 20,000 rows
+   → Full profile only when data characteristics change
+
+4. DO NOT hardcode S3 paths in Dataset definition
+   → Use parameterized paths with date variables
+   → Or use Glue Catalog table (auto-discovers new partitions)
+   → Hardcoded path = recipe only works for one day's file
+
+5. DO NOT let Recipe Jobs overwrite source data
+   → Source (Bronze): daily_exports/customers/
+   → Output (Silver): cleaned/customers/
+   → ALWAYS write to different S3 prefix
+   → Source is immutable — never modify raw data (Project 44 principle)
+
+6. DO NOT create one giant recipe with 50 steps
+   → Hard to debug — which step introduced the issue?
+   → Hard to maintain — Sarah can't find the phone step among 50
+   → Break into logical groups: dedup recipe, format recipe, validate recipe
+   → Chain recipe jobs in sequence
+
+7. DO NOT ignore DataBrew job execution logs
+   → Jobs can fail silently (wrong S3 permissions, schema mismatch)
+   → Enable CloudWatch logging
+   → Set up SNS notification on job failure (from Project 54)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────┬───────────────────┬──────────────────────────────────────────────┐
+</span>│ Scenario                        │ Use               │ Why                                          │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Business analyst cleans data    │ Glue DataBrew     │ Visual, no-code, 250+ transforms, cheap      │
+│ without code (this project)     │ (this project)    │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Engineer writes complex ETL     │ Glue ETL Job      │ PySpark, full control, complex logic          │
+│ with joins, aggregations        │ (Project 25)      │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ SQL-savvy analyst transforms    │ Athena CTAS       │ SQL-based, serverless, quick ad-hoc           │
+│ data ad-hoc                     │ (Project 36)      │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Discover schema of unknown data │ Glue Crawler      │ Auto-detect schema → populate Catalog         │
+│                                 │ (Project 23)      │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Validate data quality rules     │ Glue Data Quality │ Rule-based checks, pass/fail, metrics         │
+│ programmatically                │ (Project 68)      │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Real-time stream cleaning       │ Kinesis + Lambda  │ Per-record transformation in real-time        │
+│                                 │ (Project 72)      │                                              │
+├─────────────────────────────────┼───────────────────┼──────────────────────────────────────────────┤
+│ Enterprise data prep with       │ Trifacta / Alteryx│ More powerful but expensive, not AWS-native   │
+│ advanced ML-based suggestions   │                   │                                              │
+└─────────────────────────────────┴───────────────────┴──────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE DATABREW</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When transformation requires multi-table JOINs
+</span>   → DataBrew can join 2 datasets but awkwardly
+   → 3+ table joins: use Glue ETL or Athena
+   → Star schema joins: definitely Glue ETL
+
+2. When processing &gt;100 GB per job
+   → DataBrew scales but becomes expensive at large volumes
+   → $0.48/node/hour × 20 nodes × 2 hours = $19.20 per run
+   → Glue ETL with auto-scaling DPUs may be cheaper at scale
+
+3. When transformation logic changes frequently via CI/CD
+   → DataBrew recipes are created via UI or API — not code files
+   → Hard to version-control in Git (no native .py file)
+   → Glue ETL PySpark scripts live in Git → CI/CD friendly (Project 76)
+
+4. When you need real-time processing
+   → DataBrew is batch only — minimum job = read full dataset
+   → For streaming: Kinesis + Lambda (Project 72)
+
+5. When analyst already knows PySpark or advanced SQL
+   → DataBrew adds a layer of abstraction they don't need
+   → Let them write Glue ETL or Athena SQL directly
+   → DataBrew is specifically for NON-technical users
+
+6. When data is in a database (not S3)
+   → DataBrew can connect to databases via Glue connection
+   → But: extracting large tables is slow
+   → Better: Glue ETL JDBC extract → S3 → DataBrew on S3 data</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│                  GLUE DATABREW — INTERNAL MECHANICS                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  COMPONENT 1: DATASET                                                        │
+│  ════════════════════                                                        │
+│  → Logical pointer to data — does NOT copy or move data                      │
+│  → Source types:                                                             │
+│    - S3 file/prefix (CSV, JSON, Parquet, Excel, ORC)                        │
+│    - Glue Data Catalog table                                                 │
+│    - Database connection (via Glue JDBC)                                     │
+│  → Metadata: format, delimiter, header row, sheet name (Excel)               │
+│  → Parameterized paths: s3://bucket/data/dt={YYYY-MM-DD}/                   │
+│                                                                              │
+│  COMPONENT 2: PROJECT (Interactive Session)                                  │
+│  ══════════════════════════════════════════                                   │
+│  → Opens a LIVE session with your data (sample loaded)                       │
+│  → Default sample: first 500 rows (configurable)                            │
+│  → Spins up a TEMPORARY compute node behind the scenes                       │
+│  → Session cost: $0.48/node/30-min increments                                │
+│  → Auto-terminates after idle timeout (default 30 min)                       │
+│                                                                              │
+│  What happens when Sarah opens a Project:                                    │
+│  1. DataBrew provisions a compute node (takes ~60 seconds)                   │
+│  2. Reads sample from S3 into memory                                         │
+│  3. Displays spreadsheet-like grid in browser                                │
+│  4. Sarah applies transforms → sees LIVE preview                             │
+│  5. Each transform is recorded as a RECIPE STEP                              │
+│  6. Recipe is saved (persisted even after session ends)                       │
+│                                                                              │
+│  COMPONENT 3: RECIPE                                                         │
+│  ═══════════════════                                                         │
+│  → Ordered list of transformation steps                                      │
+│  → Each step is a JSON object describing the transform                       │
+│  → Stored as versioned artifact in DataBrew service                          │
+│  → Can be created via UI (Sarah) or API (engineer)                           │
+│                                                                              │
+│  Example recipe step (JSON):                                                 │
+│  {                                                                           │
+│    "Action": {                                                               │
+│      "Operation": "LOWER_CASE",                                              │
+│      "Parameters": {                                                         │
+│        "sourceColumn": "email"                                               │
+│      }                                                                       │
+│    }                                                                         │
+│  }                                                                           │
+│                                                                              │
+│  RECIPE IS SEPARATE FROM PROJECT:                                            │
+│  → Project = workspace (interactive)                                         │
+│  → Recipe = reusable transformation logic                                    │
+│  → Same recipe can be applied to different datasets                          │
+│  → Recipe can be exported, imported, shared across accounts                  │
+│                                                                              │
+│  COMPONENT 4: PROFILE JOB                                                    │
+│  ════════════════════════                                                     │
+│  → Analyzes data WITHOUT transforming it                                     │
+│  → Produces statistics per column:                                           │
+│    - Data type distribution                                                  │
+│    - Null count / percentage                                                 │
+│    - Unique values / cardinality                                             │
+│    - Min, max, mean, median, std dev (numeric)                               │
+│    - Top N most frequent values                                              │
+│    - String length distribution                                              │
+│    - Pattern detection (phone formats, emails)                               │
+│    - Duplicate row detection                                                 │
+│  → Output: JSON/CSV to S3                                                    │
+│  → Runs on Spark cluster behind the scenes                                   │
+│  → Cost: $0.48/node/hour × nodes × time                                     │
+│                                                                              │
+│  COMPONENT 5: RECIPE JOB                                                     │
+│  ════════════════════════                                                     │
+│  → Applies recipe to FULL dataset (not just sample)                          │
+│  → Runs on managed Spark cluster                                             │
+│  → Node count: auto-determined based on data size                            │
+│  → Max nodes: configurable (cost control)                                    │
+│  → Output: S3 in specified format (CSV, Parquet, JSON, etc.)                 │
+│  → Can partition output by column values                                     │
+│  → Can compress output (Snappy, Gzip, etc.)                                 │
+│                                                                              │
+│  EXECUTION FLOW (Recipe Job):                                                │
+│  ┌──────────────────────────────────────────────────────────────┐            │
+│  │ 1. DataBrew reads recipe JSON                                 │            │
+│  │ 2. Provisions Spark cluster (1-20 nodes)                      │            │
+│  │ 3. Reads full dataset from S3                                 │            │
+│  │ 4. Applies each recipe step in ORDER                          │            │
+│  │ 5. Writes output to S3 in specified format                    │            │
+│  │ 6. Publishes metrics to CloudWatch                            │            │
+│  │ 7. Terminates Spark cluster                                   │            │
+│  │                                                                │            │
+│  │ Duration: 2-5 min for 500K rows, 15-30 min for 50M rows      │            │
+│  └──────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│  SCHEDULING:                                                                 │
+│  → Cron expression: "cron(0 2 * * ? *)" = 2 AM daily                        │
+│  → DataBrew manages execution internally                                     │
+│  → No EventBridge or Step Functions needed (but can integrate)               │
+│  → Failed jobs can trigger SNS notification                                  │
+│                                                                              │
+│  AVAILABLE TRANSFORMS (250+):                                                │
+│  ┌────────────────────────┬─────────────────────────────────────┐            │
+│  │ Category               │ Examples                             │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ String                 │ UPPER_CASE, LOWER_CASE, TRIM,       │            │
+│  │                        │ REMOVE_SPECIAL, SUBSTRING, REPLACE   │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Numeric                │ ROUND, ABSOLUTE, LOG, POWER,         │            │
+│  │                        │ BIN_NUMERIC, NORMALIZE                │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Date/Time              │ DATE_FORMAT, EXTRACT_YEAR,            │            │
+│  │                        │ DATE_DIFF, UNIX_TIMESTAMP             │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Filtering              │ FILTER_ROWS, REMOVE_DUPLICATES,       │            │
+│  │                        │ FILTER_VALUES_BY, IS_NULL             │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Structural             │ RENAME_COLUMN, DELETE_COLUMN,         │            │
+│  │                        │ MERGE_COLUMNS, SPLIT_COLUMN           │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Encoding               │ ONE_HOT_ENCODE, LABEL_ENCODE,         │            │
+│  │                        │ FLAG_COLUMN                            │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Aggregation            │ GROUP_BY + SUM/AVG/COUNT/MIN/MAX      │            │
+│  ├────────────────────────┼─────────────────────────────────────┤            │
+│  │ Missing Values         │ FILL_WITH_VALUE, FILL_WITH_MEAN,      │            │
+│  │                        │ FILL_WITH_MODE, FILL_WITH_FORWARD     │            │
+│  └────────────────────────┴─────────────────────────────────────┘            │
+│                                                                              │
+│  PRICING:                                                                    │
+│  → Interactive sessions: $1.00 per session (30-min increments)               │
+│  → Profile jobs: $0.48 per DataBrew node-hour                                │
+│  → Recipe jobs: $0.48 per DataBrew node-hour                                 │
+│  → Typical: 500K row CSV → profile in 5 min → ~$0.08                        │
+│  → Typical: 500K row CSV → recipe job in 3 min → ~$0.05                     │
+│  → Monthly estimate for daily runs: $1.50-$5.00                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Recipe job fails with AccessDenied"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: DataBrew IAM role lacks S3 permissions
+→ Needs: s3:GetObject on source bucket + s3:PutObject on output bucket
+→ Common mistake: gave read permission but forgot write permission
+→ Fix: check IAM role policy attached to DataBrew job
+
+PITFALL 2: "Profile shows 0 rows — data not found"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Dataset S3 path doesn't match actual file location
+→ Dataset points to: s3://bucket/customers/
+→ Actual file is at: s3://bucket/daily_exports/customers/
+→ Fix: verify S3 path exactly matches where files exist
+
+PITFALL 3: "Recipe works on sample but fails on full dataset"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: sample had clean data, full dataset has edge cases
+→ Example: sample had no NULL phone numbers, full dataset has 5,000
+→ Recipe step assumes phone is always present → fails
+→ Fix: always add NULL handling BEFORE format transformation steps
+→ Fix: run Profile Job first to understand full data characteristics
+
+PITFALL 4: "Session keeps timing out — work lost"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: DataBrew interactive session has idle timeout (default 30 min)
+→ Sarah goes to lunch → session ends → unsaved recipe steps LOST
+→ Fix: publish recipe frequently (save button)
+→ Fix: increase session timeout via API (max 2880 min = 48 hours)
+→ But: costs accumulate while session is active
+
+PITFALL 5: "Output has wrong number of columns"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: recipe step accidentally deleted a column
+→ Or: SPLIT_COLUMN created extra columns
+→ Fix: check recipe steps in order — each step's output is next step's input
+→ Fix: preview each step in interactive session before publishing
+
+PITFALL 6: "Scheduled job ran but output is empty"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Dataset path is parameterized but date parameter wasn't set
+→ Or: source file for today hasn't landed yet when job runs
+→ Fix: schedule DataBrew AFTER source file landing (buffer time)
+→ Fix: use S3 event trigger instead of cron (via Step Functions — Project 55)
+
+PITFALL 7: "DataBrew costs more than expected"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: interactive session left open for hours
+→ Sarah opened project at 9 AM, left for meeting, came back at 5 PM
+→ 8 hours × $1.00/session-hour = $8.00 for one exploration
+→ Fix: set session timeout to 60 minutes
+→ Fix: educate Sarah to close sessions when done</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME:
+</span>→ 50K rows (10 MB CSV): profile 2 min, recipe 1 min → $0.03
+→ 500K rows (100 MB CSV): profile 5 min, recipe 3 min → $0.10
+→ 5M rows (1 GB CSV): profile 15 min, recipe 10 min → $0.80
+→ 50M rows (10 GB CSV): profile 45 min, recipe 30 min → $7.20
+→ 500M rows (100 GB): profile 3 hours, recipe 2 hours → $50+
+
+COST SCALING (daily recipe job):
+┌──────────────┬────────────────┬──────────────────┐
+│ Data Size    │ Cost per Run   │ Monthly (30 runs)│
+├──────────────┼────────────────┼──────────────────┤
+│ 10 MB        │ $0.03          │ $0.90            │
+│ 100 MB       │ $0.10          │ $3.00            │
+│ 1 GB         │ $0.80          │ $24.00           │
+│ 10 GB        │ $7.20          │ $216.00          │
+│ 100 GB       │ $50.00         │ $1,500.00        │
+└──────────────┴────────────────┴──────────────────┘
+
+AT SCALE DECISIONS:
+→ &lt; 1 GB daily: DataBrew is perfect (&lt; $25/month)
+→ 1-10 GB daily: DataBrew works but consider Glue ETL for cost
+→ &gt; 10 GB daily: switch to Glue ETL (Project 25) — more cost-efficient
+→ &gt; 100 GB daily: definitely Glue ETL with auto-scaling DPUs
+
+NODE CONFIGURATION:
+→ Max nodes per job: 149
+→ Default: DataBrew auto-selects based on data size
+→ Override: set max nodes for cost control
+→ More nodes = faster but more expensive
+
+RECIPE COMPLEXITY:
+→ 5 steps: minimal overhead
+→ 20 steps: noticeable processing time increase
+→ 50+ steps: consider splitting into multiple recipe jobs
+→ Each step processes full dataset sequentially</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY DATABREW OUTPUT:
+</span>
+1. Profile Job output (S3 JSON):
+   → Column-level statistics: nulls, uniques, distributions
+   → Compare BEFORE and AFTER profile results
+   → Null count should decrease, unique count should change as expected
+
+2. Recipe Job execution details (DataBrew console):
+   → Duration, rows processed, rows output
+   → Errors per step (if any)
+   → Output file location and size
+
+3. Athena verification (from Project 24):
+   → Query the cleaned output directly in Athena
+   → SELECT COUNT(DISTINCT state) FROM cleaned_customers
+   → Should be exactly 50 (not 147 like before)
+   → SELECT COUNT(*) WHERE email NOT LIKE '%@%'
+   → Should be 0 (all invalid emails flagged or removed)
+
+4. CloudWatch metrics:
+   → DataBrew publishes: JobDuration, RowsProcessed, BytesProcessed
+   → Monitor for unexpected drops (job ran but processed 0 rows)
+
+5. Data quality comparison:
+   → Run Profile Job on source data → save results
+   → Run Recipe Job → output cleaned data
+   → Run Profile Job on cleaned data → save results
+   → Compare: null counts, duplicate counts, pattern distributions</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(53)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: IAM Role for DataBrew</h3>
+
+<h3>Step 2: Generate Dirty Test Data</h3>
+
+<h3>Step 3: Create DataBrew Dataset + Project + Profile Job</h3>
+
+<h3>Step 4: Run Profile Job + Recipe Job</h3>
+
+<h3>Step 5: Schedule Recipe Job for Nightly Execution</h3>
+
+<h3>Step 6: Verify Cleaned Output</h3>
+
+<h3>Step 7: List All DataBrew Resources</h3>
+
+<h3>Step 8: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create IAM role for DataBrew (one-time)</span><span>
+</span>python 53_01_create_databrew_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Generate dirty test data and upload to S3</span><span>
+</span>python 53_02_generate_dirty_data.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create all DataBrew resources (dataset, recipe, project, profile job)</span><span>
+</span>python 53_03_create_databrew_resources.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run Profile Job (discover issues) + Recipe Job (clean data)</span><span>
+</span>python 53_04_run_jobs.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Schedule nightly automated execution</span><span>
+</span>python 53_05_schedule_recipe_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Verify cleaned output quality</span><span>
+</span>python 53_06_verify_cleaned_output.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Inventory all DataBrew resources</span><span>
+</span>python 53_07_list_all_resources.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Cleanup</span><span>
+</span>python 53_08_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT FROM VERIFICATION (Step 6):
+</span>
+======================================================================
+📊 DATA QUALITY COMPARISON: BEFORE vs AFTER DATABREW
+======================================================================
+
+📌 BEFORE (Source): s3://quickcart-raw-data-prod/daily_exports/customers/customers_20250115.csv
+────────────────────────────────────────────────────────────────
+  Total rows: 5,000
+
+  DUPLICATES:
+    Unique customer_ids with duplicates: 127
+    Extra duplicate rows: 143
+
+  EMAIL ISSUES:
+    Missing @: 714 (14.3%)
+    Contains spaces: 357 (7.1%)
+
+  STATE VARIATIONS:
+    Unique state values: 30
+    Top 10: [('CA', 342), ('california', 198), ('CALIFORNIA', 187), ...]
+
+  MISSING VALUES:
+    Empty city: 612 (12.2%)
+    Empty signup_date: 398 (8.0%)
+
+  PHONE FORMAT VARIATIONS:
+    XXX-XXXX: 743
+    (XXX) XXXX: 721
+    XXXXXXX: 714
+    +X-XXX-XXXX: 698
+    ...
+
+
+📌 AFTER (Cleaned): s3://quickcart-raw-data-prod/cleaned/customers/
+────────────────────────────────────────────────────────────────
+  Output files: 1
+  Total size: 89.3 KB
+  Format: Parquet + Snappy compression
+
+
+======================================================================
+📊 DATA QUALITY IMPROVEMENT REPORT
+======================================================================
+
+Metric                              Before          Expected After  Status
+───────────────────────────────────────────────────────────────────────────
+Total rows                          5,000           ~4,857          Deduped
+Duplicate rows                      143             0               ✅ Removed
+Bad emails (no @)                   714             0               ✅ Cleaned
+Unique state values                 30              5               ✅ Standardized
+Missing city                        612             0               ✅ Filled
+Missing signup_date                 398             0               ✅ Filled
+Phone format variations             7               1               ✅ Standardized
+───────────────────────────────────────────────────────────────────────────
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue DataBrew is a VISUAL, NO-CODE data preparation service
+→ Perfect for business analysts who don't know Python/Spark
+→ Components: Dataset (source) → Project (workspace) → Recipe (transforms) → Job (execution)
+→ Profile Jobs ANALYZE quality without changing data
+→ Recipe Jobs APPLY transformations to full dataset
+→ 250+ built-in transforms: dedup, case, fill, replace, format, validate
+→ Recipes are versioned, reusable, and shareable
+→ Schedulable via cron — fully automated nightly cleaning
+→ Output: any format (CSV, Parquet, JSON) to S3
+→ Cost: $0.48/node-hour — pennies for small datasets
+→ Engineers set up infrastructure. Analysts own the recipes.
+
+CONTRAST WITH PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 25 (Glue ETL): code-based → engineer-owned → powerful but requires PySpark
+→ Project 36 (Athena CTAS): SQL-based → needs SQL skill → good for ad-hoc
+→ Project 51-52: heavy infrastructure → SNS, SQS, EC2, ASG → fully custom
+→ Project 53 (DataBrew): visual → analyst-owned → simple but limited
+→ LESSON: right tool for right person at right complexity level
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 storage — DataBrew reads/writes S3
+→ Project 23: Glue Crawlers — Catalog tables as DataBrew datasets
+→ Project 25: Glue ETL — code-based alternative for engineers
+→ Project 44: Medallion architecture — DataBrew outputs to Silver zone
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 54: "Get Paged at 3 AM When the Pipeline Fails"
+  - DataBrew job fails → nobody knows until morning
+  - Sarah's nightly clean didn't run → Gold layer has dirty data
+  - Need: CloudWatch monitoring → SNS alerts → PagerDuty
+  - Every pipeline component must have failure notification
+  - Covers: Glue job metrics, Athena failures, DataBrew failures
+  - Builds alerting layer on TOP of all previous pipeline components</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's pipeline now has:
+</span>→ S3 storage (Project 1)
+→ Glue ETL (Project 25)
+→ DataBrew cleaning (Project 53)
+→ Athena queries (Project 24)
+→ Redshift warehouse (Project 21)
+→ SNS/SQS messaging (Projects 51-52)
+
+BUT: Tuesday at 3:14 AM
+→ DataBrew recipe job fails (Sarah's state mapping missed "CALIF")
+→ Glue ETL picks up UNCLEANED data from Bronze (Silver wasn't updated)
+→ Redshift COPY loads dirty data to Gold
+→ Wednesday morning: CTO sees dashboard with "CALIF" as a state
+→ CTO: "How did dirty data get to production?!"
+→ YOU: "DataBrew failed at 2 AM. Nobody noticed for 18 hours."
+
+CTO: "I want to be WOKEN UP when any pipeline step fails.
+      Email, SMS, PagerDuty — I don't care. Just KNOW immediately."
+
+→ Project 54: "Get Paged at 3 AM When the Pipeline Fails"
+→ Introduces: CloudWatch Logs, Metric Filters, Alarms,
+   SNS Notifications, Glue Job Metrics, Composite Alarms,
+   multi-pipeline monitoring strategy</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-52.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 53 of 80</span>
+    <span class="nav-project-title">NON-TECHNICAL ANALYST WANTS TO CLEAN DATA WITHOUT CODE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-54.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-54.html") window.location = "project-54.html";
+  if (e.key === 'ArrowLeft' && "project-52.html") window.location = "project-52.html";
+});
+</script>
+</body>
+</html>

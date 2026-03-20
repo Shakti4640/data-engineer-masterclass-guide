@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 1: A STARTUP NEEDS TO STORE DAILY CSV DUMPS SOMEWHERE CHEAP — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:1%"></div></div>
+<div id="progress-label">1%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 1 of 80</div>
+  <div class="project-title">A STARTUP NEEDS TO STORE DAILY CSV DUMPS SOMEWHERE CHEAP</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — a 6-month-old e-commerce startup
+</span>Team: 3 developers, 1 data guy (you)
+Situation:
+→ Every day at midnight, their order management system generates 3 CSV files:
+   - orders_YYYYMMDD.csv        (~50 MB, ~200K rows)
+   - customers_YYYYMMDD.csv     (~10 MB, ~50K rows)  
+   - products_YYYYMMDD.csv      (~2 MB, ~5K rows)
+→ Currently stored on a single EC2 instance's 100GB EBS volume
+→ Disk is 87% full
+→ No backup exists
+→ CTO asks: "Find a cheap, reliable place to store these files"
+→ Budget: &lt; $5/month for storage</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the NATURE of the data
+</span>→ Flat files (CSV)
+→ Write-once, read-occasionally pattern
+→ Daily append — no updates to old files
+→ ~62 MB/day → ~1.86 GB/month → ~22 GB/year
+
+Step 2: Understand the ACCESS pattern
+→ Written once at midnight
+→ Read maybe 2-3 times a month for ad-hoc analysis
+→ No real-time querying needed right now
+
+Step 3: Evaluate storage options on AWS
+→ EBS (Elastic Block Store) — already failing, expensive per GB
+→ EFS (Elastic File System) — overkill for flat files, expensive
+→ S3 (Simple Storage Service) — object storage, pay per GB, fits perfectly
+→ RDS/Database — not needed yet, files are just dumps
+
+Step 4: Calculate cost
+→ S3 Standard: $0.023 per GB/month
+→ 22 GB/year = ~$0.50/month in Year 1
+→ Massively under $5 budget</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  EC2 (Order System)
+        │
+        │ midnight cron generates CSVs
+        ▼
+  /tmp/exports/
+   ├── orders_20250101.csv
+   ├── customers_20250101.csv
+   └── products_20250101.csv
+        │
+        │ boto3 Python script uploads
+        ▼
+  S3 Bucket: quickcart-raw-data-prod
+   └── daily_exports/
+        ├── orders/
+        │    ├── orders_20250101.csv
+        │    └── orders_20250102.csv
+        ├── customers/
+        │    ├── customers_20250101.csv
+        │    └── customers_20250102.csv
+        └── products/
+             ├── products_20250101.csv
+             └── products_20250102.csv</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: AWS CLI upload (simplest)
+</span>→ aws s3 cp file.csv s3://bucket/key
+→ Works but no error handling, no retry logic, no logging
+
+Option B: boto3 Python script (recommended)
+→ Full control over error handling
+→ Can add logging, retries, metadata
+→ Can be extended later for transformations
+
+Option C: AWS DataSync
+→ Overkill for 62 MB/day
+→ Designed for TB-scale migrations
+
+Option D: S3 Transfer Acceleration
+→ Unnecessary — data originates from EC2 in same region
+→ Adds cost for zero benefit here
+
+DECISION: Option B — boto3 script
+→ Reason: extensible, programmatic, interview-relevant</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Bucket naming: globally unique, lowercase, descriptive
+</span>   → Format: {company}-{purpose}-{environment}
+   → Example: quickcart-raw-data-prod
+
+2. Region selection: SAME region as EC2 instance
+   → Avoids cross-region data transfer costs ($0.02/GB)
+   → Reduces latency
+
+3. Organize with prefixes (folder-like structure)
+   → daily_exports/orders/orders_20250101.csv
+   → Enables future partition-based querying (Athena — Project 16+)
+
+4. Add metadata to uploaded objects
+   → source=order_system, upload_date=2025-01-01
+   → Helps debugging months later
+
+5. Enable server-side encryption (SSE-S3 at minimum)
+   → aws:kms not needed yet, but SSE-S3 is free
+
+6. Block all public access on the bucket
+   → Default since April 2023, but VERIFY it explicitly
+
+7. Tag the bucket
+   → Environment=Production, Team=Data, CostCenter=Engineering</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT make the bucket public
+</span>   → Even "temporarily" — this is the #1 S3 security breach cause
+   → 2017: Verizon exposed 14M customer records via public S3
+
+2. DO NOT use bucket names with dots (e.g., quickcart.raw.data)
+   → Breaks SSL/TLS for HTTPS virtual-hosted-style URLs
+   → Certificate validation fails on *.s3.amazonaws.com
+
+3. DO NOT hardcode AWS credentials in the Python script
+   → No access_key_id / secret_access_key in code EVER
+   → Use IAM roles attached to EC2 (covered in Project 6)
+
+4. DO NOT upload to us-east-1 "just because it's default"
+   → Choose region based on: where EC2 lives, data residency, cost
+
+5. DO NOT create one flat folder with all files
+   → 10,000+ objects in one prefix = S3 LIST becomes slow
+   → Structure by entity type AND date from Day 1
+
+6. DO NOT skip error handling in upload script
+   → Network blips happen
+   → Partial uploads corrupt data silently
+
+7. DO NOT use Transfer Acceleration or Multipart for &lt;100MB files
+   → Overhead exceeds benefit
+   → Multipart useful above 100MB (covered later)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────┬──────────────────┬──────────────────────────────────┐
+</span>│ Scenario               │ Use              │ Why                              │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Store flat files cheap │ S3 Standard      │ $0.023/GB, 99.999999999%         │
+│                        │                  │ durability (11 nines)            │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Need file system       │ EFS              │ POSIX-compliant, mount to EC2    │
+│ semantics (mount)      │                  │                                  │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Block-level storage    │ EBS              │ Boot volumes, databases, low     │
+│ for EC2                │                  │ latency random I/O               │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Structured relational  │ RDS / MariaDB    │ ACID, SQL, joins                 │
+│ data                   │                  │ (Project 8)                      │
+├────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Analytical aggregation │ Redshift         │ Columnar, MPP, fast GROUP BY     │
+│ at scale               │                  │ (Project 10)                     │
+└────────────────────────┴──────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE S3</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Real-time read/write with &lt;10ms latency
+</span>   → S3 first-byte latency: 100-200ms
+   → Use: ElastiCache, DynamoDB
+
+2. POSIX file system operations (open, seek, append in-place)
+   → S3 objects are IMMUTABLE — you replace, not append
+   → Use: EFS
+
+3. Transactional database storage
+   → No row-level locking, no ACID
+   → Use: RDS, Aurora
+
+4. Storing data that changes every second
+   → Every "update" = full object re-upload
+   → Use: DynamoDB, RDS
+
+5. When data must never leave a specific server
+   → S3 replicates across 3+ AZs automatically
+   → Compliance may require local-only storage</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>S3 IS NOT A FILE SYSTEM — IT IS A KEY-VALUE OBJECT STORE
+</span>
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        S3 INTERNAL ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  WHAT YOU SEE:                                                          │
+│  s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250101.csv │
+│                                                                         │
+│  WHAT S3 ACTUALLY STORES:                                               │
+│  ┌──────────────────────────────────────────────────┐                   │
+│  │ KEY (String):                                     │                   │
+│  │ "daily_exports/orders/orders_20250101.csv"        │                   │
+│  │                                                    │                   │
+│  │ VALUE (Bytes):                                     │                   │
+│  │ &lt;actual CSV file content — up to 5TB&gt;              │                   │
+│  │                                                    │                   │
+│  │ METADATA (Headers):                                │                   │
+│  │ Content-Type: text/csv                             │                   │
+│  │ Content-Length: 52428800                            │                   │
+│  │ x-amz-meta-source: order_system                    │                   │
+│  │ x-amz-server-side-encryption: AES256               │                   │
+│  │ ETag: "d41d8cd98f00b204e9800998ecf8427e"           │                   │
+│  └──────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  "FOLDERS" DON'T EXIST:                                                 │
+│  → "/" in the key is just a character                                    │
+│  → Console SIMULATES folders for UX                                     │
+│  → Internally: flat hash map of keys → objects                          │
+│                                                                         │
+│  DURABILITY: 99.999999999% (11 nines)                                   │
+│  → Every object replicated across ≥ 3 Availability Zones                │
+│  → Designed to sustain loss of 2 facilities simultaneously              │
+│                                                                         │
+│  CONSISTENCY MODEL (since Dec 2020):                                    │
+│  → Strong read-after-write consistency                                  │
+│  → PUT new object → immediate GET returns latest                        │
+│  → PUT overwrite → immediate GET returns latest                         │
+│  → DELETE → immediate GET returns 404                                   │
+│  → Previously: eventual consistency (caused nightmares)                 │
+│                                                                         │
+│  HOW PUT (UPLOAD) WORKS:                                                │
+│  1. Client sends HTTP PUT to S3 endpoint                                │
+│  2. S3 receives bytes into primary AZ                                   │
+│  3. Synchronously replicates to ≥ 2 more AZs                           │
+│  4. Returns HTTP 200 ONLY after all replicas confirmed                  │
+│  5. ETag (MD5 hash) returned for integrity verification                 │
+│                                                                         │
+│  HOW GET (DOWNLOAD) WORKS:                                              │
+│  1. Client sends HTTP GET with bucket + key                             │
+│  2. S3 looks up key in distributed index                                │
+│  3. Routes to nearest AZ with the object                                │
+│  4. Streams bytes back over HTTP                                        │
+│  5. Supports Range headers for partial downloads                        │
+│                                                                         │
+│  S3 NAMESPACE:                                                          │
+│  → Bucket name is GLOBALLY unique across ALL AWS accounts               │
+│  → Key is unique within a bucket                                        │
+│  → Bucket + Key = globally unique object identifier                     │
+│                                                                         │
+│  PERFORMANCE (per prefix):                                              │
+│  → 3,500 PUT/COPY/POST/DELETE requests per second                      │
+│  → 5,500 GET/HEAD requests per second                                   │
+│  → Scale by distributing across multiple prefixes                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "My upload succeeded but file is 0 bytes"
+</span>→ Cause: file handle was at end-of-file position
+→ Fix: reopen file or seek(0) before upload
+
+PITFALL 2: "Access Denied when uploading"
+→ Cause: IAM user/role lacks s3:PutObject permission
+→ Debug: check IAM policy + bucket policy + S3 Block Public Access
+→ Tool: AWS Policy Simulator
+
+PITFALL 3: "Bucket creation fails — name already taken"
+→ Cause: S3 bucket names are GLOBALLY unique across ALL accounts
+→ Fix: add account ID or random suffix to name
+
+PITFALL 4: "Cross-region upload is mysteriously slow"
+→ Cause: EC2 in us-east-1, bucket in eu-west-1
+→ Data travels across Atlantic for every upload
+→ Fix: co-locate bucket and compute in same region
+
+PITFALL 5: "I see 'folders' in console but can't create empty one via API"
+→ Cause: folders are an illusion — they're 0-byte objects with "/" suffix
+→ Console creates them for UX; API doesn't need them
+
+PITFALL 6: "Upload works locally but fails on EC2"
+→ Cause: local uses ~/.aws/credentials, EC2 has no credentials configured
+→ Fix: attach IAM Role to EC2 (Project 6)
+
+PITFALL 7: "File content changed but S3 returns old data"
+→ This CANNOT happen after Dec 2020 (strong consistency)
+→ If you see this: you're reading a cached CDN copy (CloudFront)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TODAY (QuickCart):
+</span>→ 3 files/day × 62 MB = 62 MB/day
+→ S3 handles this without blinking
+
+6 MONTHS LATER:
+→ 20 files/day × 500 MB = 10 GB/day
+→ Still trivial for S3
+→ Consider multipart upload for files &gt; 100MB
+
+2 YEARS LATER:
+→ 200 files/day × 2 GB = 400 GB/day
+→ S3 still handles this easily
+→ But: listing objects becomes slow with 100K+ objects in one prefix
+→ Solution: partition by date → daily_exports/orders/year=2025/month=01/day=01/
+
+S3 HARD LIMITS:
+→ Max object size: 5 TB (single file)
+→ Max PUT size (single request): 5 GB
+→ Above 5 GB: MUST use multipart upload
+→ Recommended: use multipart above 100 MB
+→ Max buckets per account: 100 (soft limit, can increase)
+→ Objects per bucket: UNLIMITED
+→ Requests per prefix: 3,500 writes/sec + 5,500 reads/sec
+
+COST SCALING:
+→ 1 TB stored = $23.55/month (Standard)
+→ 10 TB stored = $235.50/month (Standard)
+→ At 10 TB: consider Infrequent Access for old data ($0.0125/GB)
+→ At 100 TB: consider Intelligent Tiering (auto-moves between tiers)
+→ These transitions are covered in Project 4</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY YOUR UPLOADS WORKED:
+</span>
+1. Console verification:
+   → Navigate to S3 → bucket → prefix → see file listed
+   → Click file → check Size, Last Modified, Storage Class
+
+2. CLI verification:
+   → aws s3 ls s3://quickcart-raw-data-prod/daily_exports/orders/
+   → Shows file with size and timestamp
+
+3. Programmatic verification (boto3):
+   → head_object() returns metadata without downloading
+   → Compare ContentLength with local file size
+   → Compare ETag with local MD5 hash
+
+4. CloudTrail verification:
+   → Every S3 API call logged in CloudTrail
+   → PutObject event shows: who, when, which bucket, which key
+   → Essential for audit trails
+
+5. S3 Server Access Logs:
+   → Detailed per-request logs
+   → Shows: requester, bucket, key, HTTP status, bytes transferred
+   → Must be enabled explicitly (disabled by default)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(1)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+<h3>Step 1: Create S3 Bucket via boto3</h3>
+
+<h3>Step 2: Upload Daily CSV Files to S3</h3>
+
+<h3>Step 3: Generate Sample Test Data (for testing)</h3>
+
+<h3>Step 4: List and Verify Uploaded Objects</h3>
+
+<h3>Step 5: Download a File Back (for verification or reprocessing)</h3>
+
+<h3>Step 6: Execution Flow</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT FLOW:
+</span>
+============================================================
+🚀 DAILY S3 UPLOAD — 2025-01-15 00:00:03
+============================================================
+
+📤 Uploading: orders_20250115.csv
+   Size: 0.08 MB
+   Destination: s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv
+   ✅ Upload verified — sizes match (83942 bytes)
+
+📤 Uploading: customers_20250115.csv
+   Size: 0.03 MB
+   Destination: s3://quickcart-raw-data-prod/daily_exports/customers/customers_20250115.csv
+   ✅ Upload verified — sizes match (31205 bytes)
+
+📤 Uploading: products_20250115.csv
+   Size: 0.01 MB
+   Destination: s3://quickcart-raw-data-prod/daily_exports/products/products_20250115.csv
+   ✅ Upload verified — sizes match (10847 bytes)
+
+============================================================
+📊 UPLOAD SUMMARY
+   ✅ Succeeded: 3
+      → orders_20250115.csv
+      → customers_20250115.csv
+      → products_20250115.csv
+   ❌ Failed: 0
+============================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 is a KEY-VALUE object store, not a file system
+→ Buckets are globally unique, objects are identified by key
+→ "Folders" are a console illusion — "/" is just a character
+→ Every upload is replicated to 3+ AZs before returning success
+→ Strong read-after-write consistency since Dec 2020
+→ Organize with prefixes from Day 1 — retrofitting is painful
+→ Always verify uploads (size match, head_object)
+→ Always encrypt, always block public access, always tag
+
+WHAT THIS CONNECTS TO:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 2: What happens when someone DELETES these files?
+   (Versioning, lifecycle, MFA Delete)
+→ Project 3: How to control WHO can access WHICH prefix?
+   (Bucket policies, IAM)
+→ Project 6: How does EC2 authenticate to S3 without keys in code?
+   (IAM Roles, Instance Profiles)
+→ Project 16: How to QUERY these CSVs using SQL without downloading?
+   (Athena)
+→ Project 21: How to bulk-load these CSVs into a warehouse?
+   (Redshift COPY)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart's data is now safely in S3
+</span>3 months pass... 270+ CSV files accumulate
+
+THEN: An intern runs a cleanup script that accidentally deletes
+      last week's orders files
+
+CTO: "I thought S3 was reliable! Where's our data?!"
+YOU: "S3 is durable — it won't lose data on its own.
+      But it WON'T stop an authorized user from deleting objects.
+      We need VERSIONING."
+
+→ Project 2: "Intern Accidentally Deletes Production File from S3"
+→ Introduces: Versioning, MFA Delete, Lifecycle Rules, Object Lock</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-0.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 1 of 80</span>
+    <span class="nav-project-title">A STARTUP NEEDS TO STORE DAILY CSV DUMPS SOMEWHERE CHEAP</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-2.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-2.html") window.location = "project-2.html";
+  if (e.key === 'ArrowLeft' && "project-0.html") window.location = "project-0.html";
+});
+</script>
+</body>
+</html>

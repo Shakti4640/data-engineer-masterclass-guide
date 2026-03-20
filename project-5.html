@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 5: DATA TEAM NEEDS A LINUX MACHINE TO RUN PYTHON SCRIPTS — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:6%"></div></div>
+<div id="progress-label">6%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 5 of 80</div>
+  <div class="project-title">DATA TEAM NEEDS A LINUX MACHINE TO RUN PYTHON SCRIPTS</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 9 months old, growing fast
+</span>Current State:
+→ S3 bucket fully configured (Projects 1-4)
+→ Upload script runs on developer's MacBook at midnight
+→ Cost report runs manually when CFO asks
+
+Problems with laptop-based execution:
+→ Developer goes on vacation → no uploads for 2 weeks
+→ Laptop sleeps at 1 AM → upload script killed mid-transfer
+→ Home WiFi → 50MB upload takes 8 minutes (vs 2 seconds from AWS)
+→ No monitoring → nobody knows when script fails
+→ macOS Python version conflicts with production packages
+→ Developer quits → scripts die with the laptop
+
+CTO: "We need a server in the cloud. Something reliable, 
+      always on, running our Python scripts 24/7."
+
+Requirements:
+→ Linux server (Ubuntu) with Python 3.9+
+→ Enough power to run ETL scripts (not heavy compute)
+→ SSH access for the data team
+→ Accessible from the internet for management (SSH only)
+→ Must be in same region as S3 bucket (us-east-2)
+→ Budget: &lt; $30/month</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHAT EC2 actually is
+</span>→ EC2 = Elastic Compute Cloud
+→ Virtual machine (VM) running on AWS physical hardware
+→ You choose: OS, CPU, RAM, disk, network
+→ You pay: per second of runtime (on-demand) or per hour
+→ You control: full root access, install anything, run anything
+
+Step 2: Choose the right INSTANCE TYPE
+→ Instance type = combination of CPU, memory, storage, network
+→ Format: {family}{generation}.{size}
+→ Example: t3.micro = T family, 3rd generation, micro size
+→ QuickCart needs: light ETL, Python scripts, small data
+→ Best fit: t3.micro (2 vCPU, 1 GB RAM, $0.0104/hour = ~$7.50/month)
+→ Even better: t3.small (2 vCPU, 2 GB RAM, $0.0208/hour = ~$15/month)
+
+Step 3: Understand the NETWORKING prerequisites
+→ VPC (Virtual Private Cloud): isolated network in AWS
+→ Subnet: segment of VPC in a specific Availability Zone
+→ Security Group: virtual firewall controlling inbound/outbound traffic
+→ Key Pair: SSH authentication (no passwords)
+→ Elastic IP (optional): static public IP that persists across stop/start
+
+Step 4: Plan the setup
+→ Use default VPC (AWS creates one per region automatically)
+→ Create security group allowing SSH (port 22) from team's IPs only
+→ Create key pair for SSH authentication
+→ Launch t3.small in us-east-2 (same region as S3 bucket — Project 1)
+→ Install Python, pip, boto3, and our scripts</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+INTERNET
+    │
+    │ SSH (port 22) — restricted to team IPs only
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  AWS REGION: us-east-2 (Ohio)                                │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │  DEFAULT VPC (172.31.0.0/16)                        │     │
+│  │                                                     │     │
+│  │  ┌──────────────────────────────────────────┐       │     │
+│  │  │  PUBLIC SUBNET (172.31.0.0/20)           │       │     │
+│  │  │  Availability Zone: us-east-2a           │       │     │
+│  │  │                                          │       │     │
+│  │  │  ┌────────────────────────────────────┐  │       │     │
+│  │  │  │  EC2 INSTANCE                      │  │       │     │
+│  │  │  │  Name: quickcart-data-worker       │  │       │     │
+│  │  │  │  Type: t3.small                    │  │       │     │
+│  │  │  │  OS: Ubuntu 22.04 LTS              │  │       │     │
+│  │  │  │  vCPU: 2 | RAM: 2 GB              │  │       │     │
+│  │  │  │  Disk: 20 GB gp3 EBS              │  │       │     │
+│  │  │  │                                    │  │       │     │
+│  │  │  │  Python 3.10 + boto3 + pymysql     │  │       │     │
+│  │  │  │  Cron: daily upload at midnight     │  │       │     │
+│  │  │  │                                    │  │       │     │
+│  │  │  │  Security Group:                    │  │       │     │
+│  │  │  │    IN:  SSH (22) from 203.0.113.0/24│ │       │     │
+│  │  │  │    OUT: ALL traffic (0.0.0.0/0)     │  │       │     │
+│  │  │  └────────────────────────────────────┘  │       │     │
+│  │  └──────────────────────────────────────────┘       │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                                                              │
+│  S3: quickcart-raw-data-prod  (same region — no transfer $)  │
+└─────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: EC2 On-Demand (RECOMMENDED for learning/small workloads)
+</span>→ Pay per second, stop anytime, no commitment
+→ t3.small: ~$15/month running 24/7
+→ Can stop when not needed → pay only for EBS storage
+→ Best for: QuickCart's current scale
+
+Option B: EC2 Spot Instance
+→ Up to 90% cheaper than on-demand
+→ BUT: AWS can terminate with 2-minute warning
+→ Best for: fault-tolerant batch jobs (not always-on workers)
+→ Bad for: scheduled midnight cron jobs that must complete
+
+Option C: EC2 Reserved Instance
+→ 1 or 3 year commitment → up to 72% savings
+→ t3.small 1-year no-upfront: ~$8/month
+→ Best for: stable, predictable, always-on workloads
+→ Too early for QuickCart — don't commit yet
+
+Option D: AWS Lambda (serverless)
+→ No server to manage, pay per invocation
+→ 15-minute maximum execution time
+→ Best for: short tasks, event-driven processing
+→ Bad for: long-running ETL, interactive SSH access
+→ Covered later when we discuss event-driven patterns
+
+Option E: AWS Fargate (serverless containers)
+→ No server to manage, pay per task
+→ Best for: containerized workloads
+→ More complex setup than EC2 for simple scripts
+→ Overkill for QuickCart's current needs
+
+DECISION: Option A — EC2 On-Demand (t3.small)
+→ Simple, full control, SSH access, cron support
+→ Same skills transfer to all future AWS work
+→ Can migrate to Reserved or Spot later</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Choose AMAZON LINUX 2023 or UBUNTU 22.04 LTS
+</span>   → Both are free tier eligible
+   → Ubuntu: more familiar to most developers
+   → Amazon Linux: tighter AWS integration, SSM agent pre-installed
+   → We'll use Ubuntu 22.04 LTS (Long Term Support = 5 years updates)
+
+2. Use t3.small (not t3.micro) for data work
+   → t3.micro: 1 GB RAM → Python + pandas kills it on 50MB CSVs
+   → t3.small: 2 GB RAM → comfortable for medium ETL
+   → t3.medium: 4 GB RAM → if processing grows (upgrade later)
+
+3. Use gp3 EBS volume (not gp2)
+   → gp3: 3000 IOPS baseline (free), $0.08/GB/month
+   → gp2: 100 IOPS per GB (pay more for IOPS), $0.10/GB/month
+   → gp3 is NEWER, CHEAPER, and FASTER baseline
+   → 20 GB gp3 = $1.60/month
+
+4. Create DEDICATED security group (not use default)
+   → Default SG allows all inbound from same SG → too permissive
+   → Create one that ONLY allows SSH from known IPs
+   → Add team members' office/VPN IP ranges
+
+5. Use ED25519 key pair (not RSA)
+   → ED25519: shorter keys, faster, more secure
+   → RSA 2048: legacy, still works but longer keys
+   → NEVER share private key via email/Slack/Git
+
+6. Tag EVERYTHING
+   → Name, Environment, Team, CostCenter
+   → Tags flow to billing → know exactly what costs what
+   → Tags enable resource group filtering in console
+
+7. Use USER DATA script to automate initial setup
+   → User data: shell script that runs on FIRST boot
+   → Install Python, pip, boto3, create directories
+   → Eliminates manual SSH-and-install steps
+   → Makes instance reproducible (delete and recreate anytime)
+
+8. Consider STOPPING instance when not in use
+   → Running 24/7: t3.small = $15/month
+   → Running 12 hours/day: t3.small = $7.50/month
+   → Stopped: pay only for EBS = $1.60/month
+   → For nightly-only scripts: start at 11 PM, stop at 2 AM</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT open port 22 (SSH) to 0.0.0.0/0 (the entire internet)
+</span>   → Bots scan ALL AWS IPs continuously for open SSH ports
+   → Within minutes: brute force login attempts
+   → Restrict to: your office IP, VPN IP, or specific CIDR range
+   → Better: use AWS Systems Manager Session Manager (no SSH port needed)
+
+2. DO NOT use the default security group
+   → Default SG allows all inbound from instances in same SG
+   → If another team launches an instance in same VPC with default SG
+   → They can access YOUR instance
+   → Always create purpose-specific security groups
+
+3. DO NOT use password authentication for SSH
+   → Key pair authentication ONLY
+   → Disable password auth in /etc/ssh/sshd_config
+   → Password brute force is trivial; key brute force is impossible
+
+4. DO NOT store the private key in Git, S3, or shared drives
+   → Private key = root access to your server
+   → Store in: ~/.ssh/ with chmod 400 permissions
+   → If compromised: delete key pair, create new one, update authorized_keys
+
+5. DO NOT launch in us-east-1 "because it's default"
+   → Must be SAME REGION as S3 bucket (us-east-2 from Project 1)
+   → Cross-region data transfer: $0.02/GB
+   → Same-region EC2↔S3: $0.00/GB (free)
+
+6. DO NOT use root user for daily operations
+   → Create a non-root user (e.g., "dataeng") on the instance
+   → Use sudo when needed
+   → Limits blast radius of mistakes
+
+7. DO NOT hardcode AWS credentials on the instance
+   → No ~/.aws/credentials with access keys
+   → Use IAM Role attached to EC2 (Project 6 — NEXT)
+   → For now: understand that credentials are a TEMPORARY gap
+
+8. DO NOT forget to set up automatic security updates
+   → Ubuntu: unattended-upgrades package
+   → Patches kernel and system packages automatically
+   → Prevents known vulnerabilities from being exploited</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────┬────────────────────────────┬───────────────────────────────────┐
+</span>│ Compute Option          │ Best For                   │ QuickCart Fit                     │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ EC2 On-Demand           │ Always-on, SSH access,     │ ✅ Perfect for current stage      │
+│                         │ full control, cron jobs     │ $15/month, simple, flexible      │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ EC2 Spot                │ Fault-tolerant batch,      │ ⚠️  Risky for cron jobs           │
+│                         │ can handle interruptions    │ Good for one-off big processing  │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ EC2 Reserved            │ Steady-state, 24/7,        │ ❌ Too early to commit            │
+│                         │ predictable workload        │ Revisit after 6 months stable    │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ Lambda                  │ Event-driven, &lt; 15 min,    │ ⚠️  Good for S3 triggers later    │
+│                         │ no server management        │ Bad for long ETL or SSH needs    │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ Fargate                 │ Containerized tasks,       │ ❌ Overkill for simple scripts    │
+│                         │ no server management        │ Revisit when containerizing      │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ AWS Batch               │ Large-scale batch jobs,    │ ❌ Designed for HPC/ML workloads  │
+│                         │ queue-based processing      │ Way beyond current needs         │
+├─────────────────────────┼────────────────────────────┼───────────────────────────────────┤
+│ Lightsail               │ Simple web/app servers,    │ ❌ Less flexibility than EC2      │
+│                         │ fixed monthly pricing       │ Can't attach IAM roles easily    │
+└─────────────────────────┴────────────────────────────┴───────────────────────────────────┘
+
+INSTANCE TYPE SELECTION FOR DATA ENGINEERING:
+┌──────────────┬───────┬────────┬──────────┬──────────────────────────────────┐
+│ Instance     │ vCPU  │ RAM    │ $/month  │ Use Case                         │
+├──────────────┼───────┼────────┼──────────┼──────────────────────────────────┤
+│ t3.micro     │ 2     │ 1 GB   │ $7.50    │ Tiny scripts, testing            │
+│ t3.small     │ 2     │ 2 GB   │ $15.00   │ Light ETL, cron jobs ← CHOSEN   │
+│ t3.medium    │ 2     │ 4 GB   │ $30.00   │ Medium ETL, pandas on 100MB+     │
+│ t3.large     │ 2     │ 8 GB   │ $60.00   │ Heavy pandas, multiple scripts   │
+│ m5.large     │ 2     │ 8 GB   │ $70.00   │ Memory-intensive, steady compute │
+│ c5.large     │ 2     │ 4 GB   │ $62.00   │ CPU-intensive transformations    │
+│ r5.large     │ 2     │ 16 GB  │ $91.00   │ In-memory processing, large joins│
+└──────────────┴───────┴────────┴──────────┴──────────────────────────────────┘
+
+T3 BURSTABLE PERFORMANCE:
+→ T3 instances earn CPU CREDITS when idle
+→ Spend credits when bursting above baseline
+→ t3.small baseline: 20% of 1 vCPU
+→ Can burst to 100% for ~24 minutes on saved credits
+→ Perfect for: scripts that run hard for 5 minutes then idle
+→ If sustained 100% CPU needed: use M5 or C5 (fixed performance)</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE EC2</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use EC2 for sub-second event processing
+</span>   → EC2 takes 30-90 seconds to boot
+   → Lambda: cold start 100-500ms, warm start &lt; 10ms
+   → For: "process file the instant it lands in S3" → Lambda
+
+2. DO NOT use EC2 for tasks under 15 minutes with no state
+   → Lambda: pay per 100ms of execution, zero cost when idle
+   → EC2: pay per second even when waiting for next job
+   → For: "run this function when SNS message arrives" → Lambda
+
+3. DO NOT use EC2 for containerized microservices
+   → ECS/Fargate: container orchestration, auto-scaling, no OS management
+   → EC2: you manage the OS, patching, container runtime
+   → For: "run 20 Docker containers with auto-scaling" → ECS/Fargate
+
+4. DO NOT use EC2 for managed database hosting
+   → EC2 + self-managed MySQL: you handle backups, patches, HA
+   → RDS: managed backups, patching, Multi-AZ failover
+   → Exception: MariaDB on EC2 for learning (Project 8) is fine
+
+5. DO NOT use EC2 for serverless ETL
+   → Glue: managed Spark, auto-scaling, no server management
+   → EC2: you manage everything
+   → For: "transform 100GB of Parquet files" → Glue (Project 25)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                     EC2 — INTERNAL MECHANICS                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  WHAT HAPPENS WHEN YOU "LAUNCH" AN INSTANCE:                                │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │ Step 1: You call RunInstances API                                │       │
+│  │   → Specify: AMI, instance type, key pair, SG, subnet, user data│       │
+│  │                                                                  │       │
+│  │ Step 2: AWS Placement Engine selects physical host               │       │
+│  │   → Host in requested AZ with enough capacity                    │       │
+│  │   → Multiple VMs share one physical server (multi-tenancy)       │       │
+│  │   → Nitro hypervisor isolates VMs from each other                │       │
+│  │                                                                  │       │
+│  │ Step 3: EBS volume attached                                      │       │
+│  │   → Root volume created from AMI snapshot                         │       │
+│  │   → Network-attached (not local disk) — persists across stop/start│      │
+│  │   → Replicated within the AZ for durability                       │       │
+│  │                                                                  │       │
+│  │ Step 4: Network interface created                                │       │
+│  │   → ENI (Elastic Network Interface) attached                     │       │
+│  │   → Private IP assigned from subnet CIDR                         │       │
+│  │   → Public IP assigned (if subnet configured for auto-assign)    │       │
+│  │   → Security group rules applied                                  │       │
+│  │                                                                  │       │
+│  │ Step 5: Instance boots                                           │       │
+│  │   → Hypervisor starts VM with AMI's root filesystem              │       │
+│  │   → cloud-init runs (Ubuntu) or cloud-init equivalent            │       │
+│  │   → User data script executes (if provided)                      │       │
+│  │   → SSH daemon starts, ready for connections                     │       │
+│  │                                                                  │       │
+│  │ Step 6: Instance reaches "running" state                         │       │
+│  │   → Status checks pass (system + instance)                       │       │
+│  │   → Billing starts (per-second, minimum 60 seconds)              │       │
+│  │   → Instance ID assigned (i-0abc123def456...)                    │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  INSTANCE STATES:                                                           │
+│  ┌──────────┐  start  ┌─────────┐  run    ┌─────────┐                      │
+│  │ pending  │────────→│ running │────────→│ running │ (steady state)        │
+│  └──────────┘         └─────────┘         └─────────┘                       │
+│                            │                    │                            │
+│                       stop │               terminate                         │
+│                            ▼                    ▼                            │
+│                       ┌──────────┐        ┌─────────────┐                   │
+│                       │ stopping │        │ shutting-down│                   │
+│                       └──────────┘        └─────────────┘                   │
+│                            │                    │                            │
+│                            ▼                    ▼                            │
+│                       ┌──────────┐        ┌─────────────┐                   │
+│                       │ stopped  │        │ terminated  │                    │
+│                       └──────────┘        └─────────────┘                   │
+│                            │                                                 │
+│                       start│              STOPPED:                            │
+│                            ▼              → EBS persists (you pay for it)     │
+│                       ┌──────────┐        → No compute charges               │
+│                       │ pending  │        → Public IP RELEASED               │
+│                       └──────────┘        → Private IP RETAINED              │
+│                            │              → May launch on DIFFERENT host      │
+│                            ▼                                                 │
+│                       ┌──────────┐        TERMINATED:                         │
+│                       │ running  │        → Everything deleted                │
+│                       └──────────┘        → EBS root volume deleted           │
+│                                           → Cannot be recovered              │
+│                                                                             │
+│  SECURITY GROUP MECHANICS:                                                   │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │ Security Group = STATEFUL firewall                               │       │
+│  │                                                                  │       │
+│  │ STATEFUL means:                                                  │       │
+│  │ → If INBOUND rule allows SSH (port 22)                           │       │
+│  │ → Response traffic on SSH is AUTOMATICALLY allowed outbound      │       │
+│  │ → No need to create explicit outbound rule for responses         │       │
+│  │                                                                  │       │
+│  │ vs NACL (Network ACL) = STATELESS:                               │       │
+│  │ → Must explicitly allow BOTH inbound AND outbound                │       │
+│  │ → Including ephemeral port range for responses                   │       │
+│  │                                                                  │       │
+│  │ RULES:                                                           │       │
+│  │ → Inbound: default DENY all, you add ALLOW rules                │       │
+│  │ → Outbound: default ALLOW all (can restrict)                     │       │
+│  │ → NO DENY rules — only ALLOW                                    │       │
+│  │ → If traffic doesn't match any ALLOW rule → denied              │       │
+│  │ → Changes take effect IMMEDIATELY (no apply/save)                │       │
+│  │ → Can reference other SGs as source (SG chaining)               │       │
+│  │                                                                  │       │
+│  │ EVALUATION ORDER:                                                │       │
+│  │ Packet arrives → Check ALL inbound rules → Any match? → ALLOW   │       │
+│  │                                          → No match?  → DENY    │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  KEY PAIR MECHANICS:                                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │ 1. You create key pair → AWS gives you PRIVATE key (.pem)        │       │
+│  │ 2. AWS stores PUBLIC key                                         │       │
+│  │ 3. On launch: public key injected into                           │       │
+│  │    /home/ubuntu/.ssh/authorized_keys                             │       │
+│  │ 4. You SSH with: ssh -i private_key.pem ubuntu@&lt;public-ip&gt;      │       │
+│  │ 5. SSH verifies: your private key matches stored public key      │       │
+│  │ 6. If match → access granted                                     │       │
+│  │                                                                  │       │
+│  │ KEY POINT: AWS NEVER stores your private key                     │       │
+│  │ → Downloaded once at creation                                     │       │
+│  │ → If lost → cannot recover → must create new key pair             │       │
+│  │ → Can still access via AWS Systems Manager Session Manager       │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  USER DATA MECHANICS:                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │ → Shell script (or cloud-init directives) run at FIRST boot      │       │
+│  │ → Executed as ROOT user (no sudo needed in script)               │       │
+│  │ → Runs ONCE by default (unless configured for every boot)        │       │
+│  │ → Output logged to /var/log/cloud-init-output.log                │       │
+│  │ → If script fails → instance still launches (check logs!)        │       │
+│  │ → Maximum size: 16 KB (raw) or 64 KB (base64 encoded)           │       │
+│  │ → Must start with #!/bin/bash (or appropriate shebang)           │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  INSTANCE METADATA SERVICE (IMDS):                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │ → Available at http://169.254.169.254/latest/meta-data/          │       │
+│  │ → Accessible ONLY from within the instance (link-local address)  │       │
+│  │ → Provides: instance-id, public-ip, private-ip, IAM role creds   │       │
+│  │ → IMDSv2 (recommended): requires session token (PUT then GET)    │       │
+│  │ → IMDSv1 (legacy): simple GET request (SSRF vulnerability)       │       │
+│  │ → ALWAYS use IMDSv2 — disable v1 in launch configuration        │       │
+│  │                                                                  │       │
+│  │ HOW boto3 GETS CREDENTIALS (covered deeply in Project 6):       │       │
+│  │ → boto3 calls IMDS → gets temporary credentials from IAM role    │       │
+│  │ → Credentials auto-rotate (new ones every ~6 hours)              │       │
+│  │ → No access keys stored anywhere on instance                     │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Cannot SSH — connection timed out"
+</span>→ Cause 1: Security group doesn't allow inbound port 22
+→ Cause 2: Your IP changed (dynamic home IP) — SG rule outdated
+→ Cause 3: Instance in private subnet with no internet gateway
+→ Cause 4: NACL blocking traffic (rare with default VPC)
+→ Debug: check SG rules → check your current IP → check subnet route table
+
+PITFALL 2: "Permission denied (publickey) on SSH"
+→ Cause 1: Wrong username (use "ubuntu" for Ubuntu, "ec2-user" for Amazon Linux)
+→ Cause 2: Wrong private key file
+→ Cause 3: Private key permissions too open (must be chmod 400)
+→ Cause 4: Key pair doesn't match the instance
+→ Fix: ssh -i ~/.ssh/correct-key.pem -v ubuntu@&lt;ip&gt; (-v for verbose debug)
+
+PITFALL 3: "Instance running but status check 1/2 failed"
+→ System status check: AWS hardware/hypervisor problem → stop/start instance
+→ Instance status check: OS-level issue → check logs, reboot
+→ Stop/start moves instance to different physical host (fixes hardware issues)
+
+PITFALL 4: "My public IP changed after stop/start"
+→ Cause: non-Elastic public IPs are released when instance stops
+→ On start: new public IP assigned
+→ Fix: allocate Elastic IP ($0.005/hour when NOT attached — free when attached)
+→ Or: use DNS name that auto-updates (Route 53)
+
+PITFALL 5: "Instance runs out of disk space"
+→ Default root volume: 8 GB (Ubuntu AMI)
+→ Python packages + data files fill it fast
+→ Fix: specify larger root volume at launch (20-50 GB)
+→ Or: attach additional EBS volume for data
+
+PITFALL 6: "User data script didn't run"
+→ Cause 1: missing shebang (#!/bin/bash) at top
+→ Cause 2: script has Windows line endings (\r\n instead of \n)
+→ Cause 3: script exceeds 16 KB limit
+→ Debug: SSH in → check /var/log/cloud-init-output.log
+
+PITFALL 7: "EC2 instance can't reach S3"
+→ Cause 1: outbound security group too restrictive (blocks HTTPS 443)
+→ Cause 2: no internet gateway in VPC (default VPC has one)
+→ Cause 3: route table doesn't have 0.0.0.0/0 → IGW route
+→ Default VPC: all of these are pre-configured (should just work)
+
+PITFALL 8: "Bill is higher than expected"
+→ Cause: forgot to stop instance when not using it
+→ Running 24/7: t3.small = $15/month
+→ Also: Elastic IP NOT attached to running instance = $3.60/month
+→ Fix: stop instances, release unused Elastic IPs
+→ Set up billing alarm (CloudWatch → Billing → Alarm)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VERTICAL SCALING (scale UP):
+</span>→ Stop instance → change instance type → start
+→ t3.small → t3.medium → t3.large → m5.xlarge
+→ Takes ~2 minutes (stop + type change + start)
+→ Same EBS volume, same private IP, same data
+→ Public IP changes unless Elastic IP is attached
+
+HORIZONTAL SCALING (scale OUT):
+→ Launch multiple instances behind a load balancer
+→ Auto Scaling Group: automatically add/remove instances
+→ Covered in Project 52 (SQS-based scaling)
+→ QuickCart won't need this for a while
+
+DISK SCALING:
+→ EBS volumes can be EXPANDED live (no downtime)
+→ 20 GB → 100 GB: modify volume, extend filesystem
+→ Cannot SHRINK an EBS volume
+→ For very large data: use S3, not local EBS
+
+NETWORK SCALING:
+→ t3.small: "Up to 5 Gbps" network
+→ Sufficient for S3 transfers of files &lt; 1 GB
+→ For massive transfers (TB): use S3 Transfer Acceleration or multi-part
+
+COST SCALING:
+→ 1 instance (t3.small): $15/month
+→ 5 instances (t3.small): $75/month
+→ At this point: consider ECS/Fargate for orchestration
+→ At 20+ instances: definitely need container orchestration
+
+AMI FOR REPRODUCIBILITY:
+→ Once instance is configured perfectly → create AMI (machine image)
+→ AMI captures: OS + packages + config + scripts
+→ Launch new instances from AMI → identical clones in seconds
+→ Essential for auto scaling groups</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR EC2 HEALTH:
+</span>
+1. EC2 Console:
+   → Instance state: running/stopped/terminated
+   → Status checks: 2/2 = healthy
+   → Monitoring tab: CPU, network, disk metrics
+
+2. CloudWatch Metrics (free, 5-minute intervals):
+   → CPUUtilization: should be &lt; 80% sustained
+   → NetworkIn/NetworkOut: data transfer volume
+   → StatusCheckFailed: 0 = healthy
+   → DiskReadOps/DiskWriteOps: I/O activity
+
+3. CloudWatch Alarms:
+   → CPU &gt; 90% for 5 minutes → SNS notification (Project 12)
+   → StatusCheckFailed &gt; 0 → auto-recover instance
+   → Billing &gt; threshold → alert before bill surprise
+
+4. System Logs (from inside instance):
+   → /var/log/syslog: system events
+   → /var/log/cloud-init-output.log: user data script output
+   → /var/log/auth.log: SSH login attempts (security audit)
+   → journalctl: systemd service logs
+
+5. VPC Flow Logs:
+   → Network traffic logs for the instance's ENI
+   → Shows: source IP, dest IP, port, action (ACCEPT/REJECT)
+   → Essential for debugging connectivity issues
+   → Delivered to CloudWatch Logs or S3</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(5)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create Key Pair</h3>
+
+<h3>Step 2: Create Security Group</h3>
+
+<h3>Step 3: Launch EC2 Instance</h3>
+
+<h3>Step 4: Instance Management Operations</h3>
+
+<h3>Step 5: Verify Instance Setup After Boot</h3>
+
+<h3>Step 6: Deploy Scripts to EC2</h3>
+
+<h3>Step 7: EC2 Monitoring Helper</h3>
+
+<h3>Step 8: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create SSH key pair (one-time)</span><span>
+</span>python 23_create_key_pair.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create security group (one-time)</span><span>
+</span>python 24_create_security_group.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Launch EC2 instance</span><span>
+</span>python 25_launch_ec2_instance.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Wait 3-5 minutes for user data script to complete</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Verify setup</span><span>
+</span>python 27_verify_ec2_setup.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Deploy scripts from Projects 1-4</span><span>
+</span>python 28_deploy_scripts_to_ec2.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Monitor instance</span><span>
+</span>python 29_monitor_ec2.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Manage instance (stop/start/terminate)</span><span>
+</span>python 26_manage_ec2_instance.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT — INSTANCE LAUNCH:
+</span>
+============================================================
+🚀 LAUNCHING EC2 INSTANCE
+============================================================
+   Latest Ubuntu 22.04 AMI: ami-0abc123def456...
+   Name: ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-20250710
+
+🚀 Launching EC2 instance...
+   Name: quickcart-data-worker
+   Type: t3.small
+   AMI: ami-0abc123def456...
+   Key: quickcart-data-team-key
+   SG: sg-0abc123def456...
+
+   ✅ Instance launched: i-0abc123def456...
+   ⏳ Waiting for instance to reach 'running' state...
+   ✅ Instance is running
+   ⏳ Waiting for status checks to pass...
+   ✅ Status checks passed (2/2)
+
+============================================================
+🖥️  INSTANCE READY
+============================================================
+   Instance ID:  i-0abc123def456...
+   Public IP:    3.145.67.89
+   Private IP:   172.31.42.10
+   AZ:           us-east-2a
+   Type:         t3.small
+   Key:          quickcart-data-team-key
+
+   📋 SSH COMMAND:
+   ssh -i ~/.ssh/quickcart-data-team-key.pem <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="3d485f485349487d0e130c0908130b0a130504">[email&#160;protected]</a>
+
+   ⏳ User data script may take 3-5 minutes to complete
+============================================================</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT — VERIFICATION:
+</span>
+=================================================================
+🔍 VERIFYING EC2 SETUP: quickcart-data-worker
+   IP: 3.145.67.89
+=================================================================
+   ✅ OS Version              → PRETTY_NAME="Ubuntu 22.04.5 LTS"
+   ✅ Python Version          → Python 3.10.12
+   ✅ Pip Version             → pip 22.0.2 from /usr/lib/python3/...
+   ✅ AWS CLI Version         → aws-cli/2.17.25 Python/3.11.9...
+   ✅ boto3 Version           → 1.34.144
+   ✅ pandas Version          → 2.2.2
+   ✅ pymysql Version         → 1.1.1
+   ✅ psycopg2 Available      → 2.9.9
+   ✅ Disk Space              → /dev/root 20G 4.2G 16G 21% /
+   ✅ Memory                  → Mem: 1.9Gi 312Mi 1.2Gi 6Mi 440Mi
+   ✅ Swap                    → /swapfile file 2G 0B -2
+   ✅ CPU Count               → 2
+   ✅ Uptime                  → 00:05:32 up 5 min, 0 users
+   ✅ Project Directory       → scripts logs data config
+   ✅ MySQL Client            → mysql Ver 8.0.39-0ubuntu0.22.04.1
+   ✅ PostgreSQL Client       → psql (PostgreSQL) 14.12
+   ✅ User Data Log Tail      → SETUP COMPLETE — ...
+
+-----------------------------------------------------------------
+   ✅ Passed: 17/17
+   ❌ Failed: 0/17
+
+   🎉 INSTANCE FULLY CONFIGURED AND READY
+=================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ EC2 = virtual machine on AWS hardware, full root access
+→ Instance type = CPU + RAM + Network combination (t3.small for light ETL)
+→ Key pair = SSH authentication (ED25519 preferred, never share private key)
+→ Security group = stateful firewall (ALLOW rules only, default DENY all inbound)
+→ User data = first-boot script that automates instance setup
+→ Instance states: pending → running → stopping → stopped → terminated
+→ Stop: preserves EBS, releases public IP, stops compute billing
+→ Terminate: PERMANENT deletion, cannot recover
+→ IMDSv2: secure metadata service for getting instance info + credentials
+→ gp3 EBS: newer, cheaper, better baseline IOPS than gp2
+→ T3 burstable: earns CPU credits when idle, spends when busy
+→ Always tag instances for cost tracking and management
+
+CONNECTING TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Projects 1-4: Built S3 storage layer (bucket, versioning, access, tiering)
+→ Project 5: Built COMPUTE layer (EC2 instance to run scripts)
+→ Deployed Project 1-4 scripts TO EC2 with cron scheduling
+→ EC2 is in SAME REGION as S3 → zero data transfer cost
+
+CURRENT GAP:
+→ Scripts on EC2 need AWS credentials to access S3
+→ Currently: either hardcoded credentials or ~/.aws/credentials file
+→ Both are INSECURE — keys can be stolen, never rotate, leak to Git
+→ Need: IAM Role attached to EC2 instance (Instance Profile)
+→ boto3 automatically discovers role credentials via IMDS
+→ No keys stored anywhere — auto-rotating temporary credentials
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 6: EC2 Instance Profile + IAM Role
+   → "Python Script on EC2 Must Read/Write S3 Without Hardcoded Keys"
+   → Connects: Project 3 (IAM policies) + Project 5 (EC2)
+   → Introduces: IAM Roles, Trust Policies, STS, Instance Profiles
+   → After this: EC2 ↔ S3 connection is COMPLETE and SECURE
+
+→ Project 8: Install MariaDB ON this EC2 instance
+   → Same instance hosts both scripts AND database
+   → Introduces: MariaDB installation, configuration, CRUD
+
+→ Project 19: EC2 script reads S3, writes to MariaDB
+   → First true ETL pipeline on EC2
+   → Requires: Project 5 (EC2) + Project 6 (IAM Role) + Project 8 (MariaDB)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>✅ S3 bucket — fully configured and optimized (Projects 1-4)
+✅ EC2 instance — running Ubuntu with Python, cron, all tools (Project 5)
+✅ Scripts deployed and scheduled on EC2
+
+BUT: There's a ticking time bomb in the setup
+
+Look at the upload script (Project 1, file 02_upload_daily_csvs.py):
+→ s3_client = boto3.client("s3", region_name=REGION)
+→ This call NEEDS AWS credentials
+→ On developer's laptop: uses ~/.aws/credentials
+→ On EC2: currently... NOTHING configured
+→ Script will FAIL with "Unable to locate credentials"
+
+Quick fix (WRONG approach):
+→ SSH into EC2
+→ Run: aws configure
+→ Paste access key ID and secret key
+→ Keys now stored in /home/ubuntu/.aws/credentials
+→ Works! But...
+   → Keys never rotate (static forever)
+   → If instance is compromised → attacker has permanent keys
+   → Keys might get committed to Git accidentally
+   → When employee leaves → keys still work until manually revoked
+
+Right fix (Project 6):
+→ Create IAM ROLE with S3 permissions
+→ Attach role to EC2 instance via INSTANCE PROFILE
+→ boto3 automatically discovers credentials via metadata service
+→ Credentials rotate every ~6 hours
+→ No keys stored anywhere on the instance
+→ If instance is compromised → attacker gets temporary creds that expire
+
+CTO: "Make sure no credentials are stored on any machine, ever."
+YOU: "That's exactly what IAM Roles for EC2 are designed for."
+
+→ Project 6: "Python Script on EC2 Must Read/Write S3 Without Hardcoded Keys"
+→ Introduces: IAM Roles, Trust Policies, STS AssumeRole, Instance Profiles
+→ Connects: Project 3 (IAM policies) + Project 5 (EC2)</code></pre></div>
+<hr>
+</div>
+</div>
+
+
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-4.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 5 of 80</span>
+    <span class="nav-project-title">DATA TEAM NEEDS A LINUX MACHINE TO RUN PYTHON SCRIPTS</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-6.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-6.html") window.location = "project-6.html";
+  if (e.key === 'ArrowLeft' && "project-4.html") window.location = "project-4.html";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 43: SYNC REDSHIFT AGGREGATED RESULTS BACK TO MARIADB FOR APP — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:54%"></div></div>
+<div id="progress-label">54%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 43 of 80</div>
+  <div class="project-title">SYNC REDSHIFT AGGREGATED RESULTS BACK TO MARIADB FOR APP</div>
+  <div class="project-tags"><span class="project-tag">MariaDB</span><span class="project-tag">Redshift</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Series A, 800K monthly active users
+</span>Team: 3-person data team, 5-person backend team
+
+CURRENT STATE (built through Projects 1–42):
+→ MariaDB → CDC → S3 → Glue → Redshift (forward pipeline — Project 42)
+→ Redshift holds 5.2M orders, 500K customers, 5K products
+→ Analytics team runs aggregations in Redshift daily:
+   - Customer lifetime value (CLV)
+   - Product recommendation scores
+   - Customer churn risk scores
+   - Revenue per customer segment
+
+THE NEW REQUIREMENT:
+→ Product team built a "Personalized For You" section on mobile app
+→ App reads from MariaDB (low-latency OLTP reads: &lt;5ms)
+→ App needs THESE Redshift-computed values:
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │ customer_recommendations (new table in MariaDB)               │
+  │                                                               │
+  │ customer_id │ product_id │ score │ rank │ computed_at          │
+  │ CUST-000001 │ PROD-00342 │ 0.94  │ 1    │ 2025-01-15 02:00:00│
+  │ CUST-000001 │ PROD-00891 │ 0.87  │ 2    │ 2025-01-15 02:00:00│
+  │ CUST-000001 │ PROD-00127 │ 0.82  │ 3    │ 2025-01-15 02:00:00│
+  │ ...         │ ...        │ ...   │ ...  │ ...                 │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │ customer_metrics (new table in MariaDB)                       │
+  │                                                               │
+  │ customer_id │ lifetime_value │ churn_risk │ segment │ updated │
+  │ CUST-000001 │ 2847.50        │ 0.12       │ gold    │ ...     │
+  │ CUST-000002 │ 142.00         │ 0.78       │ bronze  │ ...     │
+  │ ...         │ ...            │ ...        │ ...     │ ...     │
+  └───────────────────────────────────────────────────────────────┘
+
+→ ~500K customer_metrics rows (one per customer)
+→ ~2.5M customer_recommendations rows (top 5 products × 500K customers)
+→ Must refresh NIGHTLY after Redshift aggregations complete
+→ App reads must NEVER see partial data (half-updated recommendations)
+
+WHY CAN'T THE APP READ FROM REDSHIFT DIRECTLY?
+→ Redshift: designed for analytical queries (100ms–30s response)
+→ MariaDB: designed for OLTP reads (&lt;5ms response)
+→ Redshift: max 500 concurrent connections
+→ MariaDB: handles 10,000+ concurrent reads easily
+→ Redshift: $0.25/hour minimum cluster cost (always on)
+→ MariaDB: already running for the application
+
+BACKEND LEAD: "We need these analytics results IN MariaDB.
+               Our app can't call Redshift — it's too slow,
+               too expensive, and can't handle our read volume."
+
+CTO: "Data flows INTO the warehouse. Now make it flow BACK OUT.
+      This is reverse ETL."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand REVERSE ETL
+</span>→ Traditional ETL: Operational DB → Warehouse (data IN)
+→ Reverse ETL: Warehouse → Operational DB (insights OUT)
+→ Why it exists: analytics creates VALUE, but value must reach
+  the APPLICATION where users interact
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │           TRADITIONAL ETL (Projects 1-42)                    │
+  │  MariaDB ──────→ S3 ──────→ Glue ──────→ Redshift           │
+  │  (OLTP)          (Lake)     (Transform)   (Analytics)        │
+  │                                                              │
+  │           REVERSE ETL (THIS PROJECT)                         │
+  │  Redshift ─────→ S3 ──────→ Glue ──────→ MariaDB            │
+  │  (Analytics)     (Lake)     (Transform)   (OLTP)             │
+  └──────────────────────────────────────────────────────────────┘
+
+Step 2: Identify the data flow
+→ Source: Redshift analytical queries (aggregations)
+→ Extract: UNLOAD to S3 as Parquet/CSV (Project 22 — already learned)
+→ Transform: minimal (maybe rename columns, cast types)
+→ Load: Glue JDBC write to MariaDB (Project 31 reverse)
+→ Strategy: full replace OR upsert (depends on table)
+
+Step 3: Choose REPLACE vs UPSERT per table
+
+  ┌───────────────────────┬───────────────────┬────────────────────────┐
+  │ Table                 │ Strategy          │ Why                    │
+  ├───────────────────────┼───────────────────┼────────────────────────┤
+  │ customer_metrics      │ UPSERT            │ 500K rows              │
+  │ (500K rows)           │ (ON DUPLICATE KEY │ Only ~30K change daily │
+  │                       │  UPDATE)          │ Upsert is faster       │
+  ├───────────────────────┼───────────────────┼────────────────────────┤
+  │ customer_recommendations│ FULL REPLACE    │ 2.5M rows              │
+  │ (2.5M rows)           │ (TRUNCATE+LOAD   │ All scores recomputed  │
+  │                       │  in transaction)  │ daily — no partial     │
+  │                       │                   │ update makes sense     │
+  └───────────────────────┴───────────────────┴────────────────────────┘
+
+Step 4: Ensure ATOMIC visibility
+→ App must NEVER see half-updated data
+→ customer_recommendations: use table swap pattern
+   - Load into customer_recommendations_new
+   - RENAME customer_recommendations → customer_recommendations_old
+   - RENAME customer_recommendations_new → customer_recommendations
+   - DROP customer_recommendations_old
+   - Rename is atomic in MariaDB (&lt;1ms, no data copy)
+→ customer_metrics: use transaction-wrapped UPSERT batches
+
+Step 5: Fit into existing pipeline (Project 41)
+→ Redshift aggregation completes → UNLOAD to S3
+→ S3 file arrival → EventBridge → Step Functions (Project 41)
+→ Step Functions → Glue ETL → MariaDB JDBC write
+→ Same event-driven architecture, reverse direction</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  REDSHIFT (Source of aggregated analytics)                      │
+  │                                                                 │
+  │  Aggregation Query 1: customer_metrics                          │
+  │  ┌──────────────────────────────────────────────────────────┐  │
+  │  │ SELECT                                                    │  │
+  │  │   c.customer_id,                                          │  │
+  │  │   SUM(o.total_amount) AS lifetime_value,                  │  │
+  │  │   churn_model_score(c.customer_id) AS churn_risk,         │  │
+  │  │   CASE WHEN SUM(o.total_amount) &gt; 1000 THEN 'gold'       │  │
+  │  │        WHEN SUM(o.total_amount) &gt; 200  THEN 'silver'      │  │
+  │  │        ELSE 'bronze' END AS segment                       │  │
+  │  │ FROM customers c JOIN orders o ON c.customer_id = o.cid   │  │
+  │  │ GROUP BY c.customer_id                                    │  │
+  │  └──────────────────────────────────────────────────────────┘  │
+  │                                                                 │
+  │  Aggregation Query 2: customer_recommendations                  │
+  │  ┌──────────────────────────────────────────────────────────┐  │
+  │  │ (collaborative filtering / scoring logic)                 │  │
+  │  │ Returns: customer_id, product_id, score, rank             │  │
+  │  │ Top 5 products per customer                               │  │
+  │  └──────────────────────────────────────────────────────────┘  │
+  └───────────────────────┬─────────────────────────────────────────┘
+                          │
+                          │ UNLOAD to S3 (Project 22)
+                          ▼
+  S3: reverse_etl/customer_metrics/dt=2025-01-15/
+      reverse_etl/customer_recommendations/dt=2025-01-15/
+                          │
+                          │ EventBridge → Step Functions (Project 41)
+                          ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  GLUE ETL JOB (Reverse ETL)                                    │
+  │                                                                 │
+  │  For customer_metrics:                                          │
+  │  → Read Parquet from S3                                         │
+  │  → Write to MariaDB via JDBC                                    │
+  │  → UPSERT pattern (ON DUPLICATE KEY UPDATE)                     │
+  │                                                                 │
+  │  For customer_recommendations:                                   │
+  │  → Read Parquet from S3                                         │
+  │  → Write to MariaDB temp table via JDBC                         │
+  │  → Atomic table swap (RENAME)                                   │
+  └───────────────────────┬─────────────────────────────────────────┘
+                          │
+                          ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  MARIADB (Target — serves the mobile app)                       │
+  │                                                                 │
+  │  customer_metrics: UPSERTED (500K rows, ~30K changed)           │
+  │  customer_recommendations: SWAPPED (2.5M rows, full refresh)    │
+  │                                                                 │
+  │  App reads: SELECT * FROM customer_recommendations               │
+  │             WHERE customer_id = ? ORDER BY rank LIMIT 5          │
+  │  Latency: &lt;5ms with index on customer_id                        │
+  └─────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Direct Redshift → MariaDB via Glue JDBC (no S3 intermediate)
+</span>→ Glue reads from Redshift JDBC, writes to MariaDB JDBC
+→ Problem: Glue holds Redshift connection for entire job duration
+→ Redshift has limited connections (500 max)
+→ Large result sets (2.5M rows) can timeout the JDBC connection
+→ No checkpoint/resume if job fails midway
+→ VERDICT: Works for small tables, risky for large ones
+
+Option B: Redshift UNLOAD → S3 → EC2 script → MariaDB LOAD DATA
+→ UNLOAD is fast and decouples Redshift from downstream
+→ EC2 script downloads CSV and runs LOAD DATA INFILE
+→ Problem: custom code, no managed retries, EC2 must be running
+→ VERDICT: Works but not cloud-native
+
+Option C: Redshift UNLOAD → S3 → Glue ETL → MariaDB JDBC
+→ ✅ UNLOAD decouples Redshift (fast, parallel files)
+→ ✅ S3 provides durable intermediate storage (checkpoint)
+→ ✅ Glue provides managed compute with JDBC write capability
+→ ✅ Fits into existing Step Functions pipeline (Project 41)
+→ VERDICT: Best — decoupled, managed, auditable
+
+Option D: Use a Reverse ETL SaaS (Census, Hightouch, etc.)
+→ Commercial tools designed exactly for this
+→ Problem: cost ($500+/month), vendor lock-in, team must learn new tool
+→ VERDICT: Good for large orgs, overkill for QuickCart's 3 tables
+
+DECISION: Option C — UNLOAD → S3 → Glue → MariaDB</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. UNLOAD with Parquet format (not CSV)
+</span>   → Parquet preserves data types (decimals, timestamps)
+   → CSV causes type ambiguity (is "0.12" a string or float?)
+   → Glue reads Parquet natively with correct types
+   → Parquet is smaller (compression) → faster S3 transfer
+
+2. Use PARALLEL OFF for UNLOAD (for this use case)
+   → Default UNLOAD: splits output into multiple files (parallel)
+   → Multiple files = harder to track "is UNLOAD done?"
+   → PARALLEL OFF: single file output
+   → For 500K rows: single file is fine (&lt; 50 MB)
+   → For 2.5M rows: use PARALLEL ON with manifest file
+
+3. Create MariaDB target tables with proper indexes FIRST
+   → customer_id index for app reads
+   → composite index (customer_id, rank) for recommendations
+   → Without index: app reads go from &lt;5ms to &gt;500ms
+
+4. Use table swap (RENAME) for full-replace tables
+   → TRUNCATE + INSERT = table empty for seconds during load
+   → App reads during this window see NO recommendations
+   → RENAME: atomic, &lt;1ms, app always sees complete data
+
+5. Use batch UPSERT for incremental tables
+   → INSERT ... ON DUPLICATE KEY UPDATE (MariaDB syntax)
+   → Batch size: 1000–5000 rows per INSERT statement
+   → Too small: too many round trips to MariaDB
+   → Too large: single INSERT takes too long, blocks replication
+
+6. Add computed_at timestamp to all reverse ETL tables
+   → Tells the app: "these recommendations were computed at 2:00 AM"
+   → Enables freshness monitoring
+   → If computed_at is 48+ hours old → pipeline is broken → alert
+
+7. Run reverse ETL AFTER forward CDC completes
+   → Forward: MariaDB → Redshift (Project 42) at 00:05
+   → Aggregation: Redshift queries at 00:30
+   → Reverse: Redshift → MariaDB (this project) at 01:00
+   → Ensures aggregations use latest data</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT write directly from Redshift to MariaDB via dblink/federation
+</span>   → Redshift has no outbound JDBC connection capability
+   → Redshift is a SINK, not a source for JDBC writes
+   → Always go through S3 as intermediate
+
+2. DO NOT TRUNCATE the production table before loading
+   → TRUNCATE customer_recommendations → table is EMPTY
+   → Load takes 2 minutes → app shows "no recommendations" for 2 minutes
+   → Users see empty "For You" section → support tickets flood in
+   → Use RENAME pattern instead (atomic swap)
+
+3. DO NOT write 2.5M rows one-at-a-time via JDBC
+   → Single INSERT per row: 2.5M network round trips
+   → Time: ~45 minutes (unbearably slow)
+   → Batch INSERT (1000 rows per statement): ~90 seconds
+   → LOAD DATA INFILE: ~30 seconds (fastest for MariaDB)
+
+4. DO NOT skip type validation between Redshift and MariaDB
+   → Redshift DECIMAL(10,2) → MariaDB DECIMAL(10,2): works
+   → Redshift FLOAT → MariaDB DECIMAL: precision loss!
+   → Redshift TIMESTAMPTZ → MariaDB TIMESTAMP: timezone lost!
+   → Validate types BEFORE production deployment
+
+5. DO NOT hold a single MariaDB transaction for 2.5M row insert
+   → Huge transaction → locks table → app reads blocked
+   → MariaDB InnoDB redo log fills up → performance cliff
+   → Use batched commits: INSERT 5000 rows → COMMIT → repeat
+
+6. DO NOT schedule reverse ETL BEFORE aggregation queries finish
+   → If aggregation takes 25 minutes and reverse ETL starts at minute 20
+   → Reverse ETL reads stale/incomplete aggregation results
+   → Use Step Functions to chain: aggregate → UNLOAD → reverse ETL
+
+7. DO NOT forget to monitor MariaDB disk space
+   → 2.5M recommendation rows + 500K metric rows = ~500 MB
+   → If MariaDB is on a small EBS volume → disk full → crash
+   → Table swap temporarily doubles space (old + new table exist)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────┬──────────────────────────────┬─────────────────────────────┐
+</span>│ Pattern                      │ Use When                     │ Don't Use When              │
+├──────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ UNLOAD → S3 → Glue → MariaDB│ Nightly batch reverse ETL    │ Need real-time sync         │
+│ (THIS PROJECT)               │ Decoupled architecture       │ &lt; 1 minute latency needed   │
+│                              │ Existing Glue infrastructure │                             │
+├──────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Redshift → Glue JDBC direct  │ Small tables (&lt; 50K rows)   │ Large tables (&gt; 500K)       │
+│ (Option A above)             │ Simple schema                │ Long-running Redshift conn  │
+├──────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ DMS Reverse Replication      │ Need continuous sync         │ Batch is sufficient         │
+│                              │ Multiple tables              │ Budget-conscious            │
+├──────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Application-level API        │ Small result sets            │ Bulk data movement          │
+│ (App calls Redshift API)     │ On-demand, not batch         │ &gt; 1000 rows per request     │
+├──────────────────────────────┼──────────────────────────────┼─────────────────────────────┤
+│ Materialized View in App DB  │ Aggregation is simple enough │ Complex ML-based scoring    │
+│ (compute in MariaDB itself)  │ to run in MariaDB            │ Requires warehouse features │
+└──────────────────────────────┴──────────────────────────────┴─────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE REVERSE ETL VIA S3</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need real-time sync (&lt; 1 minute latency)
+</span>   → UNLOAD + Glue = minimum 5-10 minutes end-to-end
+   → For real-time: use Redshift streaming or Lambda trigger
+   → Or: compute in MariaDB directly (skip warehouse round trip)
+
+2. When the data is already in S3 and doesn't need Redshift
+   → If source is S3 Parquet, skip Redshift entirely
+   → Glue can read S3 and write to MariaDB directly
+   → Adding Redshift in the middle just for a pass-through is waste
+
+3. When the target is NOT a relational database
+   → If target is DynamoDB: use Glue DynamoDB connector (not JDBC)
+   → If target is Elasticsearch: use different connector
+   → JDBC write pattern is specific to RDBMS targets
+
+4. When data volume exceeds MariaDB capacity
+   → 100M+ rows → MariaDB struggles with bulk loads
+   → Consider: Aurora MySQL (managed, scales better)
+   → Or: DynamoDB (if access pattern is key-value)
+
+5. When security policy forbids warehouse data in operational DB
+   → Some compliance frameworks (PCI, HIPAA) restrict
+     where aggregated data can be stored
+   → Verify with security team before implementing reverse ETL</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: REVERSE ETL PIPELINE                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ Redshift UNLOAD Mechanics (Recap from Project 22 + new details)             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━             │
+│                                                                                 │
+│  UNLOAD ('SELECT ...') TO 's3://bucket/prefix/'                                │
+│  IAM_ROLE 'arn:aws:iam::...:role/...'                                          │
+│  FORMAT PARQUET                                                                 │
+│  ALLOWOVERWRITE;                                                                │
+│                                                                                 │
+│  Internal execution:                                                            │
+│  1. Redshift executes the SELECT query on compute nodes                         │
+│  2. Each compute node slice writes its portion to S3 IN PARALLEL               │
+│  3. Default: creates one file per slice (e.g., 8 slices = 8 files)             │
+│  4. PARALLEL OFF: leader node merges all slices into single file               │
+│     → Slower but simpler for downstream consumption                            │
+│  5. Files written to S3 with sequential naming:                                │
+│     prefix/0000_part_00 , prefix/0001_part_00, etc.                            │
+│  6. UNLOAD is READ-ONLY — does not modify Redshift data                        │
+│  7. UNLOAD generates a manifest file (optional) listing all output files       │
+│                                                                                 │
+│  PARQUET vs CSV for reverse ETL:                                                │
+│  ┌────────────────┬────────────────────────────┬─────────────────────────┐      │
+│  │ Feature        │ Parquet                    │ CSV                     │      │
+│  ├────────────────┼────────────────────────────┼─────────────────────────┤      │
+│  │ Type safety    │ Schema embedded in file    │ Everything is string    │      │
+│  │ Size (500K)    │ ~15 MB                     │ ~45 MB                  │      │
+│  │ Decimal prec.  │ Preserved exactly          │ May lose trailing zeros │      │
+│  │ Null handling  │ Native null support        │ Empty string ambiguity  │      │
+│  │ Glue read      │ Native DynamicFrame        │ Needs CSV SerDe config  │      │
+│  └────────────────┴────────────────────────────┴─────────────────────────┘      │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Glue JDBC Write to MariaDB — Internal Mechanics                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                             │
+│                                                                                 │
+│  glueContext.write_dynamic_frame.from_options(                                  │
+│      connection_type="mysql",                                                   │
+│      connection_options={                                                        │
+│          "url": "jdbc:mysql://host:3306/db",                                    │
+│          "dbtable": "table_name",                                               │
+│          "user": "...", "password": "..."                                       │
+│      }                                                                          │
+│  )                                                                              │
+│                                                                                 │
+│  What happens internally:                                                       │
+│  1. Glue partitions the DynamicFrame into N partitions (Spark)                 │
+│  2. Each Spark executor opens a JDBC connection to MariaDB                     │
+│  3. Each executor writes its partition via batch INSERT statements             │
+│  4. Default batch size: 1000 rows per INSERT                                   │
+│  5. Each batch: INSERT INTO table (col1,col2,...) VALUES (...),(...),...        │
+│  6. Executor commits after each batch                                           │
+│                                                                                 │
+│  PROBLEM with default Glue JDBC write:                                          │
+│  → Uses INSERT (not INSERT ... ON DUPLICATE KEY UPDATE)                         │
+│  → If row already exists → DUPLICATE KEY ERROR → job fails                     │
+│  → Glue does NOT natively support UPSERT for JDBC targets                      │
+│                                                                                 │
+│  SOLUTIONS for UPSERT:                                                          │
+│  a) Pre-action: TRUNCATE table before write (full replace)                      │
+│  b) Use Spark foreachPartition with custom pymysql UPSERT logic               │
+│  c) Write to temp table → SQL UPSERT from temp to target                       │
+│  d) Use Glue custom connection with upsert JDBC parameter                      │
+│                                                                                 │
+│  SOLUTION WE USE:                                                               │
+│  → customer_recommendations: Write to temp → RENAME (full replace)             │
+│  → customer_metrics: foreachPartition with ON DUPLICATE KEY UPDATE             │
+│                                                                                 │
+│                                                                                 │
+│  ❸ MariaDB RENAME TABLE — Atomic Table Swap                                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│                                                                                 │
+│  RENAME TABLE                                                                   │
+│    customer_recommendations TO customer_recommendations_old,                    │
+│    customer_recommendations_new TO customer_recommendations;                    │
+│                                                                                 │
+│  Internal execution:                                                            │
+│  1. MariaDB acquires metadata lock on BOTH tables                              │
+│  2. Swaps table name pointers in data dictionary                               │
+│  3. Releases lock                                                               │
+│  4. Total time: &lt; 1 millisecond (no data copy!)                                │
+│  5. ATOMIC: both renames happen as one operation                               │
+│  6. Concurrent queries: either see ALL old data or ALL new data                │
+│  7. No moment where table doesn't exist                                        │
+│                                                                                 │
+│  WHY this is better than TRUNCATE + INSERT:                                     │
+│  ┌─────────────────────┬─────────────────────┬──────────────────────┐           │
+│  │ Step                │ TRUNCATE+INSERT     │ RENAME (swap)        │           │
+│  ├─────────────────────┼─────────────────────┼──────────────────────┤           │
+│  │ Table empty period  │ ~90 seconds         │ 0 seconds            │           │
+│  │ App sees stale data │ Yes (during load)   │ Never (atomic swap)  │           │
+│  │ Rollback possible   │ No (TRUNCATE is DDL)│ Yes (swap back)      │           │
+│  │ Disk space needed   │ 1x table size       │ 2x (old + new exist) │           │
+│  └─────────────────────┴─────────────────────┴──────────────────────┘           │
+│                                                                                 │
+│                                                                                 │
+│  ❹ MariaDB ON DUPLICATE KEY UPDATE — Upsert Mechanics                          │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                         │
+│                                                                                 │
+│  INSERT INTO customer_metrics                                                   │
+│    (customer_id, lifetime_value, churn_risk, segment, updated_at)              │
+│  VALUES                                                                         │
+│    ('CUST-001', 2847.50, 0.12, 'gold', NOW()),                                │
+│    ('CUST-002', 142.00, 0.78, 'bronze', NOW()),                               │
+│    ...                                                                          │
+│  ON DUPLICATE KEY UPDATE                                                        │
+│    lifetime_value = VALUES(lifetime_value),                                     │
+│    churn_risk = VALUES(churn_risk),                                             │
+│    segment = VALUES(segment),                                                   │
+│    updated_at = VALUES(updated_at);                                             │
+│                                                                                 │
+│  Internal execution:                                                            │
+│  1. MariaDB checks PRIMARY KEY / UNIQUE index for each row                     │
+│  2. If key NOT found → INSERT new row                                           │
+│  3. If key found → UPDATE specified columns                                     │
+│  4. Uses InnoDB row-level locking (minimal contention)                          │
+│  5. Batch of 1000 rows: ~50ms on indexed table                                 │
+│  6. Total 500K rows in batches of 1000 = 500 batches = ~25 seconds             │
+│                                                                                 │
+│  PERFORMANCE TIP:                                                               │
+│  → Disable autocommit during batch load                                         │
+│  → Commit every 5000-10000 rows                                                │
+│  → Reduces fsync overhead significantly                                         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "RENAME TABLE fails — table doesn't exist"
+</span>→ Cause: Glue job failed midway — _new table was never fully created
+→ Fix: check table existence before RENAME
+→ Pattern: IF EXISTS check, then RENAME, else skip and alert
+
+PITFALL 2: "App returns stale recommendations for 2 hours"
+→ Cause: reverse ETL pipeline failed silently
+→ App keeps reading old table (which is fine — still valid data)
+→ But nobody noticed the failure
+→ Fix: monitor computed_at timestamp — alert if &gt; 26 hours old
+
+PITFALL 3: "MariaDB disk full during table swap"
+→ Cause: old table + new table both exist simultaneously during swap
+→ customer_recommendations: 2.5M rows × 2 copies = ~1 GB
+→ Fix: ensure disk has 2× headroom for the largest reverse ETL table
+→ Drop _old table immediately after swap
+
+PITFALL 4: "Glue writes 500K rows but MariaDB only has 480K"
+→ Cause: Glue JDBC write silently dropped rows with duplicate keys
+→ Default mode: INSERT fails on duplicate, Glue catches exception per batch
+→ Fix: use ON DUPLICATE KEY UPDATE explicitly
+→ Or: use table swap pattern (no duplicates possible on fresh table)
+
+PITFALL 5: "MariaDB replication lag spikes during reverse ETL load"
+→ Cause: 2.5M row insert generates massive binlog
+→ Read replicas fall behind by minutes
+→ App reads from replica → sees OLD data even after swap
+→ Fix: monitor replication lag, reduce batch sizes, or
+  schedule reverse ETL during low-traffic window
+
+PITFALL 6: "UNLOAD creates 8 files but Glue only reads 3"
+→ Cause: UNLOAD with PARALLEL ON creates multiple files
+→ Glue glob pattern doesn't match all file names
+→ Fix: use manifest file (UNLOAD with MANIFEST option)
+→ Or: use PARALLEL OFF for small result sets
+
+PITFALL 7: "Data types mismatch — Redshift FLOAT8 → MariaDB DECIMAL"
+→ Cause: Redshift FLOAT8 = double precision (15 digits)
+→ MariaDB DECIMAL(10,2) = fixed precision (10 digits, 2 decimal)
+→ Score 0.123456789 truncated to 0.12
+→ Fix: CAST in Redshift UNLOAD query, OR adjust MariaDB column type</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT LOAD:
+</span>→ customer_metrics: 500K rows → ~15 MB Parquet → 25s upsert
+→ customer_recommendations: 2.5M rows → ~60 MB Parquet → 90s load + swap
+→ Total reverse ETL time: ~3 minutes
+→ Runs once nightly
+
+SCALING TO 5M CUSTOMERS:
+→ customer_metrics: 5M rows → ~150 MB → 250s upsert
+→ customer_recommendations: 25M rows → ~600 MB → 15 min load
+→ Table swap still atomic (&lt;1ms)
+→ But: MariaDB LOAD DATA is faster than JDBC for this volume
+→ Switch from Glue JDBC to: UNLOAD CSV → S3 → EC2 → LOAD DATA INFILE
+
+SCALING TO 50M CUSTOMERS:
+→ customer_recommendations: 250M rows → too large for single MariaDB table
+→ Options:
+  a) Partition table by customer_id range (MariaDB PARTITION BY RANGE)
+  b) Switch to DynamoDB (key-value access pattern, unlimited scale)
+  c) Switch to ElastiCache/Redis for real-time recommendations
+→ At this scale: reconsider whether MariaDB is the right target
+
+PARALLEL WRITES (Glue → MariaDB):
+→ Glue default: each Spark executor opens a JDBC connection
+→ 10 DPUs = potentially 10 concurrent connections
+→ MariaDB max_connections default: 151
+→ SAFE: up to 20 concurrent writers
+→ DANGEROUS: 100+ concurrent writers → connection pool exhaustion
+→ Control via: Glue job DPU count + Spark repartition
+
+FREQUENCY SCALING:
+→ Nightly → Hourly: same architecture, 24× more runs
+→ Hourly → Every 5 min: switch to streaming (Kinesis → Lambda → MariaDB)
+→ Every 5 min → Real-time: skip S3, use Redshift streaming or compute in app</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR REVERSE ETL:
+</span>
+1. Freshness Monitoring
+   → Every reverse ETL table has computed_at column
+   → App dashboard: "Recommendations updated: 3 hours ago"
+   → Alert: if computed_at &gt; 26 hours → pipeline failed
+   → Query: SELECT MAX(computed_at) FROM customer_recommendations
+
+2. Row Count Validation
+   → After load: COUNT(*) on MariaDB table
+   → Compare with: COUNT(*) from Redshift UNLOAD source query
+   → Tolerance: exact match expected for full replace
+   → For upsert: MariaDB count &gt;= Redshift count (historical rows persist)
+
+3. Sample Verification
+   → Pick 10 random customer_ids
+   → Compare their metrics in Redshift vs MariaDB
+   → All values should match exactly
+   → Automate this as a post-load quality check
+
+4. Performance Tracking
+   → Log: unload_duration, upload_duration, merge_duration, total_duration
+   → Plot over time → detect degradation trends
+   → Alert if total_duration &gt; 2× historical average
+
+5. MariaDB Health During Load
+   → Monitor: Threads_running, Slave_seconds_behind_master
+   → Monitor: disk usage (table swap doubles space temporarily)
+   → Monitor: InnoDB buffer pool hit ratio (should stay &gt;95%)
+
+6. Step Functions Audit Trail (Project 41)
+   → Each reverse ETL run = one Step Functions execution
+   → Visual graph: UNLOAD → Glue → Verify → Notify
+   → Click any state to see duration, input/output, errors</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(43)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create MariaDB Target Tables</h3>
+
+<h3>Step 2: Redshift UNLOAD Script</h3>
+
+<h3>Step 3: Glue Reverse ETL Job — Load into MariaDB</h3>
+
+<h3>Step 4: Upload Glue Script and Create Glue Jobs</h3>
+
+<h3>Step 5: End-to-End Reverse ETL Orchestrator</h3>
+
+<h3>Step 6: Freshness Monitoring Script</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create target tables in MariaDB</span><span>
+</span>python 43_01_create_mariadb_target_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Upload Glue script + create Glue jobs</span><span>
+</span>python 43_04_create_glue_reverse_etl_jobs.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY RUN (automated via Step Functions — Project 41)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Runs AFTER forward CDC pipeline (Project 42) completes</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Full pipeline: UNLOAD → Glue → MariaDB → Verify → Notify</span><span>
+</span>python 43_05_reverse_etl_orchestrator.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONITORING (hourly cron or CloudWatch scheduled Lambda)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 43_06_freshness_monitor.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║              QUICKCART REVERSE ETL PIPELINE                           ║
+║              2025-01-15 01:00:00                                      ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+======================================================================
+📤 PHASE 1: REDSHIFT UNLOAD
+======================================================================
+📤 UNLOAD customer_metrics → s3://quickcart-raw-data-prod/reverse_etl/customer_metrics/dt=2025-01-15/
+   ✅ UNLOAD complete in 8.3s
+   📦 Files: 1, Total size: 14,832.5 KB
+
+📤 UNLOAD customer_recommendations → s3://quickcart-raw-data-prod/reverse_etl/customer_recommendations/dt=2025-01-15/
+   ✅ UNLOAD complete in 22.1s
+   📦 Files: 8, Total size: 58,421.0 KB
+
+======================================================================
+🔀 PHASE 2: GLUE REVERSE ETL → MARIADB
+======================================================================
+🚀 Starting: quickcart-reverse-etl-customer-metrics
+   ✅ SUCCEEDED (95s)
+
+🚀 Starting: quickcart-reverse-etl-customer-recommendations
+   ✅ SUCCEEDED (142s)
+
+======================================================================
+🔍 PHASE 3: MARIADB VERIFICATION
+======================================================================
+   📋 customer_metrics:
+      Rows: 487,234
+      Latest computed_at: 2025-01-15 01:00:00
+      Segment distribution:
+        platinum        12,847 customers, avg LTV: $  7,842.33
+        gold            48,291 customers, avg LTV: $  2,134.50
+        silver         143,882 customers, avg LTV: $    487.22
+        bronze         282,214 customers, avg LTV: $     62.18
+
+   📋 customer_recommendations:
+      Rows: 2,436,170
+      Latest computed_at: 2025-01-15 01:00:00
+      Unique customers: 487,234
+
+======================================================================
+📱 PHASE 4: SIMULATE APP QUERIES
+======================================================================
+   📱 App Query 1: Customer profile for CUST-000001
+      Result: LTV=$2847.50, churn=0.1200, segment=gold
+      ⚡ Latency: 0.8ms
+
+   📱 App Query 2: Recommendations for CUST-000001
+      Rank 1: PROD-00342 (score: 0.9400)
+      Rank 2: PROD-00891 (score: 0.8700)
+      Rank 3: PROD-00127 (score: 0.8200)
+      Rank 4: PROD-01455 (score: 0.7800)
+      Rank 5: PROD-00066 (score: 0.7100)
+      ⚡ Latency: 0.6ms
+
+   📱 App Query 3: High churn risk customers (for re-engagement)
+      High-value customers at risk: 3,847
+      ⚡ Latency: 12.3ms
+
+   ✅ All app queries executing under 5ms target
+
+╔════════════════════════════════════════════════════════════════════════╗
+║                     REVERSE ETL PIPELINE COMPLETE                     ║
+║                     Duration: 278.4 seconds                           ║
+╚════════════════════════════════════════════════════════════════════════╝</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Reverse ETL: warehouse insights → operational database → user-facing app
+→ UNLOAD to S3 decouples Redshift from downstream consumers (critical pattern)
+→ Two load strategies depending on data nature:
+   - UPSERT (ON DUPLICATE KEY UPDATE): for incremental tables
+   - FULL REPLACE (RENAME swap): for recomputed tables
+→ RENAME TABLE is atomic in MariaDB (&lt;1ms, no data gap)
+→ TRUNCATE+INSERT has a dangerous window where table is empty
+→ Glue JDBC doesn't natively support UPSERT → use foreachPartition + pymysql
+→ Freshness monitoring (computed_at) catches silent pipeline failures
+→ App query latency (&lt;5ms) validates the reverse ETL architecture
+→ Repartition controls parallel JDBC connections → protects MariaDB
+
+BIDIRECTIONAL DATA FLOW NOW COMPLETE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Forward (Project 42):  MariaDB → CDC → S3 → Glue → Redshift
+  Reverse (THIS Project): Redshift → UNLOAD → S3 → Glue → MariaDB
+
+  ┌──────────┐         ┌────┐         ┌──────────┐
+  │ MariaDB  │ ──CDC──→│ S3 │──Glue──→│ Redshift │
+  │ (OLTP)   │ ←─Rev──│    │←─Glue──│(Analytics)│
+  └──────────┘         └────┘         └──────────┘
+       ↑                                    │
+       │          Mobile App reads          │
+       └────────── from MariaDB ────────────┘
+                  (&lt; 5ms latency)
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 22: Redshift UNLOAD basics (reused for reverse ETL extraction)
+→ Project 31: Glue JDBC connections (reused in reverse direction)
+→ Project 41: Event-driven pipeline (S3 arrival triggers reverse ETL)
+→ Project 42: Forward CDC (must complete BEFORE reverse ETL runs)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 44: Design Bronze → Silver → Gold Data Lake
+   (Now that we have bidirectional flow, we need a PROPER lake architecture.
+    Raw CSVs, CDC exports, UNLOAD outputs, Glue Parquet outputs —
+    all need organized zones with clear ownership and lifecycle.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The bidirectional pipeline is working:
+</span>→ Forward: MariaDB → S3 → Glue → Redshift (CDC, Project 42)
+→ Reverse: Redshift → S3 → Glue → MariaDB (this project)
+
+But S3 is becoming a mess:
+→ daily_exports/orders/orders_20250115.csv       (full dumps — Project 20)
+→ cdc_exports/orders/dt=2025-01-15/              (CDC files — Project 42)
+→ reverse_etl/customer_metrics/dt=2025-01-15/    (UNLOAD output — this project)
+→ curated/orders/part-00000.parquet              (Glue output — Project 25)
+→ glue-temp/...                                   (Glue temp files)
+→ glue-scripts/...                                (job scripts)
+→ athena-results/...                              (query outputs)
+
+15+ prefixes with no naming convention, no lifecycle rules,
+no clear ownership, no access controls per zone.
+
+CTO: "Which data is raw? Which is cleaned? Which is safe for analysts?
+      Which can the app trust? Where does the ML team write?
+      We need a DATA LAKE ARCHITECTURE, not a data swamp."
+
+→ Project 44: "Design a Proper Bronze → Silver → Gold Data Lake"
+→ Introduces: Medallion Architecture, zone ownership, S3 prefix strategy,
+  lifecycle rules per zone, access controls per zone, data quality gates</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-42.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 43 of 80</span>
+    <span class="nav-project-title">SYNC REDSHIFT AGGREGATED RESULTS BACK TO MARIADB FOR APP</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-44.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-44.html") window.location = "project-44.html";
+  if (e.key === 'ArrowLeft' && "project-42.html") window.location = "project-42.html";
+});
+</script>
+</body>
+</html>

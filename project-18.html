@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 18: QUEUE A PROCESSING JOB THE INSTANT A FILE LANDS IN S3 — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:22%"></div></div>
+<div id="progress-label">22%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 18 of 80</div>
+  <div class="project-title">QUEUE A PROCESSING JOB THE INSTANT A FILE LANDS IN S3</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — continuing from Project 17
+</span>Situation:
+→ S3 → SNS email alerts working (Project 17)
+→ Data team gets emails when files land — great for humans
+→ BUT: the data PROCESSING is still manual
+
+Current manual workflow (every morning):
+→ 9:00 AM: Analyst checks email → "orders_20250115.csv landed at 00:03 AM"
+→ 9:05 AM: Analyst SSH into EC2
+→ 9:10 AM: Analyst runs: python load_to_mariadb.py orders_20250115.csv
+→ 9:20 AM: Analyst repeats for customers and products files
+→ 9:30 AM: Data is ready for queries — 9 HOURS after files landed
+
+Problems:
+→ 9-hour delay between file arrival and data availability
+→ Human bottleneck — if analyst is sick, data doesn't load
+→ Error-prone — analyst sometimes types wrong filename
+→ Not scalable — 3 files is manageable, 30 files is nightmare
+→ Weekend gap — nobody processes Saturday/Sunday files until Monday
+
+CTO: "I want files processed AUTOMATICALLY within minutes of landing.
+      No human in the loop. If processing fails, retry automatically.
+      If it fails 3 times, alert us (don't lose the message)."
+
+YOU: "We need S3 events routed to SQS instead of SNS.
+      An EC2 worker polls the queue continuously.
+      Each message = one file to process.
+      Delete message only after successful processing.
+      If processing fails → message reappears → automatic retry."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY SQS instead of SNS
+</span>→ SNS = push-based → delivers immediately to subscribers
+→ SQS = pull-based → messages WAIT until consumer reads them
+→ SNS email: fire-and-forget (no retry if human misses it)
+→ SQS: persistent → message stays until explicitly deleted
+→ SQS: retry-safe → if consumer crashes, message reappears
+
+Step 2: Understand the SQS consumption model
+→ Consumer calls ReceiveMessage → gets 1-10 messages
+→ Message becomes INVISIBLE for "visibility timeout" period
+→ Consumer processes the message
+→ Consumer calls DeleteMessage → permanently removes from queue
+→ If consumer crashes (no DeleteMessage) → visibility timeout expires
+→ Message becomes VISIBLE again → another consumer picks it up
+→ This is AUTOMATIC RETRY — built into the protocol
+
+Step 3: Understand the permission chain
+→ S3 must have permission to SEND messages to SQS
+→ SQS Queue Policy must allow s3.amazonaws.com to sqs:SendMessage
+→ Same pattern as Project 17 (SNS Topic Policy)
+→ Without this: S3 silently drops events
+
+Step 4: Understand the message structure
+→ S3 sends event JSON directly to SQS (no SNS wrapper)
+→ SQS message body = S3 event JSON (same structure as Project 17)
+→ Simpler than S3 → SNS → SQS (no double-wrapping)
+
+Step 5: Plan the implementation
+→ Create SQS Queue
+→ Set Queue Policy allowing S3
+→ Configure S3 Event Notification → SQS (different prefix from Project 17)
+→ Upload test file
+→ Poll queue → receive message → parse S3 event → acknowledge</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  EC2 Upload Script (Project 1)
+        │
+        │ boto3 upload_file() at midnight
+        ▼
+  S3 Bucket: quickcart-raw-data-prod
+   └── daily_exports/
+        ├── orders/orders_20250115.csv      ← ObjectCreated event
+        ├── customers/customers_20250115.csv ← ObjectCreated event
+        └── products/products_20250115.csv   ← ObjectCreated event
+        │
+        │ S3 Event Notification (prefix=daily_exports/, suffix=.csv)
+        │
+        ▼
+  SQS Queue: quickcart-file-processing-queue
+   ┌─────────────────────────────────────────────────────────┐
+   │ Message 1: {S3 event: orders_20250115.csv created}      │
+   │ Message 2: {S3 event: customers_20250115.csv created}   │
+   │ Message 3: {S3 event: products_20250115.csv created}    │
+   └─────────────────────────────────────────────────────────┘
+        │
+        │ EC2 Worker polls continuously (long polling)
+        ▼
+  EC2 Worker Script
+   ├── Receive message from SQS
+   ├── Parse S3 event → extract bucket + key
+   ├── Download file from S3
+   ├── Process file (validate, transform, load)
+   ├── Delete message from SQS (acknowledge success)
+   └── If crash → message reappears after visibility timeout → auto-retry
+
+
+  COMPARISON WITH PROJECT 17:
+  
+  Project 17: S3 → SNS → Email (human reads)
+  Project 18: S3 → SQS → EC2 Worker (machine processes)
+  
+  Same event source, different consumption pattern</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: S3 → SQS directly (simplest machine consumption)
+</span>→ S3 sends event JSON directly to SQS queue
+→ One consumer polls and processes
+→ Built-in retry via visibility timeout
+→ ✅ WE USE THIS — teaches core SQS consumption pattern
+
+Option B: S3 → SNS → SQS (fan-out pattern)
+→ S3 sends to SNS → SNS forwards to SQS + email + Lambda
+→ More flexible but adds SNS layer
+→ Message is DOUBLE-WRAPPED (SNS envelope around S3 event)
+→ Covered in Project 28 (full pipeline)
+
+Option C: S3 → Lambda (instant processing)
+→ Lambda triggered directly by S3 event
+→ No queue, no polling — instant execution
+→ Limited to 15 minutes execution time
+→ Not suitable for heavy processing (large file loads)
+
+Option D: S3 → EventBridge → Step Functions
+→ Most sophisticated routing
+→ Complex workflows with conditional logic
+→ Covered in Project 41
+
+DECISION: Option A — S3 → SQS direct
+→ Cleanest path for learning SQS consumption
+→ No double-wrapping confusion
+→ Foundation for all queue-based patterns
+→ Projects 27, 28, 30 build directly on this</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Set visibility timeout &gt; expected processing time
+</span>   → If processing takes 5 minutes → set timeout to 10 minutes
+   → Too short: message reappears while still being processed
+   → Result: same file processed TWICE simultaneously
+   → Rule of thumb: 2x-3x your expected processing time
+
+2. Use long polling (WaitTimeSeconds = 20)
+   → Short polling: returns immediately (even if queue empty) → wastes API calls
+   → Long polling: waits up to 20 seconds for messages → saves cost + reduces latency
+   → Maximum: 20 seconds (SQS hard limit)
+   → Reduces ReceiveMessage API calls by 90%+
+
+3. Set message retention period appropriately
+   → Default: 4 days → messages auto-deleted after 4 days
+   → Max: 14 days
+   → If worker is down for 5 days with default 4 days → messages LOST
+   → Set to 14 days for safety in non-critical pipelines
+
+4. Delete message ONLY after successful processing
+   → Download file → process → verify → THEN delete message
+   → If you delete first and processing fails → message gone → file never processed
+   → This is the CORE guarantee of SQS-based processing
+
+5. Handle the S3 "test event" that S3 sends during configuration
+   → When you configure S3 → SQS notification, S3 sends a TEST event
+   → This test event has different structure than real events
+   → Contains "Event": "s3:TestEvent" instead of "Records"
+   → Your consumer must detect and skip this
+
+6. Use ReceiptHandle for deletion (not MessageId)
+   → ReceiptHandle is unique per receive attempt
+   → MessageId is unique per message but cannot be used for deletion
+   → Every ReceiveMessage returns a new ReceiptHandle for same message
+
+7. Process messages in batches when possible
+   → ReceiveMessage can return up to 10 messages per call
+   → DeleteMessageBatch can delete up to 10 at once
+   → Reduces API calls → reduces cost</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT set visibility timeout shorter than processing time
+</span>   → Message reappears while still being processed
+   → Two workers process same file simultaneously
+   → Duplicate data loads, race conditions, wasted compute
+   → Example: processing = 5 min, timeout = 2 min
+     → At 2 min: message reappears → Worker 2 picks it up
+     → At 5 min: Worker 1 finishes → deletes message
+     → At 7 min: Worker 2 finishes → tries to delete → message gone
+     → Result: file processed TWICE
+
+2. DO NOT delete message before processing completes
+   → Delete first → crash during processing → message gone forever
+   → File never gets processed → silent data loss
+   → ALWAYS: process first, delete last
+
+3. DO NOT use short polling in a tight loop
+   → while True: receive_message(WaitTimeSeconds=0)
+   → Returns empty immediately → loops again → 1000s of API calls/minute
+   → Each API call costs $0.0000004 (but adds up)
+   → 1000 calls/min × 60 min × 24 hr = 1.44M calls/day = $0.58/day
+   → Long polling (WaitTimeSeconds=20): same loop = ~4,320 calls/day = $0.002
+
+4. DO NOT ignore the S3 test event
+   → S3 sends a test event when notification is first configured
+   → Structure: {"Service": "Amazon S3", "Event": "s3:TestEvent", ...}
+   → If consumer tries to parse as normal event → KeyError → crash
+   → Always check for "Records" key before processing
+
+5. DO NOT assume message order
+   → SQS Standard Queue does NOT guarantee FIFO ordering
+   → File B's event may arrive before File A's event
+   → If order matters: use SQS FIFO queue (but throughput limited to 300 msg/sec)
+   → For file processing: order usually doesn't matter
+
+6. DO NOT configure overlapping S3 notifications to SNS AND SQS
+   → From Project 17: S3 → SNS with prefix="daily_exports/", suffix=".csv"
+   → This project: S3 → SQS with SAME prefix and suffix
+   → S3 does NOT allow two notifications with overlapping filters
+     targeting different service types
+   → Error: "Configuration is ambiguously defined"
+   → Fix: use DIFFERENT prefixes, OR remove SNS notification first,
+     OR use S3 → SNS → SQS fan-out (Project 28)
+
+7. DO NOT hardcode queue URL — construct or discover dynamically
+   → Queue URLs change if you recreate the queue
+   → Use get_queue_url() to discover at runtime</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────┬────────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                               │ Use                │ Why                                  │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Notify humans (email/SMS)              │ S3 → SNS           │ Push delivery, human-readable        │
+│                                        │ (Project 17)       │                                      │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Queue jobs for async machine           │ S3 → SQS           │ Persistent, retry-safe, pull-based   │
+│ processing                             │ ✅ THIS PROJECT    │                                      │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Both notify humans AND queue           │ S3 → SNS → [SQS   │ Fan-out: one event, many consumers   │
+│ for processing                         │ + Email]           │ Project 28                           │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Process file instantly (&lt;15 min)       │ S3 → Lambda        │ No polling, instant invocation       │
+│ with no persistent queue needed        │                    │ But 15 min timeout limit             │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Complex routing with conditional       │ S3 → EventBridge   │ Filter on any attribute, route to    │
+│ targets                                │ (Project 41)       │ any AWS service                      │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Must process files in exact upload     │ S3 → SQS FIFO     │ Guaranteed ordering, exactly-once    │
+│ order                                  │                    │ But 300 msg/sec limit                │
+└────────────────────────────────────────┴────────────────────┴──────────────────────────────────────┘
+
+
+SQS STANDARD vs SQS FIFO (relevant decision here):
+┌───────────────────────┬──────────────────────────┬───────────────────────────┐
+│ Feature               │ Standard                 │ FIFO                      │
+├───────────────────────┼──────────────────────────┼───────────────────────────┤
+│ Throughput            │ Unlimited                │ 300 msg/sec (3000 w/batch)│
+│ Ordering              │ Best-effort              │ Guaranteed FIFO           │
+│ Delivery              │ At-least-once            │ Exactly-once              │
+│ S3 Event compatible   │ ✅ Yes                   │ ❌ No (S3 can't send to   │
+│                       │                          │    FIFO directly)         │
+│ Cost                  │ $0.40/million requests   │ $0.50/million requests    │
+│ Use for file events   │ ✅ RECOMMENDED           │ Only via SNS→SQS FIFO    │
+└───────────────────────┴──────────────────────────┴───────────────────────────┘
+
+DECISION: Standard Queue
+→ S3 events cannot target FIFO queues directly
+→ File processing order doesn't matter for QuickCart
+→ Unlimited throughput
+→ At-least-once is fine (we handle idempotency)</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE S3 → SQS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When you need INSTANT processing with zero polling delay
+</span>   → SQS requires polling (even long polling has up to 20s wait)
+   → Lambda triggered by S3 = millisecond invocation
+   → Use: S3 → Lambda for instant processing
+
+2. When you need the file processed in guaranteed order
+   → S3 → SQS Standard = no ordering guarantee
+   → S3 cannot send to SQS FIFO directly
+   → Workaround: S3 → SNS → SQS FIFO (complex)
+   → Or: add sequence numbers in filename + sort in consumer
+
+3. When you need complex event filtering beyond prefix/suffix
+   → S3 notifications only filter on key prefix and suffix
+   → Cannot filter on: file size, metadata, content type
+   → Use: S3 → EventBridge (filter on any event attribute)
+
+4. When single consumer model is too slow
+   → SQS + single EC2 worker = sequential processing
+   → 100 files/day each taking 5 min = 500 min = 8.3 hours
+   → Scale: multiple workers polling same queue (Project 52)
+   → Or: Lambda for parallel processing (each file = separate invocation)
+
+5. When message retention of 14 days is insufficient
+   → SQS max retention: 14 days → messages auto-deleted after
+   → If worker is down 15 days → messages lost
+   → Use: EventBridge Archive (indefinite retention) or S3 event log</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│                  S3 → SQS EVENT FLOW — INTERNAL MECHANICS                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PHASE 1: EVENT GENERATION (same as Project 17)                              │
+│  ──────────────────────────────────────────────                              │
+│  File uploaded → S3 stores object → checks notification config               │
+│  → Key matches prefix + suffix filter → generates event JSON                 │
+│  → Event structure: identical to Project 17 (17_04_parse_s3_event.py)       │
+│                                                                              │
+│  PHASE 2: EVENT DELIVERY TO SQS                                             │
+│  ───────────────────────────────                                             │
+│  S3 calls SQS SendMessage API:                                              │
+│  → MessageBody = S3 event JSON string                                       │
+│  → NO SNS wrapper (unlike S3 → SNS → SQS path)                             │
+│  → SQS assigns MessageId + MD5OfMessageBody                                │
+│  → Message stored across 3 SQS servers (redundant)                          │
+│                                                                              │
+│  DIRECT PATH (this project):                                                │
+│  ┌──────┐    event JSON    ┌──────┐                                         │
+│  │  S3  │ ───────────────→ │  SQS │                                         │
+│  └──────┘                  └──────┘                                         │
+│  Message body = raw S3 event                                                │
+│  Parse: json.loads(msg["Body"])["Records"][0]["s3"]["object"]["key"]        │
+│                                                                              │
+│  FAN-OUT PATH (Project 28):                                                 │
+│  ┌──────┐  event  ┌──────┐  wrapped event  ┌──────┐                        │
+│  │  S3  │ ──────→ │  SNS │ ──────────────→ │  SQS │                        │
+│  └──────┘         └──────┘                 └──────┘                         │
+│  Message body = SNS envelope containing S3 event                            │
+│  Parse: json.loads(json.loads(msg["Body"])["Message"])["Records"][0]...     │
+│  → DOUBLE parse needed (explained in Project 17, Step 4)                    │
+│                                                                              │
+│                                                                              │
+│  PHASE 3: SQS MESSAGE LIFECYCLE                                             │
+│  ────────────────────────────                                                │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │                    SQS MESSAGE STATE MACHINE                    │        │
+│  │                                                                 │        │
+│  │  ┌──────────┐    ReceiveMessage    ┌───────────┐               │        │
+│  │  │ VISIBLE  │ ──────────────────→  │ INVISIBLE │               │        │
+│  │  │ (in queue│                      │ (being    │               │        │
+│  │  │  waiting)│                      │ processed)│               │        │
+│  │  └────┬─────┘                      └─────┬─────┘               │        │
+│  │       │                                  │                     │        │
+│  │       │                            ┌─────┴──────────┐         │        │
+│  │       │                            │                │         │        │
+│  │       │                     DeleteMessage    Visibility       │        │
+│  │       │                     (success)        Timeout          │        │
+│  │       │                            │         Expires          │        │
+│  │       │                            ▼         (failure)        │        │
+│  │       │                     ┌──────────┐         │            │        │
+│  │       │                     │ DELETED  │         │            │        │
+│  │       │                     │ (gone    │         │            │        │
+│  │       │                     │ forever) │         │            │        │
+│  │       │                     └──────────┘         │            │        │
+│  │       │                                          │            │        │
+│  │       │◄─────────────────────────────────────────┘            │        │
+│  │       │  Message becomes VISIBLE again                        │        │
+│  │       │  → Another consumer can pick it up                    │        │
+│  │       │  → ReceiveCount incremented                           │        │
+│  │       │  → If ReceiveCount &gt; maxReceiveCount → DLQ (P50)     │        │
+│  │                                                                │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  VISIBILITY TIMEOUT MECHANICS:                                               │
+│  → Default: 30 seconds                                                       │
+│  → Range: 0 seconds to 12 hours                                             │
+│  → Per-message override: ChangeMessageVisibility API                        │
+│  → If processing takes longer than expected:                                │
+│    → Call ChangeMessageVisibility to extend timeout                         │
+│    → "Heartbeat" pattern: extend every N seconds while processing           │
+│                                                                              │
+│                                                                              │
+│  PHASE 4: LONG POLLING vs SHORT POLLING                                      │
+│  ───────────────────────────────────────                                      │
+│                                                                              │
+│  SHORT POLLING (WaitTimeSeconds = 0):                                        │
+│  ┌────────────┐  ReceiveMessage  ┌─────┐                                    │
+│  │ Consumer   │ ───────────────→ │ SQS │                                    │
+│  │            │ ←──── empty ──── │     │  (queue empty)                     │
+│  │            │  immediate       │     │                                     │
+│  │            │  return          │     │                                     │
+│  └────────────┘                  └─────┘                                    │
+│  → Returns IMMEDIATELY even if queue is empty                               │
+│  → Queries subset of SQS servers (may miss messages on other servers)       │
+│  → Multiple rapid calls needed to drain queue reliably                      │
+│  → Wastes API calls when queue is usually empty                             │
+│                                                                              │
+│  LONG POLLING (WaitTimeSeconds = 20):                                        │
+│  ┌────────────┐  ReceiveMessage  ┌─────┐                                    │
+│  │ Consumer   │ ───────────────→ │ SQS │                                    │
+│  │            │                  │     │  (waiting...)                       │
+│  │            │                  │     │  (waiting...)                       │
+│  │            │                  │     │  message arrives!                   │
+│  │            │ ←── message ──── │     │                                     │
+│  └────────────┘                  └─────┘                                    │
+│  → Waits UP TO 20 seconds for a message to arrive                           │
+│  → Queries ALL SQS servers (no missed messages)                             │
+│  → Returns immediately if message available                                 │
+│  → Returns empty only after full wait with no messages                      │
+│  → 90% fewer API calls than short polling                                   │
+│                                                                              │
+│                                                                              │
+│  PHASE 5: SQS QUEUE POLICY (allowing S3)                                    │
+│  ────────────────────────────────────────                                    │
+│                                                                              │
+│  Same concept as SNS Topic Policy (Project 17):                             │
+│  → S3 is a SEPARATE service calling SQS SendMessage                         │
+│  → SQS denies by default                                                    │
+│  → Queue Policy must explicitly allow:                                      │
+│    Principal: s3.amazonaws.com                                              │
+│    Action: sqs:SendMessage                                                  │
+│    Resource: queue ARN                                                      │
+│    Condition: source bucket ARN                                             │
+│                                                                              │
+│  → Without this policy: S3 notification config FAILS at setup time          │
+│  → Error: "Unable to validate the following destination configurations"     │
+│  → Same error as Project 17 — same root cause — permission missing          │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Unable to validate the following destination configurations"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Same as Project 17 but for SQS instead of SNS
+→ Cause: Queue Policy doesn't allow s3.amazonaws.com to sqs:SendMessage
+→ Fix: set Queue Policy BEFORE configuring S3 notification
+→ Also: queue must be in SAME REGION as bucket
+
+PITFALL 2: "Overlapping notification filter conflict"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ If Project 17 SNS notification still exists with same prefix/suffix
+→ AND you try to add SQS notification with same prefix/suffix
+→ Error: "Configuration is ambiguously defined"
+→ S3 does NOT allow overlapping prefix+suffix filters across different targets
+→ Fix A: remove Project 17 notification first (17_06_cleanup.py)
+→ Fix B: use different prefix for SQS (e.g., "processing/")
+→ Fix C: use S3 → SNS → SQS fan-out (Project 28)
+
+PITFALL 3: "Consumer receives S3 test event and crashes"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ When S3 notification is first configured, S3 sends a test event
+→ Structure: {"Service":"Amazon S3","Event":"s3:TestEvent","Time":"..."}
+→ NO "Records" key → consumer parsing Records[0] → KeyError
+→ Fix: always check if "Records" exists before parsing
+→ Skip test events gracefully
+
+PITFALL 4: "Message processed but not deleted — processed again"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Consumer processes file successfully but crashes before DeleteMessage
+→ Visibility timeout expires → message reappears → processed again
+→ Result: duplicate processing (file loaded twice into database)
+→ Fix: make processing IDEMPOTENT
+→ Idempotent = processing same message twice produces same result
+→ Example: use UPSERT instead of INSERT, or check if file already loaded
+
+PITFALL 5: "Messages disappearing without being processed"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: retention period expired (default 4 days)
+→ Cause B: another consumer deleted the message
+→ Cause C: purge_queue() was called accidentally
+→ Fix: set retention to 14 days, use single consumer group, monitor queue depth
+
+PITFALL 6: "Long polling returns empty but messages exist"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: visibility timeout hasn't expired for in-flight messages
+→ Messages are INVISIBLE (being processed by another consumer)
+→ Debug: check ApproximateNumberOfMessagesNotVisible metric
+→ This is EXPECTED behavior — not a bug
+
+PITFALL 7: "ReceiveMessage returns fewer messages than MaxNumberOfMessages"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ MaxNumberOfMessages=10 does NOT guarantee 10 messages returned
+→ SQS samples a SUBSET of servers — may find fewer
+→ This is by design for Standard Queues
+→ To drain queue: keep calling ReceiveMessage until empty response</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>THROUGHPUT:
+</span>━━━━━━━━━━
+→ SQS Standard: unlimited messages/second (no practical limit)
+→ ReceiveMessage: up to 10 messages per call
+→ DeleteMessageBatch: up to 10 messages per call
+→ QuickCart's 3 messages/day: trivially within limits
+
+CONSUMER SCALING:
+━━━━━━━━━━━━━━━━━
+→ 1 worker processing 3 files/day: no scaling needed
+→ 100 files/day, 5 min each: 1 worker = 500 min/day → just barely fits
+→ 1000 files/day: need multiple workers polling same queue
+→ SQS supports MULTIPLE consumers on same queue safely
+→ Each message delivered to ONLY ONE consumer (at a time)
+→ Auto-scaling workers based on queue depth: Project 52
+
+COST:
+━━━━━
+→ First 1 million requests/month: FREE
+→ After: $0.40 per million requests (Standard)
+→ Long polling: 1 request every 20 seconds = 4,320/day = 129,600/month
+→ Cost: well within free tier
+→ Even at scale: 1 million requests = $0.40
+
+MESSAGE SIZE:
+━━━━━━━━━━━━━
+→ Max message size: 256 KB
+→ S3 event JSON: typically 1-2 KB → well within limit
+→ If you need larger messages: use Extended Client Library
+  (stores payload in S3, message contains pointer)
+
+QUEUE DEPTH MONITORING:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ ApproximateNumberOfMessages: messages waiting to be processed
+→ ApproximateNumberOfMessagesNotVisible: messages being processed
+→ ApproximateNumberOfMessagesDelayed: messages in delay period
+→ Monitor queue depth → alert if growing (worker may be down)
+→ CloudWatch alarm on queue depth → SNS alert (Project 54)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY S3 → SQS IS WORKING:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Check queue attributes after uploading a file
+   → get_queue_attributes → ApproximateNumberOfMessages
+   → Should increment by 1 for each file uploaded matching filter
+   → If stays 0: notification config wrong or filter doesn't match
+
+2. Receive and inspect message without deleting
+   → receive_message() → read body → DON'T call delete_message
+   → Message becomes invisible for visibility timeout
+   → After timeout: reappears for re-inspection
+   → Useful for debugging message structure
+
+3. CloudWatch metrics for SQS
+   → NumberOfMessagesSent: messages S3 sent to queue
+   → NumberOfMessagesReceived: messages consumer received
+   → ApproximateAgeOfOldestMessage: how long oldest message has waited
+   → If AgeOfOldestMessage growing: consumer is too slow or down
+
+4. Compare S3 events with SQS messages
+   → Upload 3 test files → queue should have 3 messages
+   → Receive all 3 → verify each contains correct bucket + key
+   → Verify no duplicates, no missing files
+
+5. S3 notification configuration check
+   → get_bucket_notification_configuration
+   → Verify QueueConfigurations contains your queue ARN
+   → Verify prefix + suffix filters match your upload pattern</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(18)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create SQS Queue with S3 Permission</h3>
+
+<h3>Step 2: Configure S3 Event Notification → SQS</h3>
+
+<h3>Step 3: Test Upload + Consume Messages</h3>
+
+<h3>Step 4: Continuous Worker (Production Pattern)</h3>
+
+<h3>Step 5: Queue Monitoring Dashboard</h3>
+
+<h3>Step 6: Cleanup</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket with files (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Project 17 SNS notification cleaned up (17_06_cleanup.py)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#   OR accept that this project removes conflicting SNS notification</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create SQS queue with S3 permission</span><span>
+</span>python 18_01_create_sqs_queue.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Configure S3 → SQS event notification</span><span>
+</span>python 18_02_configure_s3_to_sqs.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Test: upload file + consume message (quick test)</span><span>
+</span>python 18_03_test_and_consume.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run continuous worker (production pattern)</span><span>
+</span>python 18_04_continuous_worker.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → In another terminal: upload files to trigger events</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Worker picks them up automatically</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Press Ctrl+C to stop</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Monitor queue health</span><span>
+</span>python 18_05_monitor_queue.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Cleanup</span><span>
+</span>python 18_06_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Step 4 — Continuous Worker):
+</span>
+======================================================================
+🏭 SQS WORKER STARTED
+======================================================================
+   Queue:     quickcart-file-processing-queue
+   Polling:   Long poll (20 seconds)
+   Mode:      Continuous until Ctrl+C
+   Started:   2025-01-15 00:01:00
+   PID:       12345
+----------------------------------------------------------------------
+
+   ┌─ MESSAGE RECEIVED ──────────────────────
+   │ MessageId:    a1b2c3d4-e5f6-7890...
+   │ ReceiveCount: 1
+   │ Event:        ObjectCreated:Put
+   │ File:         daily_exports/orders/orders_20250115.csv
+   │ Size:         83,942 bytes
+   │ Event Time:   2025-01-15T00:03:12.345Z
+   │
+      📥 Downloading: s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv
+      📦 Downloaded: 83,942 bytes
+      ✅ Validated: 1000 data rows, 8 columns
+      📋 Header: order_id,customer_id,product_id,quantity,unit_price,total_amount,statu...
+      ✅ Processed in 1.0s (simulated)
+   │ Result:       ✅ SUCCESS — deleted from queue
+   └───────────────────────────────────────────
+
+   [00:05:23] Polling... (uptime: 4min | processed: 3 | failed: 0)
+   [00:09:43] Polling... (uptime: 9min | processed: 3 | failed: 0)
+
+   🛑 Shutdown requested — finishing current message...
+
+======================================================================
+🏭 WORKER SHUTDOWN SUMMARY
+======================================================================
+   Uptime:             10.2 minutes
+   Messages received:  3
+   Messages processed: 3
+   Messages failed:    0
+   Messages skipped:   1
+   Stopped at:         2025-01-15 00:11:12
+======================================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SQS = pull-based message queue — consumer POLLS for messages
+→ S3 → SQS: event sent directly as message body (no SNS wrapper)
+→ Queue Policy must allow s3.amazonaws.com BEFORE S3 notification config
+→ Visibility Timeout = how long message is hidden after receive
+→ Delete message ONLY after successful processing (core guarantee)
+→ If no delete → timeout expires → message reappears → automatic retry
+→ Long polling (WaitTimeSeconds=20) saves 90% API calls vs short polling
+→ S3 sends test event on first config → consumer must handle gracefully
+→ S3 does NOT allow overlapping prefix+suffix across SNS and SQS targets
+→ Message structure: json.loads(body)["Records"][0]["s3"]["object"]["key"]
+→ Always URL-decode the object key (unquote_plus)
+
+KEY DIFFERENCES FROM PROJECT 17 (SNS):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌──────────────────────┬──────────────────────┬───────────────────────┐
+│ Aspect               │ Project 17 (SNS)     │ Project 18 (SQS)      │
+├──────────────────────┼──────────────────────┼───────────────────────┤
+│ Delivery             │ Push (to subscribers)│ Pull (consumer polls) │
+│ Consumer             │ Human (email)        │ Machine (EC2 worker)  │
+│ Persistence          │ None (fire-forget)   │ 14 days retention     │
+│ Retry                │ No automatic retry   │ Built-in via timeout  │
+│ Message structure    │ S3 event wrapped     │ Raw S3 event JSON     │
+│                      │ in SNS envelope      │                       │
+│ Permission needed    │ SNS Topic Policy     │ SQS Queue Policy      │
+│ Fan-out              │ Yes (many subs)      │ No (one consumer grp) │
+│ Cost                 │ Free (email)         │ $0.40/million requests│
+└──────────────────────┴──────────────────────┴───────────────────────┘
+
+WHAT THIS CONNECTS BACKWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 files = the data that triggers events
+→ Project 13: SQS fundamentals (Standard vs FIFO, visibility timeout)
+→ Project 17: S3 Event Notifications (same mechanism, different target)
+→ Project 17 Step 4: S3 event JSON parsing (same structure reused here)
+
+WHAT THIS CONNECTS FORWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 19: EC2 script loads CSV from S3 → MariaDB
+   → Combine with THIS project: SQS triggers the load automatically
+
+→ Project 27: EC2 worker continuously polls SQS (expanded pattern)
+   → The continuous_worker.py here IS Project 27's foundation
+   → Project 27 adds error handling, metrics, multi-consumer
+
+→ Project 28: Full pipeline: S3 → SNS → SQS → EC2 → processing
+   → Combines Project 17 (SNS) + Project 18 (SQS) + Project 14 (fan-out)
+   → Email alert AND machine processing from same event
+
+→ Project 30: S3 CSV → SQS trigger → EC2 → Redshift COPY
+   → Uses this SQS pattern to auto-load files into Redshift
+
+→ Project 50: Dead Letter Queue (DLQ)
+   → Messages that fail N times → quarantined for investigation
+   → Prevents poison messages from blocking the queue
+
+→ Project 52: Auto-scaling workers based on queue depth
+   → CloudWatch alarm on ApproximateNumberOfMessages
+   → Auto Scaling Group adds/removes EC2 workers</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has TWO event-driven patterns:
+</span>→ Project 17: S3 → SNS → Email (human gets notified)
+→ Project 18: S3 → SQS → EC2 Worker (machine processes)
+
+But there's a CONFLICT:
+→ S3 won't allow BOTH SNS and SQS notifications on same prefix+suffix
+→ We had to REMOVE the SNS notification to add SQS
+
+The CTO says:
+"I want BOTH. Email alert for the ops team AND automatic processing."
+
+YOU: "We need the FAN-OUT pattern:
+      S3 → SNS → [Email subscriber + SQS subscriber]
+      One event, two consumers."
+
+This is exactly what Project 14 described conceptually.
+Project 28 builds the full end-to-end pipeline.
+
+BUT FIRST — the worker needs to actually DO something with the file.
+Right now it just downloads and counts rows.
+
+Next step: actually LOAD the CSV into a database.
+
+→ Project 19: "Nightly CSV from S3 Must Load into MariaDB"
+→ EC2 script downloads from S3 (Project 1 pattern)
+→ Connects to MariaDB (Project 8-9 pattern)
+→ Bulk-inserts CSV rows into MariaDB tables
+→ Later combined with SQS trigger (this project) for automation</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-17.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 18 of 80</span>
+    <span class="nav-project-title">QUEUE A PROCESSING JOB THE INSTANT A FILE LANDS IN S3</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-19.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-19.html") window.location = "project-19.html";
+  if (e.key === 'ArrowLeft' && "project-17.html") window.location = "project-17.html";
+});
+</script>
+</body>
+</html>

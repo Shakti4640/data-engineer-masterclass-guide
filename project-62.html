@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 62: GLUE WRITES 50,000 TINY FILES — ATHENA HATES IT — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:78%"></div></div>
+<div id="progress-label">78%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 62 of 80</div>
+  <div class="project-title">GLUE WRITES 50,000 TINY FILES — ATHENA HATES IT</div>
+  <div class="project-tags"><span class="project-tag">Glue</span><span class="project-tag">Athena</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multiple Glue ETL pipelines running in Account B
+</span>
+WHAT'S HAPPENING:
+→ Cross-account ETL (Project 61) runs nightly
+→ Medallion architecture (Project 44) has Bronze → Silver → Gold layers
+→ Multiple Glue jobs write Parquet to S3 daily
+
+S3 BUCKET INSPECTION:
+s3://quickcart-analytics-datalake/silver/orders/
+
+  $ aws s3 ls s3://quickcart-analytics-datalake/silver/orders/year=2025/month=01/day=15/ | wc -l
+  48,327
+
+  $ aws s3 ls s3://quickcart-analytics-datalake/silver/orders/year=2025/month=01/day=15/ | head -5
+  2025-01-15 02:14:01       4,096  part-00000-abc123.snappy.parquet
+  2025-01-15 02:14:01       3,841  part-00001-abc123.snappy.parquet
+  2025-01-15 02:14:01       4,212  part-00002-abc123.snappy.parquet
+  2025-01-15 02:14:01       3,998  part-00003-abc123.snappy.parquet
+  2025-01-15 02:14:02       4,103  part-00004-abc123.snappy.parquet
+
+TOTAL DATA: ~200 MB across 48,327 files
+AVERAGE FILE SIZE: ~4 KB per file
+
+SYMPTOMS:
+→ Athena query: SELECT COUNT(*) FROM silver_orders WHERE year='2025' AND month='01' AND day='15'
+  → Takes 47 seconds (should take &lt; 3 seconds for 200 MB)
+  → Athena console shows: "Data scanned: 200 MB" but runtime is absurd
+
+→ Redshift Spectrum: Same query takes 35 seconds
+→ Glue Crawler: Takes 25 minutes to crawl one day's partition
+→ S3 LIST API: Takes 49 paginated calls (1000 objects each) to list one day
+
+→ AWS bill shows unexpected S3 REQUEST charges:
+  → 48,327 PUT requests per day × 30 days = 1.45M PUT requests/month
+  → 48,327 GET requests per Athena query × 10 queries/day = 14.5M GET/month
+  → PUT: $0.005/1000 = $7.25/month
+  → GET: $0.0004/1000 = $5.80/month
+  → JUST for one table — 20 tables = $260/month in REQUEST charges alone
+
+CTO: "We moved to a data lake to save money. Why is Athena slower than
+      querying a CSV on my laptop? And why are S3 costs climbing?"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY tiny files are created
+</span>
+  SPARK/GLUE INTERNAL:
+  → Glue uses Apache Spark under the hood
+  → Spark distributes data across PARTITIONS (in-memory chunks)
+  → Each PARTITION writes to ONE output file
+  → More partitions = more parallelism = more output files
+
+  WHERE DO 48,327 PARTITIONS COME FROM?
+  → Source: MariaDB table with 200K rows
+  → Glue reads via JDBC with hashpartitions=4 → 4 initial partitions
+  → Transformations (filter, join, map) cause SHUFFLES
+  → Each shuffle can MULTIPLY partition count
+  → GroupBy → default 200 shuffle partitions (spark.sql.shuffle.partitions)
+  → Join → another 200 shuffle partitions
+  → Final write: 200+ partitions → 200+ files PER DAY
+  → Over 30 days with multiple runs/retries → 48,327 files
+
+Step 2: Understand WHY tiny files are SLOW
+
+  ATHENA QUERY EXECUTION:
+  ┌────────────────────────────────────────────────────────────────────┐
+  │ Step 1: LIST objects in partition prefix                          │
+  │   → S3 ListObjectsV2: returns 1000/call → 49 API calls           │
+  │   → Each call: ~50ms → 49 × 50ms = 2.5 seconds just to LIST     │
+  │                                                                    │
+  │ Step 2: For each file, send GET request                           │
+  │   → 48,327 HTTP GET requests                                      │
+  │   → Each GET: ~20ms overhead (TCP handshake + TLS + headers)      │
+  │   → Overhead: 48,327 × 20ms = 966 seconds of pure overhead       │
+  │   → But Athena parallelizes: ~100 concurrent connections          │
+  │   → Actual: 966 / 100 = ~10 seconds overhead                     │
+  │                                                                    │
+  │ Step 3: Read file content                                         │
+  │   → 4 KB per file — actual data read is instant                   │
+  │   → But: Parquet has HEADER + FOOTER metadata per file            │
+  │   → Header: ~500 bytes, Footer: ~2 KB                             │
+  │   → For 4 KB file: 2.5 KB metadata + 1.5 KB actual data          │
+  │   → 62% of each file is OVERHEAD, not data                        │
+  │                                                                    │
+  │ Step 4: Process data                                               │
+  │   → 200 MB of actual data: trivial for Athena                     │
+  │   → Processing: &lt; 1 second                                        │
+  │                                                                    │
+  │ TOTAL: 2.5s (LIST) + 10s (GET overhead) + 35s (metadata) ≈ 47s   │
+  │ WITHOUT small file problem: 0.1s (LIST) + 0.5s (GET) + 1s = 1.6s │
+  └────────────────────────────────────────────────────────────────────┘
+
+Step 3: Define IDEAL file size
+
+  ┌──────────────────┬──────────────────────────────────────────────────┐
+  │ File Size        │ Assessment                                       │
+  ├──────────────────┼──────────────────────────────────────────────────┤
+  │ &lt; 1 MB           │ ❌ Tiny — metadata overhead dominates             │
+  │ 1 MB - 64 MB     │ ⚠️ Small — acceptable for low-volume tables      │
+  │ 64 MB - 256 MB   │ ✅ Optimal for Athena — sweet spot               │
+  │ 128 MB - 512 MB  │ ✅ Optimal for Redshift Spectrum                 │
+  │ 256 MB - 1 GB    │ ✅ Optimal for Spark/Glue downstream processing  │
+  │ &gt; 1 GB           │ ⚠️ Too large — reduces parallelism               │
+  │ &gt; 5 GB           │ ❌ Excessive — S3 multipart issues, slow retries  │
+  └──────────────────┴──────────────────────────────────────────────────┘
+
+  TARGET: 128 MB per file
+  → 200 MB total / 128 MB = 2 files (perfect)
+  → Instead of 48,327 files → 2 files
+  → Athena: 2 GET requests instead of 48,327
+
+Step 4: Identify SOLUTIONS
+
+  Solution A: Fix at WRITE TIME — prevent tiny files (proactive)
+  Solution B: Fix AFTER WRITE — compact existing files (reactive)
+  Solution C: Fix BOTH — prevent + periodic compaction maintenance
+  
+  DECISION: Solution C — defense in depth</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE — THREE LAYERS OF DEFENSE:
+</span>
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  LAYER 1: PREVENTION (at Glue write time)                               │
+│  ─────────────────────────────────────────                              │
+│  → coalesce(N) or repartition(N) before write                          │
+│  → Controls number of output files BEFORE they're created              │
+│  → Cheapest fix — zero additional infrastructure                        │
+│                                                                         │
+│  LAYER 2: COMPACTION (periodic maintenance job)                         │
+│  ─────────────────────────────────────────────                          │
+│  → Separate Glue job reads small files → writes large files             │
+│  → Runs after ETL or on schedule (e.g., weekly)                         │
+│  → Catches files from jobs that can't be easily modified                │
+│                                                                         │
+│  LAYER 3: PARTITION MANAGEMENT (structural optimization)                │
+│  ──────────────────────────────────────────────────────                  │
+│  → Right-size partitions: not too granular                              │
+│  → year/month instead of year/month/day/hour if volume is low          │
+│  → Athena CTAS for one-time restructuring (Project 36)                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: coalesce(N) — MERGE partitions without shuffle ✅
+</span>→ Reduces partition count by COMBINING adjacent partitions
+→ NO data movement across executors — just merges locally
+→ FAST, no network shuffle
+→ BUT: can cause SKEW if input partitions are uneven
+→ BEST FOR: reducing from many to few (200 → 2)
+
+Option B: repartition(N) — REDISTRIBUTE with full shuffle ✅
+→ Redistributes data evenly across N partitions via SHUFFLE
+→ EXPENSIVE: full data movement across network
+→ BUT: guarantees EQUAL-SIZED output files
+→ BEST FOR: when data is heavily skewed
+
+Option C: repartition(N, "column") — PARTITION BY COLUMN ✅
+→ Same as B but partitions by specific column value
+→ Output files grouped by column value
+→ BEST FOR: when downstream queries filter by that column
+
+Option D: maxRecordsPerFile Spark option ✅
+→ spark.conf.set("spark.sql.files.maxRecordsPerFile", 1000000)
+→ Limits rows per output file — Spark auto-splits
+→ Doesn't control file SIZE directly — row count proxy
+→ BEST FOR: when you know rows-to-size ratio
+
+Option E: S3DistCp (EMR utility) — post-hoc compaction
+→ Hadoop DistCp variant optimized for S3
+→ Merges small files into large ones
+→ Requires EMR cluster — adds infrastructure
+→ BEST FOR: legacy Hadoop pipelines
+
+Option F: Athena CTAS — one-time restructure
+→ CREATE TABLE AS SELECT ... WITH (format='PARQUET', bucketed_by=...)
+→ Creates new table with optimal file sizes
+→ Already covered in Project 36
+→ BEST FOR: one-time fix, not recurring
+
+DECISION: 
+→ Primary: coalesce() for daily ETL (Layer 1)
+→ Secondary: Dedicated compaction Glue job (Layer 2)
+→ Tertiary: Partition redesign (Layer 3)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. CALCULATE target file count DYNAMICALLY
+</span>   → Don't hardcode coalesce(2)
+   → Calculate: total_bytes / target_file_size = N files
+   → Target: 128 MB per file
+   → 200 MB / 128 MB = 2 files → coalesce(2)
+   → 5 GB / 128 MB = 40 files → coalesce(40)
+   → Adapts as data volume grows
+
+2. USE coalesce() for REDUCING file count (most common case)
+   → coalesce(N) merges N adjacent partitions
+   → No shuffle = fast
+   → Perfect for: 200 partitions → 2 partitions
+
+3. USE repartition() ONLY when data is skewed
+   → If coalesce(2) creates one 190 MB file and one 10 MB file
+   → repartition(2) creates two ~100 MB files
+   → Trade-off: slower (shuffle) but even output
+
+4. Place coalesce() AFTER all transformations, BEFORE write
+   → Wrong: read → coalesce → transform → write (transforms re-partition)
+   → Right: read → transform → coalesce → write
+
+5. Name compacted files distinctively
+   → Prefix: compacted_ or suffix: _merged
+   → Helps debugging: which files are original vs compacted
+
+6. VALIDATE after compaction
+   → Row count before compaction == Row count after compaction
+   → File count reduced
+   → Total bytes approximately equal (Parquet overhead changes slightly)
+
+7. DELETE original small files ONLY after validation passes
+   → Atomic swap pattern:
+     a. Write compacted files to temp prefix
+     b. Validate counts match
+     c. Delete original files
+     d. Move compacted files to original prefix
+   → OR: write to new prefix, update Glue Catalog to point there
+
+8. Monitor file sizes with CloudWatch custom metrics
+   → Track: avg file size, file count per partition
+   → Alert when avg &lt; 10 MB (small file regression)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT coalesce(1) for all tables
+</span>   → Single file = zero parallelism for readers
+   → Athena can't parallelize across files if there's only 1
+   → 5 GB in 1 file: Athena uses 1 reader = slow
+   → 5 GB in 40 files: Athena uses 40 readers = fast
+
+2. DO NOT repartition() when coalesce() suffices
+   → repartition() triggers full network shuffle
+   → For 200 MB: shuffle takes longer than actual write
+   → coalesce() does the same job without shuffle overhead
+   → Exception: heavily skewed data
+
+3. DO NOT compact while ETL is writing
+   → Race condition: compaction reads files being written
+   → Result: partial data in compacted output
+   → Fix: schedule compaction AFTER ETL completes (use Glue Workflow triggers)
+
+4. DO NOT delete small files before verifying compacted output
+   → If compaction fails silently: data loss
+   → Always: validate row counts → then delete originals
+
+5. DO NOT ignore the ROOT CAUSE
+   → Compaction treats symptoms, not disease
+   → If Glue job creates 48K files daily and you compact daily:
+     you're wasting compute
+   → Fix the write first (coalesce), compact as safety net
+
+6. DO NOT set spark.sql.shuffle.partitions = 1
+   → "I'll just make everything go to one partition"
+   → Destroys ALL parallelism in your job
+   → GroupBy on 1 partition = single-threaded
+   → Set it appropriately: 2-10 for small data, 200 for large data
+
+7. DO NOT over-partition your S3 prefix structure
+   → year/month/day/hour/minute = 5 levels
+   → If you get 100 rows per minute: each partition = 1 tiny file
+   → Right-size: year/month/day is usually sufficient
+   → Or even year/month for small tables
+
+8. DO NOT compact across partitions
+   → silver/orders/year=2025/month=01/ has 31 daily partitions
+   → Compacting ALL days into one giant file breaks partition pruning
+   → Compact WITHIN each partition separately</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────┬─────────────────────┬─────────────────────────────────┐
+</span>│ Situation                         │ Use                 │ Why                             │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Reducing files at write time      │ coalesce(N)         │ No shuffle, fast, simple        │
+│ (200 → 2 partitions)             │                     │                                 │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Reducing files + fixing skew      │ repartition(N)      │ Full shuffle ensures even sizes │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Output files must align with      │ repartition(N,col)  │ Files grouped by column value   │
+│ downstream filter column          │                     │ → better partition pruning       │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Files already exist, need to fix  │ Compaction Glue job │ Reads small → writes large      │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ One-time restructure of table     │ Athena CTAS         │ SQL-based, no Glue job needed   │
+│                                   │ (Project 36)        │                                 │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Hadoop/EMR ecosystem              │ S3DistCp            │ Optimized for HDFS → S3 merging │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Want Spark to auto-limit file     │ maxRecordsPerFile   │ Spark splits when threshold hit │
+│ size without manual calculation   │                     │                                 │
+├───────────────────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Streaming/micro-batch pipelines   │ Periodic compaction │ Streaming creates many small    │
+│ (Project 72)                      │ job on schedule     │ files by nature — must compact   │
+└───────────────────────────────────┴─────────────────────┴─────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT compact if files are already 64-256 MB
+</span>   → You're in the sweet spot — compaction wastes compute
+   → Monitor first, act only when avg &lt; 10 MB
+
+2. DO NOT use coalesce() to INCREASE partitions
+   → coalesce(100) on 2 partitions → still 2 partitions
+   → coalesce ONLY reduces — it cannot increase
+   → To increase: use repartition()
+
+3. DO NOT use compaction on data being actively queried
+   → Compaction deletes original files + writes new ones
+   → Concurrent Athena query may fail mid-read
+   → Solution: write to temp path → swap atomically
+
+4. DO NOT compact Glacier/Deep Archive objects
+   → Retrieval costs dominate any benefit
+   → Compact before transitioning to cold storage
+
+5. DO NOT apply compaction to append-only streaming tables
+   without considering data freshness requirements
+   → Compaction reads ALL files → writes new ones
+   → During compaction: new files land → not included
+   → Need watermark strategy (covered in compaction job)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│                     SPARK PARTITION → FILE MECHANICS                          │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  HOW SPARK CREATES OUTPUT FILES:                                              │
+│                                                                               │
+│  1. Data in memory is divided into PARTITIONS                                 │
+│     → Partition = unit of parallelism                                         │
+│     → Each partition processed by one TASK on one CORE                        │
+│                                                                               │
+│  2. When you call write():                                                    │
+│     → Each task writes ITS partition to ONE file                              │
+│     → 200 partitions → 200 tasks → 200 files                                 │
+│     → Spark has NO global view of "total output size"                         │
+│     → Each task works independently                                           │
+│                                                                               │
+│  3. WHERE DO EXCESS PARTITIONS COME FROM?                                     │
+│                                                                               │
+│     spark.sql.shuffle.partitions = 200 (DEFAULT)                              │
+│                                                                               │
+│     ANY operation that triggers a SHUFFLE creates 200 new partitions:         │
+│     → groupBy().agg()     → 200 partitions                                   │
+│     → join()              → 200 partitions                                    │
+│     → orderBy()           → 200 partitions                                   │
+│     → distinct()          → 200 partitions                                   │
+│     → repartition()       → 200 partitions (by default)                      │
+│                                                                               │
+│     Pipeline: read(4 partitions) → join(200) → groupBy(200) → write(200)     │
+│     → 200 output files regardless of data size                                │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │          BEFORE coalesce()                                   │              │
+│  │                                                               │              │
+│  │  Executor 1: [Part-0][Part-1][Part-2]...[Part-49]            │              │
+│  │  Executor 2: [Part-50][Part-51]...[Part-99]                  │              │
+│  │  Executor 3: [Part-100][Part-101]...[Part-149]               │              │
+│  │  Executor 4: [Part-150][Part-151]...[Part-199]               │              │
+│  │                                                               │              │
+│  │  → 200 tasks → 200 output files                              │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │          AFTER coalesce(2)                                    │              │
+│  │                                                               │              │
+│  │  Executor 1: [Part-0 thru Part-99 MERGED → BigPart-0]       │              │
+│  │  Executor 2: [Part-100 thru Part-199 MERGED → BigPart-1]    │              │
+│  │                                                               │              │
+│  │  → 2 tasks → 2 output files                                  │              │
+│  │  → NO DATA MOVEMENT — partitions merged locally              │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  coalesce() vs repartition() INTERNALS:                                       │
+│                                                                               │
+│  coalesce(N):                                                                 │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐                   │
+│  │ Part 0   │   │ Part 1   │   │ Part 2   │   │ Part 3   │                   │
+│  │ 50 MB    │   │ 50 MB    │   │ 50 MB    │   │ 50 MB    │                   │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘                   │
+│       │              │              │              │                           │
+│       └──────┬───────┘              └──────┬───────┘                           │
+│              ▼                             ▼                                   │
+│       ┌──────────┐                  ┌──────────┐                              │
+│       │ Part 0   │                  │ Part 1   │                              │
+│       │ 100 MB   │                  │ 100 MB   │                              │
+│       └──────────┘                  └──────────┘                              │
+│       → No shuffle, just merge adjacent                                       │
+│       → BUT: if Part 0 = 1 MB, Part 1 = 99 MB → SKEW                        │
+│                                                                               │
+│  repartition(N):                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐                   │
+│  │ Part 0   │   │ Part 1   │   │ Part 2   │   │ Part 3   │                   │
+│  │ 1 MB     │   │ 99 MB    │   │ 50 MB    │   │ 50 MB    │                   │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘                   │
+│       │              │              │              │                           │
+│       └──────┬───────┴──────┬───────┴──────┬───────┘                          │
+│              │    SHUFFLE   │              │                                   │
+│              ▼   (network)  ▼              ▼                                   │
+│       ┌──────────┐                  ┌──────────┐                              │
+│       │ Part 0   │                  │ Part 1   │                              │
+│       │ 100 MB   │                  │ 100 MB   │                              │
+│       └──────────┘                  └──────────┘                              │
+│       → Full shuffle, hash-based redistribution                               │
+│       → EVEN output sizes guaranteed                                          │
+│       → EXPENSIVE: data crosses network                                       │
+│                                                                               │
+│  WHY PARQUET MAKES IT WORSE:                                                  │
+│                                                                               │
+│  Parquet file structure:                                                      │
+│  ┌─────────────────────────────────────┐                                      │
+│  │ Magic Number (4 bytes)              │                                      │
+│  │ Row Group 1                         │ ← actual data                        │
+│  │   Column Chunk 1 (compressed)       │                                      │
+│  │   Column Chunk 2 (compressed)       │                                      │
+│  │   ...                               │                                      │
+│  │ Row Group N                         │                                      │
+│  │ File Metadata                       │ ← schema, row groups, stats          │
+│  │ Footer Length (4 bytes)             │                                      │
+│  │ Magic Number (4 bytes)              │                                      │
+│  └─────────────────────────────────────┘                                      │
+│                                                                               │
+│  For a 4 KB file:                                                             │
+│  → Magic numbers: 8 bytes                                                     │
+│  → File metadata: ~1.5 KB (column names, types, statistics)                   │
+│  → Footer: ~500 bytes                                                         │
+│  → Actual data: ~2 KB (50% of file!)                                          │
+│  → Compression dictionary: per-file overhead                                  │
+│                                                                               │
+│  For a 128 MB file:                                                           │
+│  → Same metadata overhead: ~2 KB                                              │
+│  → Actual data: ~128 MB (99.998% of file!)                                    │
+│  → Compression is MORE effective with more data                               │
+│  → Column statistics more useful with more rows                               │
+│                                                                               │
+│  ATHENA READING MECHANICS:                                                    │
+│                                                                               │
+│  For each file, Athena must:                                                  │
+│  1. S3 GET request → HTTP overhead (TLS handshake ~30ms)                      │
+│  2. Read footer (last N bytes) → S3 Range GET                                 │
+│  3. Parse schema from footer                                                  │
+│  4. Read required column chunks → S3 Range GETs                               │
+│  5. Decompress + decode                                                       │
+│                                                                               │
+│  Per file: minimum 2-3 S3 API calls                                           │
+│  48,327 files × 3 calls = 144,981 S3 API calls per query                     │
+│  2 files × 3 calls = 6 S3 API calls per query                                │
+│  → 24,000x fewer API calls after compaction                                   │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "I added coalesce(1) but job takes 3x longer"
+</span>→ Cause: ALL data funneled through ONE task on ONE executor
+→ That single task must process 200 MB sequentially
+→ Meanwhile: 3 other executors sit idle
+→ Fix: coalesce(2) or coalesce(4) — balance parallelism vs file count
+
+PITFALL 2: "coalesce(2) creates one 190 MB file and one 10 MB file"
+→ Cause: input data is SKEWED — some partitions have more rows
+→ coalesce merges ADJACENT partitions — doesn't redistribute
+→ Fix: use repartition(2) when skew is observed
+→ Detection: check file sizes after write → alert if max/min ratio &gt; 3x
+
+PITFALL 3: "I set shuffle.partitions = 2 globally and joins are now slow"
+→ Cause: GroupBy/Join now uses only 2 tasks — no parallelism
+→ This setting affects ALL shuffles in the job, not just the final write
+→ Fix: set shuffle.partitions appropriately for processing (e.g., 20)
+→ Then: coalesce(2) ONLY at the final write step
+
+PITFALL 4: "Compaction job reads 48K files and OOMs"
+→ Cause: Spark opens ALL files simultaneously → metadata fills memory
+→ 48K Parquet footers × ~2 KB each = ~96 MB just for metadata
+→ Plus: Spark creates one FileInputSplit per file → task scheduling overhead
+→ Fix: increase driver memory, or compact in batches (1000 files at a time)
+
+PITFALL 5: "Compacted files but Athena still queries old files"
+→ Cause: Glue Catalog still points to old partition location
+→ OR: both old AND new files exist in same prefix → Athena reads ALL
+→ Fix: delete old files BEFORE writing new ones (risky)
+→ Better: write to new prefix → update catalog → delete old prefix
+
+PITFALL 6: "After compaction, Glue Job Bookmark re-processes all data"
+→ Cause: Job Bookmarks (Project 33) track by file path
+→ New compacted files = new paths → Bookmark treats them as new
+→ Fix: disable bookmarks for compaction job
+→ Or: use separate bookmark-tracked job for incremental, separate for compaction
+
+PITFALL 7: "repartition(2, 'status') creates 5 files not 2"
+→ Cause: repartition by COLUMN creates one file per DISTINCT VALUE
+→ If status has 5 values → 5 files (ignoring the N parameter for column mode)
+→ Actually: repartition(2, col) creates 2 files where each file may contain
+  multiple status values — but hash distribution may still vary
+→ For exact control: coalesce() after repartition()
+
+PITFALL 8: "Compaction runs during ETL window — data corruption"
+→ Cause: ETL writes new files while compaction reads
+→ Compaction doesn't see files written after it started
+→ Those files get deleted when compaction "cleans up"
+→ Fix: enforce ordering — ETL completes → compaction starts
+→ Use Glue Workflow (Project 35) or Step Functions (Project 55)
+
+PITFALL 9: "I compacted to 2 files but Athena query is STILL slow"
+→ Cause: files are 128 MB each BUT partitioned by year/month/day/hour/minute
+→ Athena must scan ALL hour/minute partitions → 60×24 = 1440 partition lookups
+→ Fix: this is a PARTITION problem, not a file size problem
+→ Reduce partition granularity (covered in Layer 3)
+
+PITFALL 10: "Compaction doubled my S3 storage temporarily"
+→ Cause: write new files → validate → delete old files
+→ During validation: BOTH sets exist → 2x storage
+→ For 200 MB: trivial ($0.005 extra)
+→ For 5 TB: significant ($115 extra for even 1 hour)
+→ Fix: accept temporary cost OR compact partition-by-partition</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME vs STRATEGY:
+</span>
+┌────────────────────┬────────────────────┬────────────────────────────────────┐
+│ Daily Volume       │ File Strategy      │ Approach                           │
+├────────────────────┼────────────────────┼────────────────────────────────────┤
+│ &lt; 100 MB           │ coalesce(1)        │ Single file per partition is fine  │
+│                    │                    │ Athena reads in &lt; 1 second         │
+├────────────────────┼────────────────────┼────────────────────────────────────┤
+│ 100 MB - 1 GB      │ coalesce(2-8)      │ 2-8 files of 128 MB each          │
+│                    │                    │ Good parallelism + good file size  │
+├────────────────────┼────────────────────┼────────────────────────────────────┤
+│ 1 GB - 10 GB       │ coalesce(8-80)     │ Target 128 MB per file            │
+│                    │ Dynamic calc       │ MUST calculate N dynamically       │
+├────────────────────┼────────────────────┼────────────────────────────────────┤
+│ 10 GB - 100 GB     │ repartition(80-800)│ Even distribution matters          │
+│                    │ + shuffle tuning   │ Skew becomes visible at this scale │
+├────────────────────┼────────────────────┼────────────────────────────────────┤
+│ 100 GB+            │ repartition +      │ Must also right-size partitioning  │
+│                    │ partition strategy │ Too many S3 prefixes = slow LIST   │
+└────────────────────┴────────────────────┴────────────────────────────────────┘
+
+COMPACTION JOB SCALING:
+→ 1 partition with 1000 small files: 2 DPU, ~2 minutes
+→ 30 partitions × 1000 files: 5 DPU, ~10 minutes
+→ 365 partitions × 50K files: 20 DPU, ~45 minutes
+→ At scale: compact only RECENT partitions (last 7 days)
+→ Older partitions already compacted → skip them
+
+COST OF COMPACTION:
+→ Glue: $0.44/DPU-hour
+→ 5 DPU × 10 minutes = $0.37 per compaction run
+→ Daily: $11.10/month
+→ Weekly: $1.60/month
+→ S3 PUT requests for compacted files: negligible (2-8 PUTs vs 48K)
+→ S3 GET requests during compaction: 48K GETs = $0.02
+→ NET SAVINGS: $260/month (request charges) - $11.10 = $248.90/month saved
+
+ATHENA COST IMPACT:
+→ Before: 200 MB scanned, 47 seconds, $0.001 per query
+→ After: 200 MB scanned, 1.6 seconds, $0.001 per query
+→ Same scan cost but 30x faster
+→ Real savings: analyst productivity (47s → 1.6s per query × 100 queries/day)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO DETECT SMALL FILE PROBLEM:
+</span>
+METRIC 1: File count per partition
+→ aws s3 ls s3://bucket/prefix/ --recursive | wc -l
+→ Alert threshold: &gt; 1000 files per partition
+
+METRIC 2: Average file size per partition
+→ aws s3 ls s3://bucket/prefix/ --recursive --summarize
+→ Total size / file count = average
+→ Alert threshold: &lt; 10 MB average
+
+METRIC 3: Athena query profile
+→ In Athena query results: check "Run time" vs "Data scanned"
+→ If 200 MB takes &gt; 10 seconds → likely small file problem
+→ Compare: same data volume, fewer files → much faster
+
+METRIC 4: S3 request metrics (CloudWatch)
+→ Metric: NumberOfObjects per prefix
+→ Metric: AllRequests — unusually high = many small file reads
+→ Dashboard: plot file count trend over time
+
+MONITORING SCRIPT:
+→ Lambda on schedule → list objects per partition → calculate avg size
+→ Push to CloudWatch custom metric
+→ Alarm when avg &lt; 10 MB → trigger compaction job
+
+VISUAL DIAGNOSTIC:
+┌─────────────────────────────────────────────────────────┐
+│ BEFORE COMPACTION:                                       │
+│ silver/orders/day=15/                                    │
+│   ████████████████████████████████ 48,327 files          │
+│   ░░ 4 KB avg                                            │
+│   Athena: 47s                                            │
+│                                                          │
+│ AFTER COMPACTION:                                        │
+│ silver/orders/day=15/                                    │
+│   ██ 2 files                                             │
+│   ████████████████████ 100 MB avg                        │
+│   Athena: 1.6s                                           │
+└─────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(62)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: Fix at Write Time — Dynamic Coalesce in Glue ETL</h3>
+
+<h3>PART 2: Updated Glue ETL Job with Smart Write (patches Project 61)</h3>
+
+<h3>PART 3: Standalone Compaction Job (Layer 2 — for existing small files)</h3>
+
+<hr>
+<h3>PART 4: Deploy the Compaction Job</h3>
+
+<hr>
+<h3>PART 5: Small File Detection and Monitoring Lambda</h3>
+
+<hr>
+<h3>PART 6: Deploy Monitoring Lambda</h3>
+
+<hr>
+<h3>PART 7: Execution Flow and Before/After Comparison</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ONE-TIME DEPLOYMENT ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Deploy compaction job</span><span>
+</span>python 62_04_deploy_compaction_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Deploy monitoring Lambda + alarms</span><span>
+</span>python 62_06_deploy_monitoring.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- INTEGRATION INTO EXISTING ETL ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Update existing Glue ETL jobs to use smart_write</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Add coalesce logic from 62_01_smart_write.py</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Set spark.sql.shuffle.partitions appropriately</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → See 62_02_patched_etl_with_smart_write.py for integration</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- IMMEDIATE FIX FOR EXISTING SMALL FILES ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run compaction manually for each affected table</span><span>
+</span>python 62_04_deploy_compaction_job.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Call run_compaction_manually() for each table</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE vs AFTER COMPARISON:
+</span>
+┌────────────────────────────────────────────────────────────────────────┐
+│                           BEFORE                                       │
+├────────────────────────────────────────────────────────────────────────┤
+│ silver/orders/day=15/                                                  │
+│   48,327 files × 4 KB avg = 200 MB total                              │
+│                                                                        │
+│   Athena query time: 47 seconds                                        │
+│   S3 LIST calls: 49 paginated requests                                 │
+│   S3 GET calls per query: 48,327                                       │
+│   Monthly S3 request cost (this table): ~$13                           │
+│   Glue Crawler time: 25 minutes                                        │
+│   Redshift COPY staging: 48,327 file reads                             │
+│   Parquet metadata overhead: 62% of file content                       │
+├────────────────────────────────────────────────────────────────────────┤
+│                           AFTER                                        │
+├────────────────────────────────────────────────────────────────────────┤
+│ silver/orders/day=15/                                                  │
+│   2 files × 100 MB avg = 200 MB total                                  │
+│                                                                        │
+│   Athena query time: 1.6 seconds (29x faster)                          │
+│   S3 LIST calls: 1 request                                             │
+│   S3 GET calls per query: 2                                            │
+│   Monthly S3 request cost (this table): ~$0.01                         │
+│   Glue Crawler time: 5 seconds                                         │
+│   Redshift COPY staging: 2 file reads                                  │
+│   Parquet metadata overhead: 0.002% of file content                    │
+├────────────────────────────────────────────────────────────────────────┤
+│                        SAVINGS SUMMARY                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│ Query speed: 47s → 1.6s (29x improvement)                              │
+│ S3 requests: 48,327 → 2 per query (24,163x reduction)                 │
+│ Request cost: $260/month → $0.60/month (across 20 tables)              │
+│ Crawler time: 25 min → 5 sec                                           │
+│ Compaction cost: ~$11/month (Glue job)                                 │
+│ NET SAVINGS: ~$248/month + massive performance improvement              │
+└────────────────────────────────────────────────────────────────────────┘
+
+DEFENSE-IN-DEPTH ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  LAYER 1: PREVENTION (in every Glue ETL job)                            │
+│  ├── spark.sql.shuffle.partitions = appropriate value                   │
+│  ├── smart_write() with dynamic coalesce                                │
+│  └── Target: 128 MB per file                                            │
+│                                                                         │
+│  LAYER 2: DETECTION (Lambda + CloudWatch)                               │
+│  ├── Daily Lambda scans all monitored paths                             │
+│  ├── Publishes FileCount + AvgFileSizeMB metrics                        │
+│  ├── CloudWatch alarms on threshold breach                              │
+│  └── SNS alerts to data engineering team                                │
+│                                                                         │
+│  LAYER 3: REMEDIATION (Compaction Glue job)                             │
+│  ├── Auto-triggered by Lambda when thresholds exceeded                  │
+│  ├── Also scheduled weekly as safety net                                │
+│  ├── Validates before deleting originals                                │
+│  └── Parameterized: works for any table                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Small files are the #1 silent performance killer in data lakes
+→ Root cause: Spark creates one file per partition; shuffles create 200 partitions
+→ Impact: Athena/Spectrum/Crawler spend 95% of time on overhead, 5% on data
+→ coalesce(N) reduces partitions WITHOUT shuffle — fast and effective
+→ repartition(N) redistributes EVENLY with shuffle — use for skewed data
+→ NEVER set shuffle.partitions = 1 globally — kills processing parallelism
+→ Calculate target file count dynamically: data_size_mb / 128 MB
+→ Defense in depth: prevent at write + detect with monitoring + remediate with compaction
+→ File sizing affects cost too: 48K GET requests vs 2 GET requests per query
+→ Parquet metadata overhead dominates in tiny files (62% overhead at 4 KB)
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 25: Glue ETL Parquet writes — now we know WHY they create many files
+  → Project 26: Athena partition pruning — partitioning helps but files still matter
+  → Project 33: Job Bookmarks — compaction creates new files that bookmarks may re-process
+  → Project 36: CTAS — one-time fix alternative to compaction job
+  → Project 44: Medallion architecture — each layer can suffer small file problem
+  → Project 61: Cross-account ETL — the pipeline that created our problem
+
+→ FORWARD:
+  → Project 63: Redshift Materialized Views — even with good files, MV can help more
+  → Project 65: CDC Merge — incremental loads create even MORE small files
+  → Project 69: Cost optimization — small file fix is one of biggest cost savers
+  → Project 72: Streaming micro-batch — streaming inherently creates tiny files</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Small file problem is solved. Athena queries now return in &lt; 2 seconds.
+</span>
+BUT: The analytics dashboard team has a different complaint:
+
+→ Dashboard refreshes every 5 minutes
+→ Each refresh runs 12 complex Redshift queries
+→ Queries involve: 3-table JOINs, GROUP BY, window functions
+→ Each query takes 8-15 seconds
+→ Dashboard feels "sluggish" — users wait 15+ seconds for charts
+
+→ Same queries, same data, same results — re-computed every 5 minutes
+→ Data only changes ONCE per day (nightly ETL)
+→ 288 dashboard refreshes/day × 12 queries = 3,456 redundant computations
+
+DASHBOARD LEAD: "Can Redshift somehow CACHE these results 
+                 and serve them instantly?"
+
+YOU: "Yes — Redshift MATERIALIZED VIEWS. Pre-compute the result once,
+      serve it in milliseconds, auto-refresh when base tables change."
+
+→ Project 63: "Dashboard Queries Must Return in &lt; 2 Seconds from Redshift"
+→ Introduces: Materialized Views → Auto Refresh → Query Rewrite → Staleness</code></pre></div>
+<hr>
+</p></div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-61.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 62 of 80</span>
+    <span class="nav-project-title">GLUE WRITES 50,000 TINY FILES — ATHENA HATES IT</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-63.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-63.html") window.location = "project-63.html";
+  if (e.key === 'ArrowLeft' && "project-61.html") window.location = "project-61.html";
+});
+</script>
+</body>
+</html>

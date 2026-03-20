@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 45: SOURCE SCHEMA CHANGED — PIPELINE MUST NOT BREAK — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:56%"></div></div>
+<div id="progress-label">56%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 45 of 80</div>
+  <div class="project-title">SOURCE SCHEMA CHANGED — PIPELINE MUST NOT BREAK</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Series A, rapid feature development
+</span>Team: 5-person data team, 8-person backend team
+
+CURRENT STATE (built through Projects 1–44):
+→ Medallion data lake: Bronze → Silver → Gold (Project 44)
+→ CDC pipeline: MariaDB → Bronze → Silver → Gold → Redshift (Projects 42, 44)
+→ Strict Silver schemas enforced via PySpark StructType (Project 44)
+→ Everything automated via Step Functions (Project 41)
+
+WHAT THE BACKEND TEAM DID (without telling data team):
+
+  Sprint 47 — "Shipping V2" feature deployment:
+
+  CHANGE 1: New column added
+  → ALTER TABLE orders ADD COLUMN shipping_address TEXT AFTER status
+
+  CHANGE 2: Column renamed
+  → ALTER TABLE orders CHANGE COLUMN status order_status VARCHAR(20)
+
+  CHANGE 3: Type widened
+  → ALTER TABLE orders MODIFY COLUMN unit_price DECIMAL(10,4)
+    (was DECIMAL(10,2) — now supports 4 decimal places for crypto payments)
+
+  CHANGE 4: Column deprecated (still exists but always NULL)
+  → product_id now sometimes NULL (for gift card orders — no physical product)
+
+WHAT HAPPENED AT 00:05 AM (pipeline runs):
+
+  00:05 — CDC extracts orders from MariaDB → Bronze ✅
+          (Bronze accepts anything — correct by design)
+
+  00:10 — Bronze→Silver ETL starts → FAILS ❌
+          Error: "Required column 'status' missing in Bronze data"
+          (Column was renamed to 'order_status')
+
+  00:10 — Silver→Gold ETL never starts (upstream failed)
+
+  00:10 — Redshift MERGE never runs (upstream failed)
+
+  00:11 — SNS alert fires: "❌ Pipeline FAILED at Bronze→Silver"
+
+  07:00 — BI analyst opens dashboard: "Revenue shows yesterday's numbers!"
+
+  07:30 — CTO Slack: "Why are dashboards stale? @data-team"
+
+  07:45 — You investigate, find the schema change, manually fix ETL
+
+  08:30 — Pipeline re-runs successfully
+
+  DAMAGE:
+  → 8.5 hours of stale data
+  → 3 hours of engineer time
+  → Trust in data team eroded
+  → CTO: "This can NEVER happen again. Schema changes from source
+          systems must NOT break our pipelines. Handle them gracefully."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the TYPES of schema changes
+</span>
+  ┌────────────────────────┬────────────┬──────────────────────────────────────┐
+  │ Change Type            │ Severity   │ Example                              │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Column ADDED           │ Low        │ shipping_address added               │
+  │ (new column appears)   │            │ Silver can ignore or include it      │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Column RENAMED         │ High       │ status → order_status                │
+  │ (old name disappears)  │            │ Silver expects old name → crash      │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Type WIDENED           │ Medium     │ DECIMAL(10,2) → DECIMAL(10,4)       │
+  │ (compatible change)    │            │ Old readers can still read           │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Type NARROWED          │ High       │ VARCHAR(200) → VARCHAR(50)           │
+  │ (incompatible change)  │            │ Truncation or data loss              │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Type CHANGED           │ Very High  │ INTEGER → VARCHAR                    │
+  │ (completely different)  │            │ Casting may fail for existing data   │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Column REMOVED         │ High       │ middle_name column dropped           │
+  │ (column disappears)    │            │ Silver expects it → crash            │
+  ├────────────────────────┼────────────┼──────────────────────────────────────┤
+  │ Column DEPRECATED      │ Medium     │ product_id now sometimes NULL        │
+  │ (semantics changed)    │            │ NOT NULL constraint fails            │
+  └────────────────────────┴────────────┴──────────────────────────────────────┘
+
+Step 2: Define schema evolution STRATEGY
+
+  Two fundamental approaches:
+
+  A) SCHEMA-ON-WRITE (current — Project 44):
+  → Silver has STRICT schema (StructType)
+  → Data MUST match schema to be written
+  → Any mismatch → job fails
+  → Pro: guarantees data quality
+  → Con: breaks on any source change
+
+  B) SCHEMA-ON-READ (opposite extreme):
+  → Silver stores whatever arrives (like Bronze)
+  → Schema enforced only when READING (Athena, Redshift)
+  → Pro: never breaks on source changes
+  → Con: no quality guarantee, garbage can accumulate
+
+  C) ADAPTIVE SCHEMA-ON-WRITE (our solution — hybrid):
+  → Silver has a BASELINE schema (expected columns + types)
+  → ETL ADAPTS to changes gracefully:
+    - New columns → include with NULL default if not in baseline
+    - Missing columns → add as NULL (if nullable) or ALERT (if required)
+    - Type changes → attempt safe cast, log failures
+    - Renamed columns → use mapping table for known renames
+  → Quality gate: validate AFTER adaptation, BEFORE writing
+  → Alert on ALL schema changes (even handled ones)
+  → Human reviews and updates baseline schema periodically
+
+Step 3: Build the detection + adaptation + alerting system
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │              SCHEMA EVOLUTION PIPELINE                       │
+  │                                                             │
+  │  Bronze data arrives (new schema)                           │
+  │       │                                                     │
+  │       ▼                                                     │
+  │  ┌─────────────────┐                                        │
+  │  │ DETECT changes  │ Compare incoming vs baseline schema    │
+  │  └────────┬────────┘                                        │
+  │           │                                                  │
+  │           ▼                                                  │
+  │  ┌─────────────────┐                                        │
+  │  │ CLASSIFY changes│ Added? Removed? Renamed? Type changed? │
+  │  └────────┬────────┘                                        │
+  │           │                                                  │
+  │           ▼                                                  │
+  │  ┌─────────────────┐                                        │
+  │  │ ADAPT transform │ Apply safe mappings, casts, defaults   │
+  │  └────────┬────────┘                                        │
+  │           │                                                  │
+  │           ▼                                                  │
+  │  ┌─────────────────┐                                        │
+  │  │ VALIDATE output │ Quality gate: nulls, types, counts     │
+  │  └────────┬────────┘                                        │
+  │           │                                                  │
+  │           ▼                                                  │
+  │  ┌─────────────────┐                                        │
+  │  │ WRITE to Silver │ Only if validation passes              │
+  │  └────────┬────────┘                                        │
+  │           │                                                  │
+  │           ▼                                                  │
+  │  ┌─────────────────┐                                        │
+  │  │ ALERT team      │ Schema drift report (even if handled)  │
+  │  └─────────────────┘                                        │
+  └─────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION: Multi-layer schema evolution handling
+</span>
+LAYER 1: Schema Registry (source of truth for expected schemas)
+→ Store baseline schemas in DynamoDB (or Glue Schema Registry)
+→ Version tracked: schema_v1, schema_v2, etc.
+→ Includes: column names, types, nullable, known aliases
+
+LAYER 2: Schema Drift Detector (compares incoming vs baseline)
+→ Runs at start of every Bronze→Silver ETL
+→ Detects: additions, removals, renames, type changes
+→ Classifies each change by severity
+
+LAYER 3: Adaptive Transformer (handles changes gracefully)
+→ Column added → include in Silver if useful, ignore if not
+→ Column removed → fill with NULL if nullable, FAIL if required
+→ Column renamed → apply alias mapping from registry
+→ Type widened → safe cast (DECIMAL(10,2) → DECIMAL(10,4) is safe)
+→ Type changed → attempt cast, quarantine failures
+
+LAYER 4: Quality Gate (validates adapted output)
+→ Required columns present and non-null
+→ Data types match Silver schema
+→ Row count reasonable (not 0, not 10× expected)
+→ Pass → write to Silver
+→ Fail → write to quarantine, alert team
+
+LAYER 5: Schema Drift Alert (always fires, even when handled)
+→ SNS notification with full change report
+→ Team reviews and updates baseline if change is permanent
+→ Prevents "silent drift" where schemas gradually degrade</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue Crawlers auto-detect schema changes
+</span>→ Crawler re-crawls Bronze, updates Catalog table
+→ Problem: Crawler can't ADAPT the ETL logic
+→ It tells you the schema changed, but doesn't fix the pipeline
+→ VERDICT: Good for detection, insufficient for handling
+
+Option B: Glue DynamicFrame ResolveChoice
+→ ResolveChoice handles ambiguous types (e.g., string vs int)
+→ Problem: doesn't handle missing columns, renamed columns
+→ Only resolves TYPE ambiguity, not structural changes
+→ VERDICT: Useful tool but not a complete solution
+
+Option C: AWS Glue Schema Registry
+→ Avro/JSON Schema Registry for schema versioning
+→ Supports compatibility checks (BACKWARD, FORWARD, FULL)
+→ Problem: designed for streaming (Kafka/Kinesis schemas)
+→ Doesn't auto-fix ETL logic, just validates
+→ VERDICT: Good for versioning, complement to our solution
+
+Option D: Custom adaptive schema handler (our solution)
+→ DynamoDB stores baseline schemas + alias mappings
+→ Python code detects, classifies, adapts changes
+→ Integrated into Bronze→Silver ETL as first step
+→ Alerts on all changes, handles safe changes automatically
+→ VERDICT: ✅ Most practical for batch ETL pipelines
+
+DECISION: Option D + Option C (Glue Schema Registry for versioning)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Store baseline schemas in a VERSIONED registry
+</span>   → DynamoDB table: schema_registry
+   → Partition key: entity_name
+   → Sort key: version (v1, v2, v3...)
+   → Contains: column definitions, types, nullable, aliases
+   → Active version marked: is_active = true
+
+2. Maintain an ALIAS MAP for known column renames
+   → "status" → "order_status" (known rename from Sprint 47)
+   → Applied BEFORE schema comparison
+   → Prevents false "removed + added" detection
+   → Updated by data engineer when backend communicates changes
+
+3. Classify schema changes by HANDLING strategy
+
+   ┌────────────────────┬───────────────────────────────────────────┐
+   │ Change             │ Automatic Handling                        │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Column added       │ Include in Silver, add to schema registry │
+   │                    │ with nullable=True default                │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Column removed     │ If nullable: fill NULL, continue          │
+   │ (missing in source)│ If required: FAIL + alert                 │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Column renamed     │ If alias exists: auto-rename, continue    │
+   │                    │ If no alias: treat as removed + added     │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Type widened       │ Safe cast (int→bigint, dec(10,2)→dec(10,4))│
+   │ (compatible)       │ Continue with wider type                  │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Type narrowed      │ Attempt cast, log truncation count        │
+   │ (lossy)            │ Alert if &gt;1% rows affected                │
+   ├────────────────────┼───────────────────────────────────────────┤
+   │ Type changed       │ Attempt cast, quarantine failures         │
+   │ (incompatible)     │ ALERT immediately                        │
+   └────────────────────┴───────────────────────────────────────────┘
+
+4. ALWAYS alert on schema changes (even handled ones)
+   → "Schema drift detected for orders: 2 changes (auto-handled)"
+   → Data engineer reviews within 24 hours
+   → Updates baseline schema if change is permanent
+   → Prevents accumulation of "temporary" changes
+
+5. Write a SCHEMA DRIFT REPORT to S3 for every ETL run
+   → _system/schema-reports/orders/2025-01-15.json
+   → Contains: baseline schema, incoming schema, changes detected, handling applied
+   → Queryable via Athena for historical schema drift analysis
+
+6. Version schemas using COMPATIBILITY modes
+   → BACKWARD compatible: new schema can read old data
+   → FORWARD compatible: old schema can read new data
+   → FULL compatible: both directions work
+   → For Silver: require BACKWARD compatibility (new ETL reads old + new data)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT silently swallow schema changes
+</span>   → Even if auto-handled, team must be notified
+   → Silent handling leads to "schema drift" over months
+   → One day: Silver has 30 extra columns nobody knows about
+
+2. DO NOT fail the entire pipeline for a new nullable column
+   → Backend adds "promo_code" column → pipeline crashes
+   → This is a LOW severity change → handle automatically
+   → Only FAIL for truly dangerous changes (required column removed)
+
+3. DO NOT hardcode column names in ETL logic
+   → Bad: df.select("order_id", "status", "amount")
+   → Good: df.select([c for c in baseline_columns if c in df.columns])
+   → Dynamic column selection adapts to schema changes
+
+4. DO NOT update the baseline schema automatically
+   → Auto-detection is fine, auto-HANDLING is fine
+   → But the BASELINE (source of truth) should only change
+     after human review
+   → Prevents: source sends garbage → baseline corrupted → 
+     garbage becomes the "expected" schema
+
+5. DO NOT ignore type changes even if cast succeeds
+   → DECIMAL(10,2) → DECIMAL(10,4): cast succeeds silently
+   → But downstream Gold queries may format differently
+   → Redshift table DDL may need updating
+   → ALWAYS alert, even on compatible type changes
+
+6. DO NOT rely on Glue Crawler alone for schema management
+   → Crawler detects changes AFTER the fact
+   → Crawler can't FIX the ETL logic
+   → Crawler sometimes guesses wrong types (string for everything)
+   → Use Crawler as ONE signal, not the sole mechanism
+
+7. DO NOT apply renames without a verified alias map
+   → If you GUESS that "status" was renamed to "order_status"
+     but actually "status" was REMOVED and "order_status" is NEW
+   → Your alias mapping produces WRONG data silently
+   → Alias map must be explicitly maintained by the data engineer</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────┬─────────────────────────────┬─────────────────────────────┐
+</span>│ Approach                        │ Use When                    │ Don't Use When              │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Strict schema (fail on change)  │ Regulated environments      │ Fast-moving source systems  │
+│ (Project 44 original)           │ Financial/healthcare data   │ Frequent schema changes     │
+│                                 │ Schema changes are rare     │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Adaptive schema (this project)  │ Agile development teams     │ Strict compliance needs     │
+│ Detect + adapt + alert          │ Frequent source changes     │ Source schema is stable      │
+│                                 │ Need pipeline resilience    │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Schema-on-read (no enforcement) │ Data exploration / sandbox  │ Production data serving     │
+│                                 │ Unknown/variable sources    │ Dashboard data              │
+│                                 │ Prototyping                 │ Regulated data              │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Glue Schema Registry            │ Streaming pipelines         │ Batch CSV/Parquet pipelines │
+│ (Avro/JSON schemas)             │ Kafka/Kinesis producers     │ (no native SerDe support)   │
+│                                 │ Multi-producer systems      │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Contract testing (source team   │ Mature organizations        │ Small teams where data eng  │
+│ validates schema before deploy) │ Clear ownership boundaries  │ = backend eng (same team)   │
+└─────────────────────────────────┴─────────────────────────────┴─────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ADAPTIVE SCHEMA HANDLING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When source schema is contractually stable
+</span>   → External vendor API with versioned schema (v1, v2)
+   → Schema changes announced months in advance
+   → Strict handling is simpler and more predictable
+
+2. When data quality requirements are absolute
+   → Financial transaction data — every field must be exact
+   → Healthcare records — schema changes require formal review
+   → Adaptive handling might mask data quality issues
+
+3. When source produces completely unstructured data
+   → JSON with wildly varying fields per record
+   → No concept of "baseline" schema exists
+   → Use schema-on-read or JSON parsing with explicit field extraction
+
+4. When there's only one source and one consumer
+   → Simple pipeline: MariaDB → S3 → Redshift
+   → Just fix the ETL when schema changes (faster than building adaptation layer)
+   → Adaptation framework has overhead that's only worth it at scale
+
+5. When the adaptation logic itself becomes a maintenance burden
+   → 50+ alias mappings, complex type conversion rules
+   → The "smart" handler is now more complex than the ETL itself
+   → Simplify: establish schema contract with source team instead</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: SCHEMA EVOLUTION HANDLING                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ Schema Comparison Algorithm                                                 │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                               │
+│                                                                                 │
+│  INPUT:                                                                         │
+│  → baseline_schema: {"order_id": "string", "status": "string",                 │
+│                       "unit_price": "decimal(10,2)", ...}                       │
+│  → incoming_schema: {"order_id": "string", "order_status": "string",           │
+│                       "unit_price": "decimal(10,4)",                            │
+│                       "shipping_address": "string", ...}                        │
+│  → alias_map: {"status": "order_status"}                                       │
+│                                                                                 │
+│  ALGORITHM:                                                                     │
+│  1. Apply alias map to incoming columns                                         │
+│     → "order_status" renamed back to "status" for comparison                   │
+│     → Now comparison uses canonical names                                       │
+│                                                                                 │
+│  2. Compute column sets                                                         │
+│     → baseline_cols = {order_id, status, unit_price, product_id, ...}          │
+│     → incoming_cols = {order_id, status, unit_price, shipping_address, ...}    │
+│     → (after alias mapping applied)                                             │
+│                                                                                 │
+│  3. Detect changes                                                              │
+│     → ADDED = incoming_cols - baseline_cols = {shipping_address}               │
+│     → REMOVED = baseline_cols - incoming_cols = {}                              │
+│     → COMMON = baseline_cols ∩ incoming_cols = {order_id, status, ...}         │
+│     → RENAMED = columns in alias_map that were applied = {status}              │
+│                                                                                 │
+│  4. For COMMON columns: compare types                                           │
+│     → unit_price: baseline=decimal(10,2), incoming=decimal(10,4)               │
+│     → Type WIDENED (precision increased) → SAFE                                 │
+│     → Classify: COMPATIBLE_CHANGE                                               │
+│                                                                                 │
+│  5. Output: SchemaChangeReport                                                  │
+│     {                                                                           │
+│       "entity": "orders",                                                       │
+│       "changes": [                                                              │
+│         {"type": "COLUMN_ADDED", "column": "shipping_address",                 │
+│          "severity": "LOW", "handling": "AUTO_INCLUDE_NULLABLE"},              │
+│         {"type": "COLUMN_RENAMED", "old": "status", "new": "order_status",    │
+│          "severity": "MEDIUM", "handling": "ALIAS_APPLIED"},                   │
+│         {"type": "TYPE_WIDENED", "column": "unit_price",                       │
+│          "old_type": "decimal(10,2)", "new_type": "decimal(10,4)",             │
+│          "severity": "LOW", "handling": "SAFE_CAST"}                           │
+│       ],                                                                        │
+│       "auto_handled": 3,                                                        │
+│       "requires_manual": 0,                                                     │
+│       "pipeline_action": "CONTINUE"                                             │
+│     }                                                                           │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Type Compatibility Matrix                                                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━                                                  │
+│                                                                                 │
+│  SAFE casts (auto-handled):                                                     │
+│  ┌────────────────────┬──────────────────────┬────────────────────┐             │
+│  │ From               │ To                   │ Risk               │             │
+│  ├────────────────────┼──────────────────────┼────────────────────┤             │
+│  │ int                │ bigint               │ None (widening)    │             │
+│  │ decimal(10,2)      │ decimal(10,4)        │ None (precision+)  │             │
+│  │ varchar(50)        │ varchar(200)         │ None (widening)    │             │
+│  │ date               │ timestamp            │ None (more info)   │             │
+│  │ boolean            │ string               │ Low (repr change)  │             │
+│  └────────────────────┴──────────────────────┴────────────────────┘             │
+│                                                                                 │
+│  UNSAFE casts (require alert):                                                  │
+│  ┌────────────────────┬──────────────────────┬────────────────────┐             │
+│  │ From               │ To                   │ Risk               │             │
+│  ├────────────────────┼──────────────────────┼────────────────────┤             │
+│  │ bigint             │ int                  │ Overflow           │             │
+│  │ decimal(10,4)      │ decimal(10,2)        │ Truncation         │             │
+│  │ varchar(200)       │ varchar(50)          │ Truncation         │             │
+│  │ timestamp          │ date                 │ Time lost          │             │
+│  │ string             │ integer              │ Parse failure      │             │
+│  │ integer            │ boolean              │ Semantic change    │             │
+│  └────────────────────┴──────────────────────┴────────────────────┘             │
+│                                                                                 │
+│                                                                                 │
+│  ❸ Spark Schema Merge Mechanics                                                │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                              │
+│                                                                                 │
+│  Spark has built-in schema merge for Parquet:                                   │
+│  spark.read.option("mergeSchema", "true").parquet(path)                         │
+│                                                                                 │
+│  What it does:                                                                  │
+│  1. Reads footer of ALL Parquet files in the path                              │
+│  2. Collects all unique column names + types                                    │
+│  3. Creates UNION schema (superset of all columns)                             │
+│  4. Files missing a column → NULL for that column                              │
+│  5. Type conflicts → promotes to widest compatible type                         │
+│                                                                                 │
+│  Example:                                                                       │
+│  File 1 schema: {order_id: string, status: string}                             │
+│  File 2 schema: {order_id: string, order_status: string, shipping_addr: string}│
+│  Merged schema: {order_id: string, status: string, order_status: string,       │
+│                   shipping_addr: string}                                        │
+│  → File 1 rows: shipping_addr = NULL, order_status = NULL                      │
+│  → File 2 rows: status = NULL                                                  │
+│                                                                                 │
+│  LIMITATION:                                                                    │
+│  → mergeSchema doesn't know about RENAMES                                      │
+│  → "status" and "order_status" look like two different columns                 │
+│  → Alias mapping must happen BEFORE or AFTER merge                             │
+│                                                                                 │
+│                                                                                 │
+│  ❹ Glue DynamicFrame ResolveChoice                                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                             │
+│                                                                                 │
+│  When Glue infers schema and a column has mixed types across records:           │
+│  → Row 1: price = "29.99" (string)                                              │
+│  → Row 2: price = 29.99 (double)                                                │
+│  → Glue creates a "choice" type: price: choice{string, double}                 │
+│                                                                                 │
+│  ResolveChoice options:                                                         │
+│  → "make_struct": keep both types in a struct                                  │
+│  → "cast:double": force cast all to double                                     │
+│  → "make_cols": split into price_string and price_double                       │
+│  → "project:double": keep only values that are double, null others             │
+│  → "match_catalog": use Glue Catalog table type as reference                   │
+│                                                                                 │
+│  For schema evolution: "match_catalog" is most useful                           │
+│  → Compares incoming type against Catalog definition                            │
+│  → Casts to catalog type if possible                                            │
+│  → Nullifies if cast fails                                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Alias mapping produces wrong data"
+</span>→ Cause: assumed "status" renamed to "order_status"
+→ Reality: "status" was REMOVED, "order_status" is a NEW column with different semantics
+→ "status" was: pending/shipped/completed
+→ "order_status" is: open/closed (different enum values!)
+→ Fix: alias map requires EXPLICIT human confirmation
+→ Never auto-generate alias mappings based on name similarity
+
+PITFALL 2: "Silver schema keeps growing with abandoned columns"
+→ Cause: backend adds columns, later removes them, Silver keeps all
+→ After 12 months: Silver has 15 columns that source no longer sends
+→ All 15 are NULL in new data, wastes storage and confuses analysts
+→ Fix: quarterly schema review — mark columns as "deprecated"
+→ After 90 days of all-NULL: remove from Silver schema
+
+PITFALL 3: "Type widening cascades break Gold queries"
+→ Cause: unit_price widened from DECIMAL(10,2) to DECIMAL(10,4)
+→ Silver handles it fine (Parquet supports both)
+→ But Gold query: ROUND(unit_price, 2) now rounds differently
+→ And Redshift DDL still says DECIMAL(10,2) → COPY fails
+→ Fix: schema change alerts must include downstream impact analysis
+
+PITFALL 4: "mergeSchema reads 10,000 Parquet file footers"
+→ Cause: Silver has years of partitioned data, mergeSchema reads ALL footers
+→ Performance: 10,000 files × 50ms each = 8+ minutes just for schema
+→ Fix: read only LATEST partition for schema inference
+→ Or: use Glue Catalog as schema authority (don't infer from files)
+
+PITFALL 5: "New column has sensitive data (PII)"
+→ Cause: backend adds "shipping_address" → auto-included in Silver
+→ Shipping address is PII → must be masked/encrypted
+→ Auto-include didn't apply PII handling
+→ Fix: new columns default to QUARANTINE (not auto-include)
+→ Data engineer must explicitly approve + classify each new column
+
+PITFALL 6: "Schema detection runs AFTER data write (too late)"
+→ Cause: ETL writes to Silver, then detects schema changed
+→ Silver now has data with inconsistent schema
+→ Fix: detect BEFORE write, validate BEFORE write, alert BEFORE write
+→ Never write first, check later
+
+PITFALL 7: "Glue Crawler marks all columns as string"
+→ Cause: CSV has no type metadata, Crawler can't infer types reliably
+→ Crawler sees: "29.99" → could be string or decimal
+→ Defaults to string for safety
+→ Fix: don't rely on Crawler for Silver schema
+→ Use explicit StructType (Project 44) + adaptive handling (this project)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT LOAD:
+</span>→ 3 entities (orders, customers, products)
+→ Schema changes: ~1 per month
+→ Schema registry: 3 entries in DynamoDB
+→ Overhead: negligible
+
+SCALING TO 50 ENTITIES:
+→ 50 entities × ~2 changes/month = 100 schema changes/month
+→ Schema registry: 50 entries, ~200 versions over time
+→ Each Bronze→Silver job adds ~5 seconds for schema detection
+→ Total overhead: 50 entities × 5 seconds = ~4 minutes/day
+→ Manageable
+
+SCALING TO 500 ENTITIES:
+→ Schema changes: potentially daily across all entities
+→ Manual review of EVERY change becomes bottleneck
+→ Solution: auto-approve LOW severity changes (column added, type widened)
+→ Only escalate MEDIUM/HIGH severity to human review
+→ Weekly "schema drift summary" instead of per-change alerts
+
+SCHEMA REGISTRY SIZE:
+→ DynamoDB: 1 item per entity per version
+→ 500 entities × 50 versions = 25,000 items
+→ DynamoDB handles this trivially (&lt;1ms reads)
+→ Cost: ~$0.00 (on-demand pricing, minimal reads/writes)
+
+SCHEMA COMPARISON PERFORMANCE:
+→ Comparing two schemas: O(n) where n = number of columns
+→ 100 columns: &lt;1ms comparison time
+→ 1000 columns: &lt;10ms comparison time
+→ Not a performance concern at any practical scale</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR SCHEMA EVOLUTION:
+</span>
+1. Schema Drift Dashboard
+   → CloudWatch custom metric: SchemaChanges (dimension: entity, severity)
+   → Daily count of schema changes across all entities
+   → Trend: increasing changes = source systems evolving rapidly
+   → Spike: many changes on one day = major deployment upstream
+
+2. Schema Drift Reports (S3)
+   → _system/schema-reports/{entity}/{date}.json
+   → Queryable via Athena:
+     SELECT entity, change_type, severity, COUNT(*)
+     FROM schema_reports
+     WHERE date &gt; DATE_ADD('day', -30, CURRENT_DATE)
+     GROUP BY entity, change_type, severity
+
+3. Schema Version History (DynamoDB)
+   → For each entity: full history of schema versions
+   → When did "shipping_address" first appear?
+   → When did "status" get renamed?
+   → Enables root cause analysis when data issues arise
+
+4. Pipeline Run Metadata
+   → Each Bronze→Silver run logs:
+     - schema_changes_detected: 2
+     - schema_changes_auto_handled: 2
+     - schema_changes_manual_required: 0
+     - pipeline_action: CONTINUE
+   → Step Functions execution includes this in state output
+
+5. Alert Escalation Levels
+   → LOW (column added): email to data-team channel
+   → MEDIUM (type changed, column renamed): email + Slack alert
+   → HIGH (required column removed): email + Slack + PagerDuty
+   → CRITICAL (&gt;5 changes simultaneously): page on-call engineer</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(45)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Schema Registry (DynamoDB)</h3>
+
+<h3>Step 2: Schema Drift Detector</h3>
+
+<h3>Step 3: Adaptive Schema Transformer (Glue ETL Integration)</h3>
+
+<h3>Step 4: Integrated Bronze→Silver ETL with Schema Evolution</h3>
+
+<h3>Step 5: Schema Update Utility</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create schema registry and initialize baseline schemas</span><span>
+</span>python 45_01_schema_registry.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY PIPELINE (automated — replaces Project 44's ETL)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Adaptive Bronze→Silver ETL (Glue job)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># This automatically: detects → adapts → validates → writes → alerts</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Runs via Step Functions (Project 41)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># WHEN DRIFT ALERT RECEIVED (manual engineer action)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Test drift detection locally</span><span>
+</span>python 45_02_schema_drift_detector.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># After confirming changes are permanent:</span><span>
+</span>python 45_05_schema_update_utility.py apply_sprint47
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Or individual changes:</span><span>
+</span>python 45_05_schema_update_utility.py add_column orders shipping_address string
+python 45_05_schema_update_utility.py add_alias orders status order_status
+<span>python 45_05_schema_update_utility.py update_type orders unit_price </span><span class="token" style="color: rgb(163, 21, 21);">"decimal(10,4)"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Verify updated schemas</span><span>
+</span>python 45_05_schema_update_utility.py show</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Sprint 47 scenario — pipeline auto-handles):
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║  ADAPTIVE BRONZE → SILVER ETL: orders                                 ║
+║  Date: 2025-01-15                                                     ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+📥 PHASE 1: Reading Bronze data...
+   CDC: 11,247 rows
+   Total raw: 11,247 rows
+   Incoming columns: ['order_id', 'customer_id', 'product_id', 'quantity',
+                       'unit_price', 'total_amount', 'order_status',
+                       'shipping_address', 'order_date', 'created_at', 'updated_at']
+
+🔍 PHASE 2: Detecting schema drift...
+   Baseline: v1 (10 columns)
+   Alias map: {'status': 'order_status'}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 SCHEMA DRIFT REPORT: orders
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Total changes: 3
+   Auto-handled: 3
+   Manual required: 0
+   Overall severity: MEDIUM
+   Pipeline action: CONTINUE
+
+   Type                 Column               Severity   Handling
+   ─────────────────────────────────────────────────────────────────
+   COLUMN_ADDED         shipping_address     LOW        AUTO_INCLUDE_NULLABLE
+                        ↳ New column 'shipping_address' found — will include as nullable
+   COLUMN_RENAMED       status               MEDIUM     ALIAS_APPLIED
+                        ↳ Column renamed: 'order_status' → 'status' (alias applied)
+   TYPE_WIDENED         unit_price            LOW        SAFE_CAST
+                        ↳ Decimal precision widened: decimal(10,2) → decimal(10,4)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   📄 Drift report saved: s3://quickcart-datalake-prod/_system/schema-reports/orders/2025-01-15.json
+   📧 Drift alert sent: ⚠️ Schema Drift: orders — MEDIUM (3 changes)
+
+🔧 PHASE 3: Applying adaptations...
+   ✅ Renamed: order_status → status
+   ✅ New column included: shipping_address (nullable)
+   ✅ Type widened: unit_price → decimal(10,4)
+
+   📊 Adaptations applied: 3
+      → RENAMED: order_status → status
+      → ADDED: shipping_address (kept as-is, nullable)
+      → TYPE_WIDENED: unit_price → decimal(10,4)
+
+🔧 PHASE 4: Silver transformations...
+   NULL PK dropped: 0
+   Duplicates removed: 28
+   ETL metadata added
+
+🔍 PHASE 5: Quality gate...
+   ✅ Quality gate PASSED
+
+📤 PHASE 6: Writing to Silver...
+   ✅ Written: 11,219 rows to s3://quickcart-datalake-prod/silver/orders/
+
+============================================================
+📊 ADAPTIVE BRONZE → SILVER REPORT: orders
+============================================================
+   Schema baseline: v1
+   Schema drift: 3 changes (3 auto, 0 manual)
+   Pipeline action: CONTINUE
+   Input (Bronze):      11,247 rows
+   NULL PK dropped:          0 rows
+   Dups removed:            28 rows
+   Output (Silver):     11,219 rows
+   Quality gate:        PASSED
+   Output columns:      15
+============================================================</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Schema evolution is INEVITABLE — source systems change constantly
+→ Strict schema-on-write (Project 44) breaks on ANY source change
+→ Adaptive schema handling: detect → classify → adapt → validate → alert
+→ Schema registry (DynamoDB): versioned baseline + alias mappings
+→ Alias map handles renames WITHOUT code changes to ETL
+→ Type compatibility matrix: widening is safe, narrowing is dangerous
+→ Quality gate AFTER adaptation catches data quality issues
+→ ALWAYS alert on drift — even auto-handled changes need human review
+→ Baseline schema updated MANUALLY by engineer after confirming permanence
+→ Drift reports in S3 enable historical schema evolution analysis
+
+EVOLUTION FLOW:
+━━━━━━━━━━━━━━
+  Source changes schema
+       ↓
+  Bronze ingests (accepts anything) ✅
+       ↓
+  Drift detector compares incoming vs baseline
+       ↓
+  ┌─ AUTO: column added, type widened, known rename
+  │  → Adapt and continue pipeline ✅
+  │
+  └─ MANUAL: required column removed, type incompatible
+     → Fail pipeline, alert engineer ❌
+     → Engineer updates registry, re-runs pipeline
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 44: Medallion architecture (Bronze accepts anything, Silver enforces)
+→ Project 34: Glue transforms (ResolveChoice for type ambiguity)
+→ Project 42: CDC (schema changes propagate through CDC)
+→ Project 41: Step Functions catches ETL failure → sends alert
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 46: Athena Federated Query — Query MariaDB Live Without ETL
+   (Now that we handle schema evolution for batch ETL, what about
+    querying source databases DIRECTLY without ETL at all?
+    Athena Federated Query lets analysts SQL-query MariaDB
+    through Athena — no pipeline, no schema management needed.
+    But with trade-offs: performance, cost, load on source.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Schema evolution is now handled gracefully:
+</span>→ Pipeline adapts to most changes automatically
+→ Engineers alerted for all changes, required for dangerous ones
+→ Zero downtime for common schema changes
+
+But the analytics engineer raises a new question:
+
+"I need to run an ad-hoc query against MariaDB RIGHT NOW.
+ The data I need was inserted 10 minutes ago.
+ Our CDC pipeline runs nightly — I'd have to wait 14 hours.
+ Bronze→Silver→Gold adds another 2 hours on top.
+ 
+ Can I just SQL-query MariaDB directly from Athena?
+ Without waiting for any pipeline?"
+
+This is the FEDERATED QUERY pattern:
+→ Athena sends SQL to MariaDB via a Lambda connector
+→ Results returned to Athena as if it were an S3 table
+→ Zero ETL, zero latency, zero pipeline dependency
+→ But: puts load on MariaDB, costs per query, limited performance
+
+→ Project 46: "Query MariaDB Live from Athena Without ETL"
+→ Introduces: Athena Federated Query, Lambda Connector,
+  Data Source Catalog, Predicate Pushdown</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-44.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 45 of 80</span>
+    <span class="nav-project-title">SOURCE SCHEMA CHANGED — PIPELINE MUST NOT BREAK</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-46.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-46.html") window.location = "project-46.html";
+  if (e.key === 'ArrowLeft' && "project-44.html") window.location = "project-44.html";
+});
+</script>
+</body>
+</html>

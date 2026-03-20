@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 19: NIGHTLY CSV FROM S3 MUST LOAD INTO MARIADB — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:24%"></div></div>
+<div id="progress-label">24%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 19 of 80</div>
+  <div class="project-title">NIGHTLY CSV FROM S3 MUST LOAD INTO MARIADB</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">MariaDB</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now 9 months old
+</span>Situation:
+→ Daily CSVs landing in S3 reliably (Project 1)
+→ SNS email alerts working (Project 17)
+→ SQS queue captures file events (Project 18)
+→ MariaDB running on EC2 with schema ready (Projects 8-9)
+→ Athena handles ad-hoc queries (Project 16)
+
+BUT: The application team needs data in MariaDB, not Athena
+→ Customer support app queries MariaDB for order status
+→ Dashboard pulls "today's revenue" from MariaDB
+→ API serves customer profiles from MariaDB
+→ None of these can use Athena (too slow, SQL dialect different)
+
+Current pain:
+→ Analyst manually downloads CSV from S3 every morning
+→ Opens MySQL Workbench → imports CSV → takes 45 minutes
+→ If analyst is absent → app shows stale data all day
+→ Weekends: no import → Monday app shows Friday's data
+
+CTO: "When a CSV lands in S3, I want it in MariaDB within 15 minutes.
+      No human involvement. Handle errors. Don't duplicate data.
+      Don't crash if file format changes slightly."
+
+YOU: "We build an EC2 script that:
+      1. Downloads CSV from S3 (Project 1 download pattern)
+      2. Connects to MariaDB (Project 8-9 connection)
+      3. Bulk-loads rows using batch INSERT
+      4. Verifies row counts match
+      5. Later: triggered automatically via SQS (Project 18)"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the data flow
+</span>→ Source: S3 CSV files (known schema from Project 1)
+→ Destination: MariaDB tables (schema from Project 9)
+→ Frequency: daily (one file per entity per day)
+→ Volume: ~200K orders, ~50K customers, ~5K products per day
+→ Mode: append (new rows daily, no updates to old data — yet)
+
+Step 2: Understand the loading strategy options
+→ Row-by-row INSERT: 200K individual INSERTs → extremely slow (hours)
+→ Batch INSERT: INSERT INTO ... VALUES (...), (...), (...) → fast (minutes)
+→ LOAD DATA INFILE: MySQL native bulk load → fastest but requires file on server
+→ executemany(): pymysql batch parameter binding → good balance
+
+Step 3: Understand idempotency requirements
+→ If script runs twice for same file → must NOT duplicate data
+→ Options:
+  A. DELETE existing data for that date, then INSERT (replace strategy)
+  B. Use INSERT IGNORE (skip duplicates based on primary key)
+  C. Use INSERT ... ON DUPLICATE KEY UPDATE (upsert)
+  D. Check if file already loaded before starting
+→ We use: Option A (DELETE + INSERT in transaction) for simplicity
+→ Project 42 covers proper CDC/merge patterns
+
+Step 4: Understand error handling needs
+→ S3 download failure → retry, don't touch MariaDB
+→ CSV parse failure → log bad rows, continue with good ones
+→ MariaDB connection failure → retry with backoff
+→ Partial load failure → ROLLBACK transaction, no partial data
+→ All errors → logged with enough detail to debug
+
+Step 5: Plan the implementation
+→ Download CSV from S3 to local temp file
+→ Parse CSV, validate structure
+→ Connect to MariaDB
+→ Begin transaction
+→ DELETE existing data for this file's date (idempotency)
+→ Batch INSERT new rows
+→ COMMIT transaction
+→ Verify row count matches
+→ Clean up temp file
+→ Log result</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  S3 Bucket (Project 1)
+   └── daily_exports/
+        ├── orders/orders_20250115.csv          (200K rows)
+        ├── customers/customers_20250115.csv    (50K rows)
+        └── products/products_20250115.csv      (5K rows)
+        │
+        │ boto3 download_file()
+        ▼
+  EC2 Instance
+   └── /tmp/s3_downloads/
+        ├── orders_20250115.csv      ← temporary local copy
+        │
+        │ Python: csv.reader() → parse rows
+        │ pymysql: batch INSERT
+        ▼
+  MariaDB (on same EC2 or separate EC2 — Project 8)
+   └── Database: quickcart
+        ├── Table: orders      ← 200K new rows inserted
+        ├── Table: customers   ← 50K new rows inserted
+        └── Table: products    ← 5K new rows inserted
+
+
+  LATER AUTOMATION (combining with Project 18):
+  
+  S3 upload → SQS event → EC2 worker receives message
+  → Worker parses S3 key from event
+  → Worker calls THIS loading script
+  → Worker deletes SQS message on success
+  → FULLY AUTOMATED end-to-end</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: pymysql + batch INSERT (programmatic, portable)
+</span>→ Pure Python — works anywhere
+→ Full control over error handling, validation, transformation
+→ Batch INSERT for performance
+→ ✅ WE USE THIS — most interview-relevant, production-common
+
+Option B: LOAD DATA LOCAL INFILE (MySQL native bulk load)
+→ Fastest possible load method for MariaDB
+→ Reads CSV directly into table
+→ Less control over row-level validation
+→ Requires: local_infile=True on connection + server config
+→ Mentioned in code but not primary approach
+
+Option C: mysqlimport CLI tool
+→ Command-line bulk loader
+→ Fast but no programmatic error handling
+→ Cannot transform data during load
+→ Good for one-off loads, not production pipelines
+
+Option D: AWS DMS (Database Migration Service)
+→ Overkill for CSV→MariaDB
+→ Designed for database-to-database migration
+→ Covered conceptually in Project 79
+
+Option E: Glue JDBC connection (Project 31)
+→ Glue writes to MariaDB via JDBC
+→ More complex setup (VPC, connection, security group)
+→ Better for large-scale ETL
+→ Covered in Project 31
+
+DECISION: Option A — pymysql batch INSERT
+→ Most common in real data engineering
+→ Full error control
+→ Easy to integrate with SQS worker (Project 18)
+→ Teaches: connection management, transactions, batch operations</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use TRANSACTIONS for atomicity
+</span>   → BEGIN → DELETE old → INSERT new → COMMIT
+   → If any step fails → ROLLBACK → no partial data
+   → MariaDB default: autocommit=True → must explicitly manage
+
+2. Use batch INSERT (not row-by-row)
+   → INSERT INTO orders VALUES (%s,%s,...), (%s,%s,...), ...
+   → executemany() with batch_size of 1000-5000 rows
+   → 200K rows at batch_size=1000 → 200 INSERTs instead of 200,000
+
+3. Make loading IDEMPOTENT
+   → Running same file twice must produce same result
+   → DELETE WHERE order_date = '2025-01-15' THEN INSERT
+   → Or: track loaded files in a metadata table
+
+4. Validate CSV structure BEFORE loading
+   → Check column count matches expected schema
+   → Check for empty file (header only, no data)
+   → Check for encoding issues (UTF-8 expected)
+   → Reject file early rather than fail mid-load
+
+5. Use connection pooling for repeated connections
+   → Single script run: one connection is fine
+   → Continuous worker (Project 18 pattern): use connection pool
+   → pymysql doesn't have built-in pooling → use DBUtils or SQLAlchemy
+
+6. Log everything with timestamps
+   → Start time, end time, row counts, file sizes
+   → Which file loaded, to which table, how many rows
+   → Essential for debugging when something goes wrong at 2 AM
+
+7. Clean up temporary files
+   → Download to /tmp → process → delete
+   → If script crashes → stale files accumulate
+   → Add cleanup in finally block
+
+8. Use parameterized queries (never string formatting)
+   → cursor.execute("INSERT INTO t VALUES (%s, %s)", (val1, val2))
+   → NEVER: f"INSERT INTO t VALUES ('{val1}', '{val2}')"
+   → String formatting → SQL injection vulnerability
+   → Parameterized → safe, handles escaping automatically</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use row-by-row INSERT for large files
+</span>   → 200K individual INSERTs → 200K round trips to MariaDB
+   → Each INSERT: parse SQL + write to WAL + flush
+   → Time: 30-60 minutes for 200K rows
+   → Batch INSERT: 2-5 minutes for same data (20-30x faster)
+
+2. DO NOT skip transactions
+   → Without transaction: if script crashes after 100K rows
+   → Table has 100K partial rows — no way to know which are loaded
+   → Must delete all and reload from scratch
+   → With transaction: ROLLBACK → table unchanged → retry cleanly
+
+3. DO NOT load into production table directly without validation
+   → Bad CSV (wrong columns, corrupt data) → breaks production table
+   → Strategy: load into STAGING table → validate → swap/merge
+   → For simple cases: validate CSV structure before loading
+
+4. DO NOT store MariaDB password in Python source code
+   → Use: environment variables, AWS Secrets Manager (Project 70), 
+     or EC2 parameter store
+   → Here: we use environment variables as minimum acceptable approach
+
+5. DO NOT forget to handle duplicate loads
+   → Cron fires twice, SQS message retried, manual re-run
+   → Without idempotency: 400K rows instead of 200K
+   → Fix: DELETE + INSERT in transaction, or metadata tracking table
+
+6. DO NOT ignore character encoding
+   → CSV may contain: café, naïve, résumé, 日本語
+   → MariaDB connection charset must match file encoding
+   → Default: charset='utf8mb4' (supports all Unicode)
+   → Wrong charset → garbled data or insert failures
+
+7. DO NOT load with autocommit=True for bulk operations
+   → Each INSERT auto-committed → 200K commits → slow + no rollback
+   → Set autocommit=False → explicit COMMIT after all batches
+   → Single commit at end → much faster (one WAL flush)
+
+8. DO NOT ignore MariaDB max_allowed_packet
+   → Large batch INSERTs generate large SQL statements
+   → Default max_allowed_packet: 16 MB
+   → 5000 rows × 500 bytes = 2.5 MB per batch → usually fine
+   → 50000 rows × 500 bytes = 25 MB → exceeds default → error
+   → Keep batch size at 1000-5000 to stay safe</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────────┬────────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                               │ Loading Method     │ Why                                  │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ CSV → MariaDB, full control needed     │ pymysql batch      │ Validation, transformation, error    │
+│ (this project)                         │ INSERT             │ handling in Python                   │
+│                                        │ ✅ THIS PROJECT    │                                      │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Massive CSV (10M+ rows), speed is      │ LOAD DATA LOCAL    │ 10-50x faster than batch INSERT     │
+│ critical, minimal transformation       │ INFILE             │ MySQL/MariaDB native bulk loader    │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ CSV → Redshift (columnar warehouse)    │ Redshift COPY      │ Native parallel load from S3        │
+│                                        │ (Project 21)       │ 100x faster than row inserts        │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ S3 → MariaDB at scale with Spark       │ Glue JDBC          │ Distributed write, handles schema   │
+│ engine                                 │ (Project 31)       │ evolution, bookmarks                │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ One-off import from command line       │ mysqlimport        │ Quick, no code needed               │
+│                                        │ or mysql CLI       │ Not scriptable for automation       │
+├────────────────────────────────────────┼────────────────────┼──────────────────────────────────────┤
+│ Complex ETL with joins, dedup,         │ Python + pymysql   │ Full programming power              │
+│ business logic during load             │ with pandas        │ pandas for transformation,          │
+│                                        │                    │ pymysql for loading                 │
+└────────────────────────────────────────┴────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE PYMYSQL BATCH INSERT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Loading 100M+ rows from CSV
+</span>   → pymysql processes in Python → GIL-limited single thread
+   → LOAD DATA INFILE: 10-50x faster (MySQL engine reads file directly)
+   → Or: split file → parallel workers → each loads a chunk
+
+2. When source is another database (not CSV)
+   → Database-to-database: use DMS or Glue JDBC
+   → Don't: dump to CSV → upload to S3 → download → load
+   → Direct JDBC-to-JDBC is more efficient
+
+3. When destination is a data warehouse (Redshift, BigQuery)
+   → These have native bulk loaders (COPY, bq load)
+   → pymysql doesn't speak Redshift protocol
+   → Use: psycopg2 for Redshift or Redshift COPY (Project 21)
+
+4. When data needs heavy transformation
+   → Complex joins, window functions, pivots during load
+   → Better: use pandas or Spark for transformation
+   → Then load the transformed result
+
+5. When you need exactly-once delivery guarantee
+   → pymysql + DELETE/INSERT = idempotent but not exactly-once
+   → For financial transactions: use database-native CDC
+   → Or: distributed transaction coordinators</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│             PYMYSQL + MARIADB BATCH LOADING — INTERNAL MECHANICS             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PHASE 1: CONNECTION ESTABLISHMENT                                           │
+│  ─────────────────────────────────                                           │
+│  pymysql.connect() →                                                         │
+│    1. TCP socket connection to MariaDB port (default 3306)                   │
+│    2. MySQL protocol handshake (capability negotiation)                      │
+│    3. Authentication (username/password or plugin auth)                      │
+│    4. Character set negotiation (utf8mb4 recommended)                        │
+│    5. Connection ID assigned by MariaDB server                              │
+│                                                                              │
+│  Connection object holds:                                                    │
+│    → Socket handle                                                           │
+│    → Server version info                                                     │
+│    → Current database context                                                │
+│    → Autocommit state                                                        │
+│    → Character encoding                                                      │
+│                                                                              │
+│                                                                              │
+│  PHASE 2: TRANSACTION MECHANICS                                              │
+│  ──────────────────────────────                                              │
+│  conn.autocommit = False                                                     │
+│  → Every SQL statement is part of a transaction                             │
+│  → Changes are INVISIBLE to other connections until COMMIT                  │
+│  → ROLLBACK undoes ALL changes since last COMMIT                            │
+│                                                                              │
+│  MariaDB InnoDB transaction flow:                                            │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │ BEGIN (implicit on first statement)                         │            │
+│  │   ├── DELETE FROM orders WHERE order_date = '2025-01-15'    │            │
+│  │   │   → Rows marked for deletion in undo log               │            │
+│  │   │   → Row locks acquired (prevents other transactions)   │            │
+│  │   │   → Original data saved in undo tablespace             │            │
+│  │   │                                                         │            │
+│  │   ├── INSERT INTO orders VALUES (...), (...), (...)         │            │
+│  │   │   → New rows written to buffer pool (memory)           │            │
+│  │   │   → Redo log entries written (for crash recovery)      │            │
+│  │   │   → NOT visible to other connections yet               │            │
+│  │   │                                                         │            │
+│  │   ├── ... (more batch INSERTs) ...                          │            │
+│  │   │                                                         │            │
+│  │   └── COMMIT                                                │            │
+│  │       → Redo log flushed to disk (durability guarantee)     │            │
+│  │       → Changes become visible to all connections           │            │
+│  │       → Row locks released                                  │            │
+│  │       → Undo log entries can be purged                      │            │
+│  │                                                              │            │
+│  │   OR: ROLLBACK                                               │            │
+│  │       → Undo log replayed (restores original rows)           │            │
+│  │       → New rows discarded from buffer pool                  │            │
+│  │       → Row locks released                                   │            │
+│  │       → Table returns to pre-transaction state               │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│                                                                              │
+│  PHASE 3: BATCH INSERT MECHANICS                                             │
+│  ────────────────────────────────                                            │
+│                                                                              │
+│  cursor.executemany(sql, data_batch) internals:                              │
+│                                                                              │
+│  WHAT executemany() ACTUALLY DOES:                                           │
+│  → pymysql optimizes INSERT INTO t VALUES (%s,%s) with list of tuples       │
+│  → Rewrites as: INSERT INTO t VALUES (v1,v2), (v3,v4), (v5,v6)...          │
+│  → Single SQL statement with multiple value sets                            │
+│  → Sent as ONE network packet to MariaDB                                    │
+│                                                                              │
+│  BATCH SIZE IMPACT:                                                          │
+│  ┌────────────────┬──────────────┬─────────────┬────────────────┐           │
+│  │ Batch Size     │ Network Trips│ Time (200K) │ SQL Size       │           │
+│  ├────────────────┼──────────────┼─────────────┼────────────────┤           │
+│  │ 1 (row-by-row) │ 200,000      │ ~45 min     │ ~200 bytes     │           │
+│  │ 100            │ 2,000        │ ~8 min      │ ~20 KB         │           │
+│  │ 1,000          │ 200          │ ~3 min      │ ~200 KB        │           │
+│  │ 5,000          │ 40           │ ~2 min      │ ~1 MB          │           │
+│  │ 10,000         │ 20           │ ~1.5 min    │ ~2 MB          │           │
+│  │ 50,000         │ 4            │ ~1 min      │ ~10 MB         │           │
+│  └────────────────┴──────────────┴─────────────┴────────────────┘           │
+│                                                                              │
+│  SWEET SPOT: 1,000 - 5,000 rows per batch                                   │
+│  → Good balance of speed and memory usage                                   │
+│  → Stays well under max_allowed_packet (16 MB default)                      │
+│  → Each batch is one network round trip                                     │
+│                                                                              │
+│                                                                              │
+│  PHASE 4: LOAD DATA LOCAL INFILE (alternative method)                       │
+│  ─────────────────────────────────────────────────────                       │
+│  LOAD DATA LOCAL INFILE '/tmp/orders.csv'                                   │
+│  INTO TABLE orders                                                          │
+│  FIELDS TERMINATED BY ','                                                   │
+│  ENCLOSED BY '"'                                                            │
+│  LINES TERMINATED BY '\n'                                                   │
+│  IGNORE 1 LINES;                                                            │
+│                                                                              │
+│  HOW IT WORKS:                                                               │
+│  → Client reads file from LOCAL filesystem (not server filesystem)          │
+│  → Streams file content over MySQL protocol to server                       │
+│  → Server parses and inserts directly into table                            │
+│  → Bypasses SQL parser for each row → much faster                           │
+│  → 200K rows: ~30 seconds vs ~3 minutes for batch INSERT                   │
+│                                                                              │
+│  REQUIREMENTS:                                                               │
+│  → pymysql.connect(local_infile=True)                                       │
+│  → MariaDB server: SET GLOBAL local_infile = 1;                             │
+│  → Security risk: client can read any local file server allows              │
+│                                                                              │
+│                                                                              │
+│  PHASE 5: IDEMPOTENCY VIA DELETE + INSERT                                   │
+│  ─────────────────────────────────────────                                   │
+│                                                                              │
+│  WHY DELETE + INSERT (not just INSERT):                                      │
+│  → File may be reprocessed (SQS retry, manual re-run, cron duplicate)       │
+│  → INSERT alone → duplicate rows → wrong aggregations                       │
+│  → DELETE matching rows first → then INSERT → same result every time        │
+│                                                                              │
+│  Transaction guarantees:                                                     │
+│  → DELETE + INSERT in same transaction                                      │
+│  → If INSERT fails → ROLLBACK → DELETE is also undone                       │
+│  → Table never in inconsistent state                                        │
+│  → Other connections see old data until COMMIT (isolation)                  │
+│                                                                              │
+│  Alternative: INSERT ... ON DUPLICATE KEY UPDATE                            │
+│  → Requires unique key (e.g., order_id)                                     │
+│  → Slower than DELETE + INSERT for full file reload                         │
+│  → Better for incremental updates (Project 42)                             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "pymysql.err.OperationalError: (1040, 'Too many connections')"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: script opens connections but doesn't close them
+→ Each run leaks a connection → MariaDB max (default 151) exhausted
+→ Fix: always use try/finally or context manager to close connections
+→ Debug: SHOW PROCESSLIST; in MariaDB to see open connections
+
+PITFALL 2: "Data truncated for column 'unit_price' at row 1"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV has value like "29.99" but column is INT not DECIMAL
+→ Or: value "N/A" in numeric column
+→ Fix: match MariaDB column types to actual CSV data
+→ Fix: clean data in Python before inserting (convert "N/A" to NULL)
+
+PITFALL 3: "Duplicate entry 'ORD-20250115-0001' for key 'PRIMARY'"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: script ran twice for same file without DELETE first
+→ Fix: DELETE WHERE order_date = X before INSERT (our approach)
+→ Or: INSERT IGNORE (silently skip duplicates)
+→ Or: INSERT ... ON DUPLICATE KEY UPDATE (upsert)
+
+PITFALL 4: "Lock wait timeout exceeded; try restarting transaction"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: another process holds locks on rows we're trying to DELETE
+→ Common when: app queries running while bulk load happens
+→ Fix: schedule loads during low-traffic periods (midnight)
+→ Fix: use shorter transactions (commit every N batches)
+→ Fix: increase innodb_lock_wait_timeout
+
+PITFALL 5: "Lost connection to MySQL server during query"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: max_allowed_packet exceeded (batch too large)
+→ Cause B: wait_timeout exceeded (connection idle too long)
+→ Cause C: network hiccup between EC2 and MariaDB
+→ Fix A: reduce batch size
+→ Fix B: increase wait_timeout or add keepalive pings
+→ Fix C: implement retry with exponential backoff
+
+PITFALL 6: "CSV has 9 columns but table has 8"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Source system added a new column without telling data team
+→ Script crashes on first INSERT
+→ Fix: validate column count before loading
+→ Fix: schema evolution handling (Project 45)
+
+PITFALL 7: "Loaded 200K rows but table shows 400K"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: script ran twice (cron fired twice, manual re-run)
+→ DELETE step was not implemented → data doubled
+→ Fix: always DELETE matching date range before INSERT
+→ Fix: add load_metadata table tracking which files were loaded</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME SCALING:
+</span>━━━━━━━━━━━━━━━━━━━
+→ 5K rows (products): &lt; 1 second
+→ 50K rows (customers): 5-10 seconds
+→ 200K rows (orders): 2-5 minutes with batch INSERT
+→ 1M rows: 10-15 minutes with batch INSERT
+→ 10M rows: consider LOAD DATA INFILE (10x faster)
+→ 100M rows: split file + parallel loaders + partitioned table
+
+MARIADB TABLE SCALING:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Under 10M rows: standard InnoDB table works great
+→ 10M-100M rows: add proper indexes, optimize queries
+→ 100M+ rows: consider table partitioning (by date)
+→ 1B+ rows: MariaDB is wrong tool → use Redshift (Project 10)
+
+CONNECTION SCALING:
+━━━━━━━━━━━━━━━━━━
+→ Single loader script: 1 connection is fine
+→ Multiple parallel loaders: connection pool (5-10 connections)
+→ MariaDB default max_connections: 151
+→ Don't open more than you need → resource exhaustion
+
+NETWORK SCALING:
+━━━━━━━━━━━━━━━━
+→ EC2 and MariaDB in same VPC: ~0.1ms latency
+→ EC2 and MariaDB in different regions: 50-200ms latency
+→ Each batch INSERT = 1 round trip
+→ 200 batches × 0.1ms = 0.02s overhead (same VPC — negligible)
+→ 200 batches × 100ms = 20s overhead (cross-region — significant)
+→ Always co-locate compute and database
+
+COST:
+━━━━━
+→ EC2 t3.medium: $0.0416/hour
+→ Script runs for 5 minutes → $0.0035 per run
+→ 30 runs/month → $0.10/month compute cost
+→ S3 GET request: $0.0004 per 1000 → negligible
+→ MariaDB on EC2: already running → no additional cost</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY LOADING WORKED CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Row count comparison
+   → CSV rows (minus header) must equal MariaDB SELECT COUNT(*)
+   → Mismatch → some rows rejected or duplicated
+   → Script logs both counts for comparison
+
+2. Spot-check sample rows
+   → SELECT * FROM orders WHERE order_date = '2025-01-15' LIMIT 5
+   → Compare with first 5 data rows of CSV
+   → Check: values match, no truncation, no encoding issues
+
+3. Aggregate comparison
+   → CSV: sum of total_amount column (Python calculation)
+   → MariaDB: SELECT SUM(total_amount) WHERE order_date = '2025-01-15'
+   → Must match (or differ by &lt; $0.01 due to floating point)
+
+4. Load metadata table
+   → Track: filename, load_time, row_count, status
+   → Query: SELECT * FROM load_metadata ORDER BY load_time DESC
+   → Shows full history of what was loaded when
+
+5. MariaDB binary log
+   → Contains every INSERT statement executed
+   → Can reconstruct exactly what was loaded
+   → Useful for: audit, debugging, replication</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(19)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create MariaDB Schema for Loading</h3>
+
+<h3>Step 2: Core Loading Engine</h3>
+
+<h3>Step 3: Query Loaded Data (Verification)</h3>
+
+<h3>Step 4: SQS-Triggered Auto-Loading (Combines Projects 18 + 19)</h3>
+
+<h3>Step 5: Standalone Loader Module (Importable)</h3>
+
+<h3>Step 6: Cleanup</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → MariaDB running on EC2 (Project 8)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → CSV files in S3 (Project 1 — run 03_generate_test_data.py + 02_upload_daily_csvs.py)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → pip install pymysql boto3</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Set environment variables (or use defaults in code)</span><span>
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">export</span><span> </span><span class="token assign-left" style="color: rgb(54, 172, 170);">MARIADB_HOST</span><span class="token" style="color: rgb(57, 58, 52);">=</span><span>localhost
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">export</span><span> </span><span class="token assign-left" style="color: rgb(54, 172, 170);">MARIADB_PORT</span><span class="token" style="color: rgb(57, 58, 52);">=</span><span class="token" style="color: rgb(54, 172, 170);">3306</span><span>
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">export</span><span> </span><span class="token assign-left" style="color: rgb(54, 172, 170);">MARIADB_USER</span><span class="token" style="color: rgb(57, 58, 52);">=</span><span>quickcart_etl
+</span><span></span><span class="token builtin" style="color: rgb(43, 145, 175);">export</span><span> </span><span class="token assign-left" style="color: rgb(54, 172, 170);">MARIADB_PASSWORD</span><span class="token" style="color: rgb(57, 58, 52);">=</span><span class="token" style="color: rgb(57, 58, 52);">[</span><span>REDACTED:PASSWORD</span><span class="token" style="color: rgb(57, 58, 52);">]</span><span>_pas</span><span class="token" style="color: rgb(57, 58, 52);">[</span><span>REDACTED:PASSWORD</span><span class="token" style="color: rgb(57, 58, 52);">]</span><span>rd_</span><span class="token" style="color: rgb(57, 58, 52);">[</span><span>REDACTED:PASSWORD</span><span class="token" style="color: rgb(57, 58, 52);">]</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create MariaDB schema (one-time)</span><span>
+</span>python 19_01_create_mariadb_schema.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Load today's CSV files from S3 into MariaDB</span><span>
+</span>python 19_02_load_csv_to_mariadb.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2b. Load specific date</span><span>
+</span><span>python 19_02_load_csv_to_mariadb.py </span><span class="token" style="color: rgb(54, 172, 170);">20250115</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Verify loaded data</span><span>
+</span>python 19_03_verify_loaded_data.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run automated SQS-triggered loader (combines Projects 18+19)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># (requires SQS queue from Project 18 to be set up)</span><span>
+</span>python 19_04_sqs_triggered_loader.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Cleanup</span><span>
+</span><span>python 19_05_cleanup.py          </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># data only</span><span>
+</span><span>python 19_05_cleanup.py --full   </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># drop everything</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Step 2 — Loading):
+</span>
+======================================================================
+📦 LOADING: orders_20250115.csv
+   Source:  s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv
+   Time:    2025-01-15 09:00:03
+======================================================================
+   Entity:  orders → table: orders
+   Date:    2025-01-15
+   📥 Downloading: s3://quickcart-raw-data-prod/daily_exports/orders/orders_20250115.csv
+   ✅ Downloaded: 83,942 bytes → /tmp/s3_to_mariadb/orders_20250115.csv
+
+   🔌 Connecting to MariaDB...
+   ✅ Connected to localhost:3306/quickcart
+
+   🔍 Validating CSV structure...
+   ✅ Valid: 1000 data rows, 8 columns
+
+   🔄 Beginning load transaction...
+   🗑️  Deleted 0 existing rows for date 2025-01-15
+   ✅ COMMITTED: 1000 rows loaded
+
+   📊 VERIFICATION:
+   → CSV data rows:     1000
+   → Rows loaded:       1000
+   → Rows rejected:     0
+   → Rows in table:     1000
+   → Count match:       ✅ YES
+
+   ⏱️  Duration: 1.2 seconds
+   📈 Speed: 833 rows/second
+   🔌 Connection closed
+   🗑️  Temp file deleted: /tmp/s3_to_mariadb/orders_20250115.csv
+
+======================================================================
+📊 DAILY LOAD SUMMARY
+======================================================================
+   ✅ orders      :    1,000 loaded,    0 rejected, 1.2s
+   ✅ customers   :      500 loaded,    0 rejected, 0.4s
+   ✅ products    :      200 loaded,    0 rejected, 0.2s
+
+   TOTAL: 1,700 rows loaded, 0 rejected
+   STATUS: ✅ ALL SUCCEEDED</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ pymysql batch INSERT is the standard Python→MariaDB loading pattern
+→ BATCH_SIZE of 1000-5000 rows balances speed and memory
+→ executemany() rewrites multiple VALUES into single INSERT statement
+→ Transactions (autocommit=False) give atomicity — ROLLBACK on failure
+→ Idempotency via DELETE + INSERT in same transaction
+→ load_metadata table tracks what was loaded for audit and dedup
+→ CSV validation BEFORE loading prevents corrupting production tables
+→ clean_row() handles: empty strings→NULL, type conversion, booleans
+→ Connection must ALWAYS be closed (try/finally pattern)
+→ Parameterized queries (%s) prevent SQL injection — NEVER use f-strings
+
+KEY DESIGN DECISIONS:
+━━━━━━━━━━━━━━━━━━━━
+→ DELETE + INSERT (not UPSERT) — simplest for full file reload
+→ One connection per load (not pool) — sufficient for single script
+→ Local temp file (not streaming) — allows validation before load
+→ Metadata table — enables "was this file already loaded?" check
+→ Per-entity config dict — extensible to new tables without code change
+
+WHAT THIS CONNECTS BACKWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1: S3 upload creates the CSV files we're loading
+→ Project 5-6: EC2 instance where this script runs + IAM role for S3 access
+→ Project 8-9: MariaDB installation and schema design
+→ Project 16: Athena queries same data — compare query speed
+→ Project 18: SQS event triggers this loader automatically
+
+WHAT THIS CONNECTS FORWARD TO:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 20: REVERSE direction — extract MariaDB → CSV → S3
+   → SELECT from MariaDB → write CSV → upload to S3
+   → Used for: sharing data, feeding analytics, backup
+
+→ Project 27: EC2 worker continuously polls SQS
+   → THIS project's SQS-triggered loader (19_04) IS Project 27's core
+   → Project 27 expands: error handling, metrics, graceful shutdown
+
+→ Project 29: Scheduled loading via cron
+   → Instead of SQS trigger: cron runs 19_02 every night at 2 AM
+   → Simpler but not event-driven (delay between upload and load)
+
+→ Project 31: Glue JDBC replaces pymysql for larger scale
+   → Same concept: read from S3, write to MariaDB
+   → But: distributed Spark engine, handles 100M+ rows
+   → Connection via Glue JDBC Connection (VPC, subnet, security group)
+
+→ Project 42: CDC — only load CHANGED rows, not entire file
+   → Instead of DELETE all + INSERT all
+   → Compare: what's new? what changed? what's deleted?
+   → MERGE pattern: more efficient for large tables with small changes</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart can now load S3 CSVs into MariaDB — manually or via SQS trigger.
+</span>Data flows IN to MariaDB. But what about flowing OUT?
+
+NEW REQUIREMENT:
+→ Finance team needs daily order data in their own S3 bucket
+→ Marketing team wants customer segments exported as CSV for email campaigns
+→ Analytics team needs MariaDB data in S3 for Athena ad-hoc queries
+→ Disaster recovery: MariaDB data must be backed up to S3
+
+CTO: "We load S3 → MariaDB. Now we need MariaDB → S3.
+      Export specific tables as CSVs, organized by date,
+      so other teams can consume them."
+
+YOU: "That's the reverse ETL pattern:
+      1. Connect to MariaDB (same as this project)
+      2. SELECT data with date filters
+      3. Write to CSV locally
+      4. Upload to S3 with partitioned key structure
+      5. Other teams access via S3, Athena, or their own tools"
+
+→ Project 20: "Extract MariaDB Table &amp; Upload as CSV to S3"
+→ Reverses the data flow: MariaDB → CSV → S3
+→ Introduces: date-partitioned S3 keys, export scheduling
+→ Builds directly on pymysql connection pattern from THIS project</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-18.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 19 of 80</span>
+    <span class="nav-project-title">NIGHTLY CSV FROM S3 MUST LOAD INTO MARIADB</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-20.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-20.html") window.location = "project-20.html";
+  if (e.key === 'ArrowLeft' && "project-18.html") window.location = "project-18.html";
+});
+</script>
+</body>
+</html>

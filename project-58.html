@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 58: SHARE REDSHIFT DATA ACROSS ACCOUNTS WITHOUT COPY — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:72%"></div></div>
+<div id="progress-label">72%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 58 of 80</div>
+  <div class="project-title">SHARE REDSHIFT DATA ACROSS ACCOUNTS WITHOUT COPY</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — multi-account AWS setup
+</span>Team: 15 engineers, 5 data engineers, 4 analysts, 1 BI lead
+
+CURRENT STATE (after Projects 56-57):
+→ Account A (111111111111): Production Data
+  - S3 data lake: shared cross-account ✅ (Project 56)
+  - Glue Catalog: shared cross-account ✅ (Project 57)
+  - Redshift cluster: "quickcart-prod-cluster"
+    - 50+ curated tables (aggregations, materialized views, star schema)
+    - 500 GB of warehouse data
+    - Used by production dashboards
+
+→ Account B (222222222222): Analytics
+  - Can query S3 data via Athena ✅
+  - Can run Glue ETL on S3 data ✅
+  - Redshift Serverless: "quickcart-analytics-workgroup"
+    - Used by BI team for ad-hoc analysis
+    - Currently: loads data from S3 (slow, stale)
+
+THE PROBLEM:
+BI Lead: "Our Redshift in Account B has yesterday's data.
+  Account A's Redshift has LIVE curated tables with:
+  - Materialized views refreshed every 15 minutes
+  - Pre-joined star schema (orders + customers + products)
+  - Pre-aggregated daily/weekly/monthly rollups
+  - Custom UDFs for business metric calculations
+  
+  We need to query Account A's Redshift tables FROM Account B's Redshift.
+  NOT a copy. NOT an export. LIVE data."
+
+WHAT THEY TRIED AND WHY IT FAILED:
+
+ATTEMPT 1: UNLOAD → S3 → COPY
+→ Account A: UNLOAD orders_star_schema TO 's3://...'
+→ Account B: COPY orders_star_schema FROM 's3://...'
+→ Problems:
+  - 500 GB × daily = massive S3 storage cost
+  - UNLOAD takes 45 minutes
+  - COPY takes 30 minutes
+  - Data is 75 minutes stale by the time BI queries it
+  - Must repeat for every table (50 tables)
+  - Materialized views can't be UNLOADED (they're Redshift-internal)
+
+ATTEMPT 2: Cross-account Redshift JDBC
+→ Account B connects to Account A's Redshift via JDBC
+→ Problems:
+  - Requires VPC Peering (complex network setup)
+  - Account A's cluster gets overloaded by Account B's queries
+  - No workload isolation — BI queries slow production dashboards
+  - No access control at table level
+
+ATTEMPT 3: Federated Query
+→ Account B's Redshift queries Account A's via federated query
+→ Problems:
+  - Every query goes through Account A's cluster
+  - Network latency for every row
+  - Can't use Account B's compute for heavy queries
+
+THE REAL SOLUTION:
+→ Redshift Data Sharing
+→ Account A PUBLISHES specific tables as a "datashare"
+→ Account B SUBSCRIBES to the datashare
+→ Account B queries the data using ITS OWN compute
+→ Data stays in Account A — zero copying
+→ Real-time: Account B always sees Account A's latest data
+→ Workload isolation: Account B's queries don't affect Account A
+
+REQUIREMENTS:
+→ Share 15 specific tables (not all 50)
+→ Account B gets READ-ONLY access
+→ No data movement (zero-copy)
+→ Real-time freshness (no lag)
+→ Account A controls what's shared
+→ Account B uses its own Redshift compute for queries</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what Redshift Data Sharing IS
+</span>→ A feature of Redshift that shares LIVE data between clusters
+→ Producer cluster: owns the data, creates datashare
+→ Consumer cluster: subscribes, queries using own compute
+→ Zero-copy: data physically stays on producer's storage
+→ Real-time: consumer always reads latest committed data
+→ Works: same account, cross-account, cross-region (with limitations)
+
+Step 2: Understand the components
+→ DATASHARE: a named container of shared objects (created by producer)
+→ DATASHARE OBJECTS: tables, schemas, views, UDFs added to datashare
+→ CONSUMER NAMESPACE: unique identifier for consumer cluster
+→ DATASHARE DATABASE: consumer creates a local database from the datashare
+→ External schema: consumer queries shared tables through this database
+
+Step 3: Understand the authorization flow
+→ Producer creates datashare → adds objects → grants to consumer namespace
+→ For cross-account: AWS account-level authorization also required
+→ Producer authorizes consumer's AWS account (via console/API)
+→ Consumer associates the datashare (accepts the sharing invitation)
+→ Consumer creates database from datashare → queries
+
+Step 4: Understand what CAN and CANNOT be shared
+→ CAN share: tables, views (regular + late-binding), materialized views
+→ CAN share: schemas (all tables in schema), UDFs
+→ CANNOT share: stored procedures, system tables
+→ CANNOT share: cross-database references within shared views
+→ Consumer: READ-ONLY (cannot INSERT, UPDATE, DELETE shared tables)
+
+Step 5: Understand compute isolation
+→ Producer's queries: use producer's compute (RPU/nodes)
+→ Consumer's queries: use CONSUMER's compute (RPU/nodes)
+→ Even though data is on producer → consumer's compute reads it directly
+→ No network hop through producer's cluster
+→ This is the KEY advantage over JDBC/federated query</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+Account A [REDACTED:BANK_ACCOUNT_NUMBER]1)                 Account B [REDACTED:BANK_ACCOUNT_NUMBER]2)
+PRODUCER                                 CONSUMER
+┌──────────────────────────┐            ┌──────────────────────────┐
+│                          │            │                          │
+│ Redshift Cluster:        │            │ Redshift Serverless:     │
+│ "quickcart-prod"         │            │ "quickcart-analytics"    │
+│ (ra3.xlplus × 4 nodes)   │            │ (128 RPU)                │
+│                          │            │                          │
+│ ┌──────────────────────┐ │  DATASHARE │ ┌──────────────────────┐ │
+│ │ Schema: analytics    │ │ ══════════ │ │ Database:            │ │
+│ │  ├─ orders_star      │─┼────────────┼→│ acct_a_shared        │ │
+│ │  ├─ daily_rollup     │─┼────────────┼→│  ├─ orders_star      │ │
+│ │  ├─ customer_360     │─┼────────────┼→│  ├─ daily_rollup     │ │
+│ │  ├─ product_perf     │─┼────────────┼→│  ├─ customer_360     │ │
+│ │  └─ mv_hourly_rev    │─┼────────────┼→│  ├─ product_perf     │ │
+│ │     (mat view)       │ │            │ │  └─ mv_hourly_rev    │ │
+│ └──────────────────────┘ │            │ └──────────────────────┘ │
+│                          │            │                          │
+│ Schema: internal         │            │ LOCAL tables:            │
+│  ├─ hr_salaries (NOT     │            │  ├─ bi_reports           │
+│  │   shared)             │            │  ├─ user_segments        │
+│  └─ raw_logs (NOT shared)│            │  └─ forecast_data        │
+│                          │            │                          │
+│ DATASHARE:               │            │ QUERY EXAMPLE:           │
+│ "quickcart_analytics_    │            │ SELECT a.order_date,     │
+│  share"                  │            │        a.revenue,        │
+│  → analytics schema      │            │        b.forecast        │
+│  → authorized to         │            │ FROM acct_a_shared       │
+│    Account B             │            │   .analytics             │
+│                          │            │   .daily_rollup a        │
+│                          │            │ JOIN local_schema         │
+│                          │            │   .forecast_data b       │
+│                          │            │ ON a.order_date =        │
+│                          │            │    b.forecast_date;      │
+│                          │            │                          │
+└──────────────────────────┘            └──────────────────────────┘
+
+KEY PROPERTIES:
+→ Data physically stays in Account A's Redshift storage
+→ Account B's compute reads it via Redshift's managed storage layer
+→ Consumer sees LIVE data (not a snapshot or copy)
+→ Producer can revoke access at any time
+→ Consumer can join shared tables with local tables
+→ Materialized views in datashare: consumer sees refreshed data</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: UNLOAD → S3 → COPY (current painful approach)
+</span>→ 500 GB daily transfer
+→ 75-minute staleness
+→ S3 storage cost for duplicated data
+→ Breaks for materialized views (can't UNLOAD)
+→ 50 tables × setup = massive maintenance burden
+
+Option B: VPC Peering + JDBC connection
+→ Account B's application connects to Account A's Redshift
+→ All queries run on Account A's compute → overloads production
+→ Complex VPC networking (covered in Project 61)
+→ No workload isolation
+
+Option C: Federated Query (Redshift → Redshift)
+→ Account B queries Account A via federation
+→ Each query routes through Account A's cluster
+→ Network latency, compute contention
+→ Better than JDBC but still uses producer's resources
+
+Option D: Redshift Data Sharing (this project) ✅
+→ Zero-copy: data stays in producer
+→ Real-time: consumer always sees latest
+→ Compute isolation: consumer uses own resources
+→ Granular: share specific schemas/tables
+→ Revocable: producer controls access
+→ Works cross-account and (limited) cross-region
+
+Option E: AWS Data Exchange
+→ For sharing data with EXTERNAL organizations
+→ Marketplace-based — overkill for internal teams
+→ Commercial data sharing, not operational
+
+DECISION: Option D — Redshift Data Sharing
+→ Reason: zero-copy, real-time, compute isolation, simple
+→ Only requirement: both clusters must use RA3 nodes or Serverless
+→ Does NOT work with dc2 or ds2 node types (legacy)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use RA3 nodes or Serverless on BOTH sides
+</span>   → Data Sharing requires Redshift Managed Storage (RMS)
+   → RA3 nodes: separate compute + storage (supports data sharing)
+   → Serverless: always supports data sharing
+   → dc2/ds2: local storage only → data sharing NOT supported
+   → Check: SELECT * FROM stv_datashares; (fails on dc2/ds2)
+
+2. Share at SCHEMA level (not individual tables)
+   → Share entire "analytics" schema → all tables within it shared
+   → New tables added to schema → automatically shared
+   → No need to update datashare for every new table
+   → Keep shared tables in dedicated schema (separation of concerns)
+
+3. Create DEDICATED schema for shared objects
+   → Don't share your "public" schema (contains everything)
+   → Create: "analytics_shared" schema with only tables to share
+   → Internal tables stay in separate schema (not shared)
+   → Clear boundary: shared vs. internal
+
+4. Use meaningful datashare names
+   → "quickcart_analytics_share" (describes what's shared)
+   → Not: "ds1" or "share_for_account_b"
+   → Name should be self-documenting
+
+5. Grant to specific consumer namespace (not account wildcard)
+   → Each Redshift cluster/serverless has a unique namespace UUID
+   → Grant to namespace = specific cluster
+   → More precise than granting to entire account
+
+6. Document shared objects and consumers
+   → Maintain catalog: what's shared, with whom, since when
+   → Review quarterly: is Account B still using this datashare?
+   → Revoke unused shares to reduce surface area
+
+7. Monitor consumer query patterns
+   → Producer can see: which shared tables are queried
+   → SVL_DATASHARE_USAGE_CONSUMER: consumer-side query tracking
+   → SVL_DATASHARE_USAGE_PRODUCER: producer-side access tracking
+   → Identify: unused shared tables → candidates for removal
+
+8. Set up notifications for schema changes
+   → If producer drops a shared table → consumer queries break
+   → Communicate schema changes BEFORE making them
+   → Use SNS notification (from Project 54) when shared schema changes</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT share system tables or pg_catalog
+</span>   → System tables contain: user credentials, cluster config, internal state
+   → Sharing these = security risk
+   → Only share user-created schemas with business data
+
+2. DO NOT share tables with PII without access controls
+   → Data sharing is READ-ONLY but consumer can SELECT all columns
+   → If orders_star has customer_email → consumer sees it
+   → Redshift doesn't support column-level sharing within datashares
+   → Fix: create VIEWS that exclude PII columns → share the views
+
+3. DO NOT assume cross-region data sharing is free
+   → Same-region: no data transfer cost
+   → Cross-region: data transfer charges apply ($0.01-$0.02/GB)
+   → 500 GB queried cross-region daily = $5-$10/day
+   → Keep producer and consumer in SAME region when possible
+
+4. DO NOT forget to authorize at BOTH levels
+   → Level 1: Redshift datashare grants (within cluster)
+   → Level 2: AWS account authorization (for cross-account)
+   → Missing either level → consumer can't access
+   → Most common failure: forgot account-level authorization
+
+5. DO NOT modify shared tables without communicating
+   → Producer drops column → consumer queries referencing it break
+   → Producer renames table → consumer references break
+   → Treat shared schema like a PUBLIC API — versioned, documented
+   → Breaking changes require consumer notification + migration window
+
+6. DO NOT create circular sharing
+   → Account A shares with Account B
+   → Account B shares derived tables with Account A
+   → Creates dependency cycle → changes in either break the other
+   → Keep data flow unidirectional: producer → consumer
+
+7. DO NOT grant ALL PRIVILEGES on datashare
+   → Only USAGE is needed for consumers
+   → GRANT USAGE ON DATASHARE share_name TO NAMESPACE 'uuid'
+   → Not: GRANT ALL ON DATASHARE (doesn't exist but conceptually wrong)</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬─────────────────────────┬──────────────────────────────────────────┐
+</span>│ Scenario                             │ Use                     │ Why                                      │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Share Redshift tables across accounts│ Data Sharing            │ Zero-copy, real-time, compute isolation   │
+│ with compute isolation               │ (this project)          │                                          │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Share S3 data across accounts        │ Cross-account S3 +      │ S3 data not in Redshift — different      │
+│                                      │ Catalog (Projects 56-57)│ mechanism entirely                       │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Query remote Redshift from local     │ Federated Query         │ Ad-hoc cross-cluster queries without     │
+│ Redshift (same account)             │                         │ data sharing setup                       │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Share data with external companies   │ AWS Data Exchange       │ Marketplace-based, commercial licensing   │
+│                                      │                         │ Includes Redshift Data Sharing as option  │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Share individual query results       │ UNLOAD → S3 → share     │ One-time extract, not ongoing sharing    │
+│ (one-time, not ongoing)             │ S3 cross-account        │                                          │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Need column-level access control     │ Views in datashare OR   │ Data Sharing doesn't support column-     │
+│ on shared tables                     │ Lake Formation          │ level; views can exclude columns         │
+│                                      │ (Project 74)            │                                          │
+├──────────────────────────────────────┼─────────────────────────┼──────────────────────────────────────────┤
+│ Legacy dc2/ds2 Redshift clusters     │ UNLOAD → S3 → COPY     │ Data Sharing requires RA3/Serverless     │
+│                                      │                         │ Upgrade cluster type to enable sharing    │
+└──────────────────────────────────────┴─────────────────────────┴──────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE REDSHIFT DATA SHARING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data is in S3 (not Redshift)
+</span>   → Data Sharing is for Redshift-internal tables only
+   → S3 data: use cross-account S3 + Spectrum (Projects 56-57)
+   → Don't COPY S3 data into Redshift just to share it via Data Sharing
+
+2. When consumer needs to WRITE to shared tables
+   → Data Sharing is READ-ONLY
+   → Consumer cannot INSERT, UPDATE, DELETE shared data
+   → If write needed: consumer writes to LOCAL tables, producer reads via separate share
+
+3. When using dc2 or ds2 node types
+   → Data Sharing requires Redshift Managed Storage (RMS)
+   → dc2/ds2 use local SSD storage → no RMS → no data sharing
+   → Upgrade to RA3 or migrate to Serverless
+
+4. When cross-region latency is unacceptable
+   → Cross-region data sharing: higher latency for every query
+   → Large result sets: significant data transfer time
+   → If consumer queries are latency-sensitive: replicate to same region
+
+5. When sharing with non-Redshift consumers
+   → Data Sharing is Redshift-to-Redshift only
+   → Athena, Glue, external tools: can't consume datashares
+   → For non-Redshift consumers: UNLOAD to S3, or use Redshift data API
+
+6. When you need row-level security on shared data
+   → Data Sharing doesn't support RLS across clusters
+   → Consumer sees ALL rows in shared tables
+   → Fix: create filtered views in producer → share the views
+   → Or: use Lake Formation for row-level security (Project 74)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│            REDSHIFT DATA SHARING — INTERNAL MECHANICS                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  COMPONENT 1: REDSHIFT MANAGED STORAGE (RMS)                                 │
+│  ═══════════════════════════════════════════                                  │
+│  → RA3 nodes and Serverless use RMS (separate from compute)                  │
+│  → Data stored in S3-backed managed storage layer                            │
+│  → Multiple clusters can read SAME storage blocks                            │
+│  → This is what enables zero-copy sharing                                    │
+│                                                                              │
+│  Without RMS (dc2/ds2):                                                      │
+│  ┌──────────┐                                                                │
+│  │ Compute  │ ← data stored on LOCAL SSD                                     │
+│  │ + Storage│ ← only THIS cluster can read it                                │
+│  └──────────┘ ← no sharing possible                                          │
+│                                                                              │
+│  With RMS (RA3/Serverless):                                                  │
+│  ┌──────────┐     ┌──────────────────┐     ┌──────────┐                     │
+│  │ Compute  │────→│ Managed Storage  │←────│ Compute  │                     │
+│  │ (Prod)   │     │ (shared S3 layer)│     │(Analytics)│                    │
+│  └──────────┘     └──────────────────┘     └──────────┘                     │
+│  Producer reads     Data lives HERE         Consumer reads                   │
+│  and writes         Both clusters access    (read-only)                      │
+│                     SAME physical blocks                                     │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 2: DATASHARE OBJECT                                               │
+│  ═════════════════════════════                                                │
+│  → Named container created on producer cluster                               │
+│  → Contains references to schemas, tables, views, UDFs                       │
+│  → Does NOT contain actual data (just metadata pointers)                     │
+│  → Created via SQL: CREATE DATASHARE share_name                              │
+│                                                                              │
+│  DATASHARE LIFECYCLE:                                                        │
+│  1. CREATE DATASHARE share_name;                                             │
+│  2. ALTER DATASHARE share_name ADD SCHEMA schema_name;                       │
+│  3. ALTER DATASHARE share_name ADD ALL TABLES IN SCHEMA schema_name;         │
+│  4. GRANT USAGE ON DATASHARE share_name TO NAMESPACE 'consumer-uuid';        │
+│  5. (Cross-account): authorize via AWS API                                   │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 3: CROSS-ACCOUNT AUTHORIZATION                                    │
+│  ════════════════════════════════════════                                     │
+│  → Within same account: only Redshift GRANT needed                           │
+│  → Cross-account: TWO levels of authorization                                │
+│                                                                              │
+│  Level 1: Redshift-level (SQL)                                               │
+│  → Producer: GRANT USAGE ON DATASHARE TO ACCOUNT '[REDACTED:BANK_ACCOUNT_NUMBER]'              │
+│  → This makes the datashare VISIBLE to Account B                             │
+│                                                                              │
+│  Level 2: AWS account-level (API/Console)                                    │
+│  → Producer: authorize_data_share(data_share_arn, consumer_account_id)       │
+│  → Consumer: associate_data_share_consumer(data_share_arn, consumer_arn)      │
+│  → This establishes the AWS-level trust between accounts                     │
+│                                                                              │
+│  BOTH levels required for cross-account access                               │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 4: CONSUMER DATABASE CREATION                                     │
+│  ════════════════════════════════════════                                     │
+│  → Consumer creates a LOCAL database from the datashare                      │
+│  → CREATE DATABASE acct_a_shared FROM DATASHARE 'share_name'                 │
+│    OF NAMESPACE 'producer-namespace-uuid';                                   │
+│  → This database appears in consumer's catalog like any other DB             │
+│  → Tables inside are READ-ONLY (backed by producer's storage)                │
+│  → Consumer queries: SELECT * FROM acct_a_shared.schema.table               │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 5: QUERY EXECUTION FLOW                                           │
+│  ═══════════════════════════════════                                          │
+│  ┌──────────────────────────────────────────────────────────────┐            │
+│  │ Consumer submits: SELECT * FROM acct_a_shared.analytics     │            │
+│  │                   .daily_rollup WHERE order_date = '2025-01-15'          │
+│  │                                                              │            │
+│  │ 1. Consumer's query planner reads metadata from datashare    │            │
+│  │    (table structure, column types, partition info)            │            │
+│  │                                                              │            │
+│  │ 2. Consumer's compute nodes generate scan plan               │            │
+│  │    (which RMS blocks to read, predicate pushdown)            │            │
+│  │                                                              │            │
+│  │ 3. Consumer's compute nodes read data DIRECTLY from          │            │
+│  │    producer's Managed Storage (RMS)                          │            │
+│  │    → NO data flows through producer's compute nodes          │            │
+│  │    → Consumer reads RMS blocks directly (like reading S3)    │            │
+│  │                                                              │            │
+│  │ 4. Consumer's compute processes the data (filter, aggregate) │            │
+│  │                                                              │            │
+│  │ 5. Results returned to consumer's client                     │            │
+│  │                                                              │            │
+│  │ KEY: Producer's cluster is NOT involved in query execution   │            │
+│  │ Producer could be offline → consumer still queries (from RMS)│            │
+│  │ (but new writes by producer would be invisible until online) │            │
+│  └──────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 6: CONSISTENCY MODEL                                              │
+│  ══════════════════════════════                                               │
+│  → Consumer sees COMMITTED data from producer                                │
+│  → Producer writes new row → COMMIT → consumer immediately sees it           │
+│  → In-flight transactions on producer: NOT visible to consumer               │
+│  → This is "read committed" isolation across clusters                        │
+│  → No eventual consistency — it's transactionally consistent                 │
+│                                                                              │
+│                                                                              │
+│  COMPONENT 7: NAMESPACE                                                      │
+│  ════════════════════════                                                     │
+│  → Every Redshift cluster/serverless workgroup has a NAMESPACE               │
+│  → Namespace = UUID that uniquely identifies the cluster                     │
+│  → Format: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"                           │
+│  → Used in: GRANT USAGE ON DATASHARE TO NAMESPACE 'uuid'                    │
+│  → Used in: CREATE DATABASE ... OF NAMESPACE 'uuid'                          │
+│  → Find it: SELECT current_namespace FROM stv_sessions LIMIT 1;             │
+│             Or: Redshift console → Namespace column                          │
+│                                                                              │
+│                                                                              │
+│  PRICING:                                                                    │
+│  → Data Sharing itself: FREE (no additional charge)                          │
+│  → Consumer compute: charged at normal Redshift rate                         │
+│  → Cross-region data transfer: standard AWS transfer rates                   │
+│  → No storage charge for consumer (data stays on producer)                   │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Cannot create datashare — cluster not RA3/Serverless"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: dc2 or ds2 node types don't support Managed Storage
+→ Data Sharing requires RMS → requires RA3 or Serverless
+→ Fix: migrate cluster from dc2 → RA3 (elastic resize)
+→ Or: create new Serverless workgroup
+
+PITFALL 2: "Datashare visible but consumer can't create database"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: missing AWS account-level authorization
+→ Redshift GRANT done ✅ but API authorize_data_share not done ❌
+→ Cross-account requires BOTH: SQL grant + API authorization
+→ Fix: call redshift:AuthorizeDataShareConsumer API from producer account
+
+PITFALL 3: "Consumer sees tables but queries return 0 rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: datashare was created before tables had data
+→ Or: tables were truncated after sharing
+→ Debug: query from PRODUCER to confirm data exists
+→ Also check: is consumer's database pointing to correct namespace?
+
+PITFALL 4: "Consumer query is slow — expected data sharing to be fast"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: consumer cluster too small (not enough RPU/nodes)
+→ Consumer's compute does ALL the work — needs adequate sizing
+→ Cause 2: cross-region sharing → network latency on every block read
+→ Cause 3: shared table lacks sort keys → full scan instead of range scan
+→ Fix: size consumer appropriately, keep same region, ensure good table design
+
+PITFALL 5: "Producer dropped shared table → consumer queries break"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Producer ALTERs or DROPs table → immediately affects consumer
+→ No versioning, no grace period
+→ Consumer's next query: "relation does not exist"
+→ Fix: treat shared schema like API — document changes, notify consumers
+→ Fix: producer tests changes in staging datashare first
+
+PITFALL 6: "Consumer namespace UUID is wrong"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Provisioned cluster namespace ≠ Serverless namespace
+→ Each workgroup in Serverless has its OWN namespace
+→ Copy-paste errors in UUID → GRANT fails silently
+→ Debug: SHOW DATASHARES; on producer → check granted namespaces
+→ Verify: SELECT current_namespace on consumer</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME:
+</span>→ 1 GB shared: negligible performance impact
+→ 100 GB shared: normal query performance
+→ 1 TB shared: ensure consumer has adequate compute
+→ 10 TB+ shared: consider materialized views on producer for heavy aggregations
+→ No limit on data volume in datashare
+
+CONSUMER COUNT:
+→ 1 consumer: simple setup
+→ 5 consumers: same datashare, multiple GRANT statements
+→ 20+ consumers: manage via automation (script the grants)
+→ Max consumers per datashare: no hard limit
+→ Each consumer uses own compute → no contention
+
+TABLE COUNT:
+→ 1-10 tables: add individually or via schema
+→ 50+ tables: share entire schema (auto-includes new tables)
+→ 100+ tables: consider multiple datashares by domain
+→ No limit on objects per datashare
+
+COST AT SCALE:
+┌──────────────────────────┬────────────────────┬─────────────────┐
+│ Component                │ Producer Cost       │ Consumer Cost    │
+├──────────────────────────┼────────────────────┼─────────────────┤
+│ Storage (data)           │ Normal Redshift $/GB│ $0 (zero-copy)  │
+│ Compute (queries)        │ Own queries only    │ Own queries only │
+│ Data Sharing feature     │ $0 (free)           │ $0 (free)        │
+│ Cross-region transfer    │ $0.01-$0.02/GB     │ $0.01-$0.02/GB  │
+│ Same-region transfer     │ $0                  │ $0               │
+└──────────────────────────┴────────────────────┴─────────────────┘
+
+→ Key insight: consumer pays ONLY for compute, NOT for storage
+→ 500 GB shared: consumer pays $0 for storage
+→ Consumer's Serverless at 128 RPU: ~$48/day (only when querying)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY DATA SHARING IS WORKING:
+</span>
+1. Producer-side verification:
+   → SHOW DATASHARES; — lists all datashares
+   → SHOW DATASHARES LIKE 'quickcart%'; — filter by name
+   → DESC DATASHARE share_name; — shows objects + consumers
+   → SELECT * FROM svv_datashares; — system view with details
+   → SELECT * FROM svv_datashare_objects; — what's in the share
+   → SELECT * FROM svv_datashare_consumers; — who has access
+
+2. Consumer-side verification:
+   → SHOW DATASHARES; — lists available datashares
+   → SELECT * FROM svv_datashares WHERE share_type = 'INBOUND';
+   → \dt acct_a_shared.analytics.* — list shared tables
+   → SELECT COUNT(*) FROM acct_a_shared.analytics.orders_star;
+   → Verify: count matches producer's count
+
+3. Cross-account authorization check:
+   → AWS CLI: aws redshift describe-data-shares
+   → Shows: status (AUTHORIZED, ACTIVE, PENDING_AUTHORIZATION)
+   → Must be ACTIVE for consumer to access
+
+4. Query monitoring:
+   → Producer: SVL_DATASHARE_USAGE_PRODUCER — who queried what
+   → Consumer: SVL_DATASHARE_USAGE_CONSUMER — what you queried
+   → STL_QUERY on consumer: normal query logs include shared table queries</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(58)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Producer Setup — Create Datashare (Account A's Redshift)</h3>
+
+<h3>Step 2: Consumer Setup — Associate and Create Database (Account B)</h3>
+
+<h3>Step 3: Datashare Management — Monitor, Modify, Revoke</h3>
+
+<h3>Step 4: Cleanup SQL</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account A has Redshift RA3 cluster or Serverless (running)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Account B has Redshift RA3 cluster or Serverless (running)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Cross-account S3 + Catalog access set up (Projects 56-57)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Generate producer SQL + authorize cross-account (Account A)</span><span>
+</span>python 58_01_producer_create_datashare.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run generated SQL on Account A's Redshift</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → API authorization done automatically</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Associate datashare + generate consumer SQL (Account B)</span><span>
+</span>python 58_02_consumer_create_database.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run generated SQL on Account B's Redshift</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Replace &lt;PRODUCER-NAMESPACE-UUID&gt; with actual UUID</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Manage datashares (ongoing operations)</span><span>
+</span>python 58_03_manage_datashare.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Cleanup (when done)</span><span>
+</span>python 58_04_cleanup.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run consumer SQL first, then producer SQL</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED CONSUMER QUERY OUTPUT:
+</span>
+-- Query: JOIN shared tables with local tables
+-- (Account A's actuals + Account B's forecasts)
+
+ order_date  | actual_revenue | forecast_revenue | variance  | variance_pct
+-------------|----------------|------------------|-----------|-------------
+ 2025-01-15  |     127,450.00 |      125,000.00  |  2,450.00 |         2.0
+ 2025-01-16  |     131,200.00 |      130,000.00  |  1,200.00 |         0.9
+ 2025-01-17  |     124,800.00 |      128,000.00  | -3,200.00 |        -2.5
+
+-- Key observations:
+-- → actual_revenue: came from Account A's Redshift (via data sharing)
+-- → forecast_revenue: came from Account B's local table
+-- → JOIN executed on Account B's compute (zero load on Account A)
+-- → Account A's data is LIVE (not a copy — changes appear immediately)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Redshift Data Sharing enables ZERO-COPY cross-account data access
+→ Producer creates datashare → adds schemas/tables → grants to consumer
+→ Consumer creates local database from datashare → queries normally
+→ COMPUTE ISOLATION: consumer uses own compute, producer unaffected
+→ REAL-TIME: consumer always sees producer's latest committed data
+→ READ-ONLY: consumer cannot modify producer's data
+→ Requires RA3 or Serverless (NOT dc2/ds2 — no Managed Storage)
+→ Cross-account needs TWO levels: Redshift SQL GRANT + AWS API authorization
+→ Shared tables can be JOINed with consumer's local tables
+→ Materialized views in datashare: consumer sees refreshed data automatically
+→ Schema changes on producer immediately affect consumer (treat as API)
+→ FREE feature — no additional charge beyond normal Redshift compute
+
+CROSS-ACCOUNT DATA ACCESS COMPLETE PICTURE (Projects 56-58):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 56: S3 data accessible cross-account ✅
+  (raw files, parquet, CSV — any S3 object)
+→ Project 57: Glue Catalog metadata accessible cross-account ✅
+  (databases, tables, partitions, schemas)
+→ Project 58: Redshift curated tables accessible cross-account ✅
+  (star schemas, rollups, materialized views)
+
+Account B can now access EVERYTHING in Account A:
+┌────────────────────┬──────────────────────┬─────────────────┐
+│ Data Layer         │ Access Method        │ Project         │
+├────────────────────┼──────────────────────┼─────────────────┤
+│ S3 raw files       │ Cross-account S3     │ Project 56      │
+│ Glue Catalog       │ Resource Policy      │ Project 57      │
+│ Redshift tables    │ Data Sharing         │ Project 58      │
+│ S3 via Athena      │ Catalog + S3         │ Projects 56+57  │
+│ S3 via Spectrum    │ Catalog + S3 + RS    │ Projects 56+57  │
+│ Redshift via query │ Data Sharing         │ Project 58      │
+└────────────────────┴──────────────────────┴─────────────────┘
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 10-11: Redshift cluster setup, table design
+→ Project 21-22: Redshift COPY/UNLOAD (replaced by data sharing for cross-account)
+→ Project 38: Redshift Spectrum (still useful for S3 data, not Redshift-internal)
+→ Project 39: Redshift optimization (sort keys, dist keys affect shared table perf)
+→ Project 56: Cross-account S3 (data layer)
+→ Project 57: Cross-account Catalog (metadata layer)
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 59: "Account A's SNS Must Deliver to Account B's SQS"
+  - Data access shared ✅ (Projects 56-58)
+  - But: EVENT FLOW between accounts is not set up
+  - Account A's pipeline publishes events to SNS
+  - Account B needs to RECEIVE those events in its SQS queues
+  - Use case: "When Account A's Glue ETL completes, trigger Account B's pipeline"
+  - Cross-account SNS → SQS: topic policy + queue policy
+  - Builds on Project 14 (fan-out) + Project 51 (filtering)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has complete cross-account DATA access:
+</span>→ S3 files (Project 56)
+→ Catalog metadata (Project 57)
+→ Redshift tables (Project 58)
+
+BUT: Account B has no way to KNOW when Account A's data changes.
+
+CURRENT PROBLEM:
+→ Account A's Glue ETL finishes at 4:15 AM → Gold layer updated
+→ Account B's BI dashboard still shows yesterday's data
+→ BI Lead: "When does Account A's pipeline finish? How do I know
+   when to refresh my reports?"
+→ Currently: Account B checks manually every 30 minutes (polling)
+
+DESIRED:
+→ Account A's pipeline completes → publishes event to SNS
+→ Account B's SQS queue receives the event → triggers refresh
+→ Real-time notification across accounts — zero polling
+
+YOU: "We need cross-account SNS → SQS delivery.
+      Account A's SNS topic publishes 'pipeline complete'.
+      Account B's SQS queue subscribes to Account A's topic.
+      Requires: topic policy on Account A + queue policy on Account B."
+
+→ Project 59: "Account A's SNS Must Deliver to Account B's SQS"
+→ Introduces: Cross-account SNS topic policy, cross-account SQS subscription,
+   queue policy for SNS, condition keys, message filtering cross-account</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="37" ========== -->
+<div class="chat-message" data-index="37"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-57.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 58 of 80</span>
+    <span class="nav-project-title">SHARE REDSHIFT DATA ACROSS ACCOUNTS WITHOUT COPY</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-59.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-59.html") window.location = "project-59.html";
+  if (e.key === 'ArrowLeft' && "project-57.html") window.location = "project-57.html";
+});
+</script>
+</body>
+</html>

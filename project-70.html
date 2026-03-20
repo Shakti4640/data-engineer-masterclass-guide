@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 70: ROTATE DB CREDENTIALS WITHOUT BREAKING ANY PIPELINE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:88%"></div></div>
+<div id="progress-label">88%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 70 of 80</div>
+  <div class="project-title">ROTATE DB CREDENTIALS WITHOUT BREAKING ANY PIPELINE</div>
+  <div class="project-tags"><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Security audit across all accounts
+</span>
+SECURITY AUDIT FINDINGS:
+┌────┬────────────────────────────────────────┬──────────┬──────────────────────┐
+│ #  │ Finding                                │ Severity │ Affected Services    │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F1 │ MariaDB password hardcoded in Glue     │ CRITICAL │ Glue connections,    │
+│    │ Connection properties (plaintext)       │          │ test scripts         │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F2 │ Redshift password in Lambda env vars   │ HIGH     │ MV refresh Lambda,   │
+│    │ (visible in console)                    │          │ validation scripts   │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F3 │ Cross-account external_id hardcoded    │ MEDIUM   │ Federation Lambdas,  │
+│    │ in Python source files                  │          │ connector configs    │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F4 │ No credential rotation — ever          │ CRITICAL │ ALL services         │
+│    │ Same passwords for 12 months            │          │                      │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F5 │ No audit trail of credential access    │ HIGH     │ ALL services         │
+│    │ Can't answer: "who used this password?" │          │                      │
+├────┼────────────────────────────────────────┼──────────┼──────────────────────┤
+│ F6 │ Password shared across environments    │ HIGH     │ Dev + Prod use same  │
+│    │ Dev and Prod use identical credentials  │          │ MariaDB password     │
+└────┴────────────────────────────────────────┴──────────┴──────────────────────┘
+
+CREDENTIAL INVENTORY:
+┌─────────────────────────────────────┬───────────────────┬──────────────────────┐
+│ Credential                          │ Where It's Used   │ How It's Stored      │
+├─────────────────────────────────────┼───────────────────┼──────────────────────┤
+│ MariaDB glue_reader password        │ Glue Connection   │ Connection properties│
+│                                     │ Test scripts (5)  │ Hardcoded in .py     │
+│                                     │ Athena connector  │ Lambda env var       │
+├─────────────────────────────────────┼───────────────────┼──────────────────────┤
+│ Redshift etl_writer password        │ Glue Connection   │ Connection properties│
+│                                     │ MV refresh Lambda │ Lambda env var       │
+│                                     │ CDC Glue job      │ Redshift Data API    │
+│                                     │ Validation scripts│ Hardcoded in .py     │
+│                                     │ Superset dashboard│ JDBC config          │
+├─────────────────────────────────────┼───────────────────┼──────────────────────┤
+│ Cross-account external_id           │ Federation Lambda │ Lambda env var       │
+│                                     │ IAM trust policy  │ JSON policy doc      │
+├─────────────────────────────────────┼───────────────────┼──────────────────────┤
+│ MariaDB root password               │ EC2 admin scripts │ Hardcoded in .py     │
+│                                     │ Manual maintenance│ Sticky note on desk  │
+└─────────────────────────────────────┴───────────────────┴──────────────────────┘
+
+WHAT HAPPENS IF WE CHANGE A PASSWORD TODAY:
+→ Change MariaDB glue_reader password manually
+→ Glue Connection: still has old password → CDC job FAILS at 2 AM
+→ Athena MySQL connector: still has old password → federated queries FAIL
+→ Test scripts: still have old password → developer confusion
+→ 3 AM page: "All pipelines down — authentication failure"
+→ 4 hours to find and update all 8+ references
+
+COMPLIANCE REQUIREMENT (SOC 2):
+→ Credentials must be rotated every 90 days
+→ Rotation must not cause service disruption
+→ All credential access must be logged (who, when, which credential)
+→ Credentials must not be stored in code or environment variables
+→ Different credentials per environment (dev ≠ prod)
+
+CISO: "Centralize ALL credentials in Secrets Manager.
+       Auto-rotate every 90 days. Zero downtime during rotation.
+       Full audit trail. No more hardcoded passwords — anywhere."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the credential lifecycle
+</span>
+  CURRENT (broken):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ CREATE password → HARDCODE everywhere → NEVER change → PRAY     │
+  │                                                                  │
+  │ Risk: credential leak → permanent unauthorized access            │
+  │ Risk: password change → cascade of failures                      │
+  │ Risk: no audit → can't detect misuse                             │
+  └──────────────────────────────────────────────────────────────────┘
+
+  TARGET (secure):
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ CREATE password → STORE in Secrets Manager → ALL services        │
+  │ retrieve at runtime → AUTO-ROTATE every 90 days →                │
+  │ Rotation Lambda updates DB + secret atomically →                 │
+  │ Next service call gets new password automatically →              │
+  │ CloudTrail logs every access                                     │
+  │                                                                  │
+  │ Risk: credential leak → attacker has 90-day window (not forever) │
+  │ Risk: rotation → zero downtime (dual-password strategy)          │
+  │ Risk: audit → every access logged in CloudTrail                  │
+  └──────────────────────────────────────────────────────────────────┘
+
+Step 2: Understand Secrets Manager rotation mechanics
+
+  ROTATION STRATEGY: "Alternating Users"
+  
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ TWO database users, alternating:                                 │
+  │                                                                  │
+  │ User A: glue_reader_a (current active)                           │
+  │ User B: glue_reader_b (standby)                                  │
+  │                                                                  │
+  │ ROTATION STEP 1: Generate new password for User B                │
+  │ ROTATION STEP 2: Update User B's password in MariaDB             │
+  │ ROTATION STEP 3: Test User B can connect                         │
+  │ ROTATION STEP 4: Update secret to point to User B                │
+  │ ROTATION STEP 5: User B is now "current", User A is "standby"   │
+  │                                                                  │
+  │ NEXT ROTATION: swap back — update User A, make it current        │
+  │                                                                  │
+  │ WHY TWO USERS:                                                   │
+  │ → During rotation: User A still works (services using old secret)│
+  │ → After rotation: User B works (services get new secret)         │
+  │ → Brief overlap: BOTH users valid → zero downtime                │
+  │ → No "gap" where neither password works                          │
+  └──────────────────────────────────────────────────────────────────┘
+
+Step 3: Map services to secret retrieval method
+
+  ┌──────────────────────────────────┬──────────────────────────────────────┐
+  │ Service                          │ How to Retrieve Secret               │
+  ├──────────────────────────────────┼──────────────────────────────────────┤
+  │ Glue Connection                  │ Native secret reference (ARN)        │
+  │ Glue ETL Script                  │ boto3 get_secret_value() at runtime  │
+  │ Lambda                           │ boto3 get_secret_value() at runtime  │
+  │ Redshift Data API                │ Secret ARN parameter (native)        │
+  │ Athena Connector                 │ Lambda env var → secret ARN          │
+  │ Python test scripts              │ boto3 get_secret_value()             │
+  │ Superset Dashboard               │ Custom auth hook → Secrets Manager   │
+  └──────────────────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                          │
+  │  AWS SECRETS MANAGER                                                     │
+  │  ┌────────────────────────────────────────────────────────────────┐      │
+  │  │                                                                │      │
+  │  │  Secret: quickcart/prod/mariadb/glue-reader                   │      │
+  │  │  Value: {"username":"glue_reader_a", "password":[REDACTED:PASSWORD]Z...",     │      │
+  │  │          "host":"10.1.3.50", "port":3306, "dbname":"quickcart"}│      │
+  │  │  Rotation: every 90 days via Lambda                            │      │
+  │  │  Versions: AWSCURRENT (active), AWSPREVIOUS (last rotation)   │      │
+  │  │                                                                │      │
+  │  │  Secret: quickcart/prod/redshift/etl-writer                   │      │
+  │  │  Value: {"username":"etl_writer", "password":[REDACTED:PASSWORD]C...",        │      │
+  │  │          "host":"workgroup.xxx.redshift-serverless...",       │      │
+  │  │          "port":5439, "dbname":"analytics"}                   │      │
+  │  │  Rotation: every 90 days via Lambda                            │      │
+  │  │                                                                │      │
+  │  └────────────────────┬───────────────────────────────────────────┘      │
+  │                       │                                                  │
+  │         ┌─────────────┼─────────────┐                                    │
+  │         ▼             ▼             ▼                                    │
+  │  ┌────────────┐ ┌──────────┐ ┌──────────┐                              │
+  │  │ Glue       │ │ Lambda   │ │ Redshift │                              │
+  │  │ Connection │ │ (MV, CDC)│ │ Data API │                              │
+  │  │ ref: ARN   │ │ get_secret│ │ ref: ARN │                              │
+  │  └────────────┘ └──────────┘ └──────────┘                              │
+  │                                                                          │
+  │  ROTATION FLOW (every 90 days):                                         │
+  │  ┌────────────────────────────────────────────────────────────────┐     │
+  │  │ Secrets Manager → Rotation Lambda → MariaDB/Redshift          │     │
+  │  │                                                                │     │
+  │  │ 1. createSecret: generate new password                        │     │
+  │  │ 2. setSecret: update password in database                     │     │
+  │  │ 3. testSecret: verify new password works                      │     │
+  │  │ 4. finishSecret: swap AWSCURRENT label to new version         │     │
+  │  │                                                                │     │
+  │  │ Zero downtime: old password valid until step 4 completes      │     │
+  │  │ Rollback: if step 3 fails → old password stays active         │     │
+  │  └────────────────────────────────────────────────────────────────┘     │
+  │                                                                          │
+  │  AUDIT:                                                                  │
+  │  CloudTrail logs every GetSecretValue call:                             │
+  │  → WHO: arn:aws:iam::222222222222:role/GlueCrossAccountETLRole          │
+  │  → WHAT: quickcart/prod/mariadb/glue-reader                            │
+  │  → WHEN: 2025-01-15T02:01:23Z                                          │
+  │  → FROM: 10.2.6.10 (Glue ENI)                                          │
+  │                                                                          │
+  └──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Secrets Manager with Lambda rotation ✅ (CHOSEN)
+</span>→ AWS-native, fully managed
+→ Built-in rotation templates for MySQL, PostgreSQL, Redshift
+→ Glue native integration (secret ARN in connection)
+→ Redshift Data API native integration (SecretArn parameter)
+→ CloudTrail audit automatically
+→ Caching: SDK caches secret → reduces API calls
+
+Option B: AWS Systems Manager Parameter Store (SecureString)
+→ Cheaper ($0 for standard, $0.05/parameter for advanced)
+→ BUT: no built-in rotation mechanism
+→ Must build custom rotation logic
+→ No native Glue connection integration
+→ Good for: static config, not rotating credentials
+
+Option C: HashiCorp Vault
+→ Industry standard, cross-cloud
+→ Dynamic secrets (generate on-demand, auto-expire)
+→ BUT: requires Vault infrastructure (EC2/EKS)
+→ Operational overhead: backup, HA, upgrades
+→ Good for: multi-cloud enterprises, not AWS-only
+
+Option D: IAM Database Authentication
+→ MariaDB + RDS: supports IAM auth (no passwords at all)
+→ Redshift: supports IAM auth via GetClusterCredentials
+→ BUT: MariaDB on EC2 doesn't support IAM auth natively
+→ Would need RDS migration (out of scope)
+→ Redshift: can use IAM but Glue Connection still needs JDBC password
+
+DECISION: Option A — Secrets Manager with Lambda rotation
+→ Best integration with existing AWS services
+→ Built-in rotation for MySQL/MariaDB and Redshift
+→ Native Glue + Data API support
+→ CloudTrail audit included
+→ Cost: $0.40/secret/month + $0.05/10K API calls
+→ 4 secrets × $0.40 = $1.60/month (negligible)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. CREATE secrets in Secrets Manager for EVERY credential
+</span>   → quickcart/prod/mariadb/glue-reader
+   → quickcart/prod/mariadb/root (admin)
+   → quickcart/prod/redshift/etl-writer
+   → quickcart/prod/cross-account/external-id
+   → Naming convention: {app}/{env}/{service}/{purpose}
+
+2. USE JSON format for secret values (not plain string)
+   → {"username":"X", "password":[REDACTED:PASSWORD]Y", "host":"Z", "port":3306, "dbname":"D"}
+   → All connection info in one secret → single retrieval
+   → Matches Secrets Manager rotation template expectations
+
+3. CREATE separate database users for rotation (alternating users)
+   → MariaDB: glue_reader_a + glue_reader_b
+   → Both have identical GRANT permissions
+   → Rotation alternates between them
+   → During rotation: BOTH valid simultaneously → zero downtime
+
+4. UPDATE all services to retrieve secrets at RUNTIME
+   → NOT: read secret at deploy time → store in env var
+   → YES: call get_secret_value() when connection needed
+   → Use caching: AWS SDK caches for 1 hour by default
+   → Reduces API calls while staying current
+
+5. USE Glue Connection's native secret reference
+   → Glue Connection supports: "SECRET_ARN" property
+   → Glue retrieves credentials from secret at job start
+   → No password in Glue Connection properties
+   → Password change → Glue automatically uses new one
+
+6. USE Redshift Data API's SecretArn parameter
+   → execute_statement(SecretArn="arn:...", Database="analytics", Sql="...")
+   → No DbUser or password in Lambda code
+   → Data API retrieves credentials from Secrets Manager
+
+7. ENABLE rotation schedule on each secret
+   → Rotation interval: 90 days (SOC 2 requirement)
+   → Rotation Lambda: AWS-provided template (customizable)
+   → Test rotation manually first → then enable automatic
+
+8. SET resource policy on secrets for least-privilege access
+   → Only specific IAM roles can read each secret
+   → GlueCrossAccountETLRole → can read mariadb/glue-reader
+   → LambdaMVRefreshRole → can read redshift/etl-writer
+   → No blanket "secretsmanager:*" permissions
+
+9. ENABLE CloudTrail for Secrets Manager events
+   → Already enabled by default in CloudTrail
+   → Log: GetSecretValue, DescribeSecret, RotateSecret
+   → Alert: unusual access patterns (new IP, unusual time)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT store passwords in Lambda environment variables
+</span>   → Visible in console to anyone with Lambda:GetFunction
+   → Visible in CloudFormation template
+   → No rotation — must redeploy Lambda to change
+   → Instead: Lambda calls get_secret_value() at runtime
+
+2. DO NOT store passwords in Glue job arguments
+   → Visible in Glue console, CloudTrail, CloudWatch Logs
+   → --redshift_password=[REDACTED:PASSWORD] → logged everywhere
+   → Instead: pass SECRET ARN as argument → retrieve in code
+
+3. DO NOT use single database user for rotation
+   → Single user rotation: change password → brief window where nothing works
+   → Between password change and secret update: connections FAIL
+   → Instead: alternating users (A/B) → overlap period → zero downtime
+
+4. DO NOT rotate all secrets simultaneously
+   → If rotation Lambda has a bug: ALL credentials break at once
+   → Stagger: MariaDB on day 1, Redshift on day 15, etc.
+   → Reduces blast radius of rotation failures
+
+5. DO NOT forget to test rotation BEFORE enabling automatic schedule
+   → First rotation: run manually → verify all services still work
+   → Check: Glue jobs, Lambda functions, Athena connectors, dashboards
+   → Only after manual success: enable 90-day automatic rotation
+
+6. DO NOT cache secrets for too long
+   → Cache forever: defeats purpose of rotation
+   → Cache 0 seconds: excessive API calls ($0.05/10K)
+   → Sweet spot: 1 hour cache (default in AWS SDK)
+   → After rotation: services pick up new secret within 1 hour
+
+7. DO NOT grant secretsmanager:* to any role
+   → "Allow all Secrets Manager actions on all secrets"
+   → Overly permissive: role can read ANY secret in account
+   → Instead: specific ARN per role per secret
+
+8. DO NOT log secret values
+   → print(f"Connecting with password: {password}")
+   → Password appears in CloudWatch Logs
+   → NEVER log credential values — log secret ARN only
+   → Use: print(f"Connecting using secret: {secret_arn}")</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬──────────────────────┬───────────────────────────────────┐
+</span>│ Scenario                             │ Use                  │ Why                               │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ Database passwords that need         │ Secrets Manager      │ Built-in rotation, native         │
+│ rotation (MySQL, PostgreSQL,         │ with rotation Lambda │ integration with Glue/Data API    │
+│ Redshift)                            │                      │                                   │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ API keys, tokens (no rotation)       │ Secrets Manager      │ Encrypted, audited, versioned     │
+│                                      │ without rotation     │ But: no auto-rotation template    │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ Application config (non-sensitive)   │ SSM Parameter Store  │ Free for standard parameters      │
+│ Feature flags, endpoints             │ (String type)        │ No encryption needed              │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ Sensitive config (encrypted)         │ SSM Parameter Store  │ $0.05/parameter/month (advanced)  │
+│ but no rotation needed               │ (SecureString)       │ KMS encrypted, cheaper than SM    │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ IAM-based auth (no passwords)        │ IAM Database Auth    │ No password to rotate at all      │
+│ RDS MySQL/PostgreSQL                 │                      │ Temp tokens via STS               │
+│                                      │                      │ Not available for EC2-hosted DB   │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ Cross-cloud credential management    │ HashiCorp Vault      │ Dynamic secrets, multi-cloud      │
+│ Multi-cloud enterprise               │                      │ High operational overhead          │
+├──────────────────────────────────────┼──────────────────────┼───────────────────────────────────┤
+│ Redshift Serverless auth             │ Secrets Manager      │ Data API SecretArn parameter      │
+│                                      │ + Data API           │ No password in code at all        │
+└──────────────────────────────────────┴──────────────────────┴───────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│            SECRETS MANAGER ROTATION — INTERNAL MECHANICS                      │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  SECRET VERSIONS:                                                             │
+│  → Every secret has multiple VERSIONS                                         │
+│  → Each version has STAGING LABELS:                                           │
+│    - AWSCURRENT: the version services should use                              │
+│    - AWSPREVIOUS: the version from last rotation                              │
+│    - AWSPENDING: the version being prepared during rotation                   │
+│                                                                               │
+│  NORMAL STATE (between rotations):                                            │
+│  ┌──────────────────────────────────────────────────┐                         │
+│  │ Version v1 [AWSCURRENT]:                         │                         │
+│  │   username: glue_reader_a                        │                         │
+│  │   password: [REDACTED:PASSWORD]                       │                         │
+│  │                                                  │                         │
+│  │ Version v0 [AWSPREVIOUS]:                        │                         │
+│  │   username: glue_reader_b                        │                         │
+│  │   password: [REDACTED:PASSWORD]                        │                         │
+│  └──────────────────────────────────────────────────┘                         │
+│                                                                               │
+│  ROTATION FLOW (4 steps, executed by Lambda):                                 │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ STEP 1: createSecret                                        │              │
+│  │ → Secrets Manager generates new random password              │              │
+│  │ → Creates new version (v2) with label AWSPENDING            │              │
+│  │ → New value: {username: glue_reader_b, password: [REDACTED:PASSWORD]}   │              │
+│  │ → Database NOT touched yet                                   │              │
+│  │ → Services still using v1 [AWSCURRENT] → no disruption      │              │
+│  │                                                               │              │
+│  │ State after step 1:                                           │              │
+│  │ v1 [AWSCURRENT]: glue_reader_a / OldP@ssw0rd123 ← active   │              │
+│  │ v2 [AWSPENDING]: glue_reader_b / NewP@ss         ← pending  │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ STEP 2: setSecret                                           │              │
+│  │ → Lambda connects to MariaDB using ADMIN credentials         │              │
+│  │ → Executes: ALTER USER glue_reader_b SET PASSWORD = [REDACTED:PASSWORD] │              │
+│  │ → Database now accepts BOTH old (reader_a) and new (reader_b)│              │
+│  │ → Services still using reader_a → no disruption              │              │
+│  │                                                               │              │
+│  │ State after step 2:                                           │              │
+│  │ MariaDB: reader_a works ✅, reader_b works ✅ (BOTH valid)   │              │
+│  │ Secret: v1 [AWSCURRENT] still points to reader_a             │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ STEP 3: testSecret                                          │              │
+│  │ → Lambda retrieves AWSPENDING version (v2)                   │              │
+│  │ → Attempts to connect to MariaDB with new credentials        │              │
+│  │ → Runs: SELECT 1 (simple connectivity test)                  │              │
+│  │ → If SUCCESS: proceed to step 4                              │              │
+│  │ → If FAILURE: rotation ABORTS — old password stays active    │              │
+│  │                                                               │              │
+│  │ SAFETY NET: if new password doesn't work, nothing changes    │              │
+│  │ → v1 [AWSCURRENT] still active → services unaffected        │              │
+│  │ → Rotation marked as FAILED → CloudWatch alarm → investigate │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ STEP 4: finishSecret                                        │              │
+│  │ → Move AWSCURRENT label from v1 to v2                        │              │
+│  │ → Move AWSPREVIOUS label from v0 to v1                       │              │
+│  │ → Now: v2 [AWSCURRENT] = reader_b / NewP@ss                 │              │
+│  │ → Now: v1 [AWSPREVIOUS] = reader_a / OldP@ssw0rd123         │              │
+│  │ → Next service call: gets v2 (new credentials)               │              │
+│  │ → Cached services: still use v1 for up to cache TTL          │              │
+│  │ → BOTH passwords work during cache transition                │              │
+│  │                                                               │              │
+│  │ State after step 4:                                           │              │
+│  │ v2 [AWSCURRENT]: glue_reader_b / NewP@ss         ← active   │              │
+│  │ v1 [AWSPREVIOUS]: glue_reader_a / OldP@ssw0rd123 ← backup   │              │
+│  │ MariaDB: reader_a works ✅, reader_b works ✅ (BOTH valid)   │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  TIMELINE OF A ROTATION:                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐           │
+│  │ T+0s:  Rotation triggered (schedule or manual)                │           │
+│  │ T+1s:  createSecret — new password generated                  │           │
+│  │ T+3s:  setSecret — database updated                           │           │
+│  │ T+5s:  testSecret — new credentials verified                  │           │
+│  │ T+6s:  finishSecret — labels swapped                          │           │
+│  │ T+7s:  Rotation COMPLETE                                      │           │
+│  │                                                                │           │
+│  │ T+0 to T+7: ALL services use OLD password (AWSCURRENT = v1)  │           │
+│  │ T+7 onward: NEW services get NEW password (AWSCURRENT = v2)  │           │
+│  │ T+7 to T+3607: cached services may still use OLD password    │           │
+│  │ T+3607: ALL services using NEW password (cache expired)       │           │
+│  │                                                                │           │
+│  │ ZERO DOWNTIME: at every point, at least one valid password    │           │
+│  └────────────────────────────────────────────────────────────────┘           │
+│                                                                               │
+│  HOW SERVICES RETRIEVE SECRETS:                                               │
+│                                                                               │
+│  import boto3                                                                 │
+│  sm = boto3.client("secretsmanager")                                          │
+│  response = sm.get_secret_value(SecretId="quickcart/prod/mariadb/glue-reader")│
+│  secret = json.loads(response["SecretString"])                                │
+│  # secret = {"username": "glue_reader_b", "password": "[REDACTED:PASSWORD]", ...}        │
+│                                                                               │
+│  DEFAULT: returns AWSCURRENT version                                          │
+│  EXPLICIT: get_secret_value(SecretId=..., VersionStage="AWSPREVIOUS")         │
+│                                                                               │
+│  CACHING (recommended):                                                       │
+│  from aws_secretsmanager_caching import SecretCache                           │
+│  cache = SecretCache()                                                        │
+│  secret = cache.get_secret_string("quickcart/prod/mariadb/glue-reader")       │
+│  → Caches for 1 hour by default → reduces API calls                          │
+│  → After rotation: new value picked up within 1 hour                          │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Rotation succeeded but Glue job fails 2 hours later"
+</span>→ Cause: Glue Connection caches credentials from PREVIOUS job run
+→ Glue doesn't re-fetch secret on every run — uses cached connection
+→ Fix: Glue ETL script explicitly calls get_secret_value() at start
+→ Or: restart Glue Connection test to force re-cache
+
+PITFALL 2: "Rotation Lambda can't connect to MariaDB"
+→ Cause: Rotation Lambda not in VPC, MariaDB on private subnet
+→ Rotation Lambda must reach MariaDB to change password (step 2)
+→ Fix: Deploy rotation Lambda in same VPC/subnet as Glue ENIs
+→ Same VPC Peering path as Glue (Project 61)
+
+PITFALL 3: "testSecret fails: Access denied for glue_reader_b"
+→ Cause: glue_reader_b user exists but lacks GRANT permissions
+→ Password changed but user can't access database
+→ Fix: ensure BOTH alternating users have IDENTICAL grants
+→ CREATE USER glue_reader_b → GRANT same as glue_reader_a
+
+PITFALL 4: "Secret rotated but dashboard still uses old password"
+→ Cause: Superset JDBC connection caches password in config file
+→ Superset doesn't call Secrets Manager — uses static config
+→ Fix: custom Superset auth hook that reads from Secrets Manager
+→ Or: Superset restart after rotation (less elegant but works)
+
+PITFALL 5: "All 4 secrets rotated on same day — Lambda throttled"
+→ Cause: 4 rotation Lambdas invoke simultaneously → API throttle
+→ Secrets Manager API: 5,000 requests/second (unlikely to hit)
+→ More likely: MariaDB connection limit hit by 4 simultaneous rotations
+→ Fix: stagger rotation schedules (day 1, day 8, day 15, day 22)
+
+PITFALL 6: "Rotation works but CloudTrail shows 1000s of GetSecretValue calls"
+→ Cause: every Glue task (10 DPU × 4 tasks each) calls get_secret_value()
+→ 40 calls per job run × 30 runs/day = 1,200 calls/day
+→ Cost: $0.05/10K calls = negligible ($0.006/day)
+→ But: CloudTrail log volume increases
+→ Fix: use caching library → reduces to 1 call per hour per Lambda
+
+PITFALL 7: "Secret deleted accidentally — all pipelines down"
+→ Cause: someone ran aws secretsmanager delete-secret
+→ ALL services referencing this secret → authentication failure
+→ Fix: enable deletion protection (DeletionPolicy: Retain in CloudFormation)
+→ Recovery: Secrets Manager has 7-30 day recovery window before permanent deletion
+→ aws secretsmanager restore-secret --secret-id &lt;name&gt;
+
+PITFALL 8: "Rotation Lambda has permission to read ALL secrets"
+→ Cause: IAM policy allows secretsmanager:* on Resource: *
+→ Rotation Lambda for MariaDB can read Redshift secret (shouldn't need to)
+→ Fix: scope each rotation Lambda to its specific secret ARN only</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>NUMBER OF SECRETS:
+</span>→ 4 secrets (current): trivial — $1.60/month
+→ 20 secrets (10 services × 2 envs): $8/month
+→ 100 secrets (enterprise): $40/month
+→ 1000 secrets (large enterprise): $400/month
+→ Cost scales linearly — no volume discount
+
+API CALL SCALING:
+→ Without caching: N services × M calls/day × 30 days
+→ 10 services × 100 calls/day = 30,000/month = $0.15
+→ With caching: 10 services × 24 calls/day (hourly) = 7,200/month = $0.04
+→ API call cost is NEGLIGIBLE at any scale
+
+ROTATION LAMBDA SCALING:
+→ Each secret needs its own rotation Lambda (or shared Lambda with routing)
+→ 4 secrets × 1 Lambda = 4 Lambdas (current)
+→ 20 secrets: use shared Lambda with secret-type routing
+→ Template: AWS provides rotation templates for MySQL, PostgreSQL, Redshift
+
+MULTI-ACCOUNT SCALING:
+→ Account A has MariaDB → secret in Account A's Secrets Manager
+→ Account B needs to read it → cross-account secret access
+→ OR: replicate secret to Account B's Secrets Manager
+→ Best practice: secret lives where database lives → cross-account read</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(70)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: Create Secrets in Secrets Manager</h3>
+
+<hr>
+<h3>PART 2: Secret Retrieval Helper Module</h3>
+
+<hr>
+<h3>PART 3: Update All Services to Use Secrets Manager</h3>
+
+<hr>
+<h3>PART 4: Rotation Lambda and Schedule</h3>
+
+<hr>
+<h3>PART 5: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER — SECRETS MANAGER MIGRATION</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PHASE 1: CREATE SECRETS (Day 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create MariaDB alternating users (Account A)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    On MariaDB host:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    CREATE USER 'glue_reader_a'@'10.2.%' IDENTIFIED BY '&lt;password&gt;';</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    CREATE USER 'glue_reader_b'@'10.2.%' IDENTIFIED BY '&lt;password&gt;';</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    GRANT SELECT ON quickcart.* TO 'glue_reader_a'@'10.2.%';</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    GRANT SELECT ON quickcart.* TO 'glue_reader_b'@'10.2.%';</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    FLUSH PRIVILEGES;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Create secrets in Secrets Manager</span><span>
+</span>python 70_01_create_secrets.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PHASE 2: UPDATE ALL SERVICES (Day 2-3)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Upload secret helper module to S3 for Glue jobs</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    aws s3 cp 70_02_secret_helper.py s3://quickcart-analytics-scripts/lib/secret_helper.py</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Update all services to use Secrets Manager</span><span>
+</span>python 70_03_update_services.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Test all pipelines manually</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Run CDC Glue job → verify MariaDB connection via secret</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Run MV refresh Lambda → verify Redshift connection via secret</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Run Athena federated query → verify MySQL connector</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Open Superset dashboard → verify Redshift JDBC</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PHASE 3: ENABLE ROTATION (Day 4-5)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Deploy rotation Lambdas (via AWS Console → SAR)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Template: SecretsManagerRDSMySQLRotationMultiUser</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Template: SecretsManagerRedshiftRotationSingleUser</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Configure rotation schedules</span><span>
+</span>python 70_04_setup_rotation.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Test manual rotation</span><span>
+</span>python 70_04_setup_rotation.py --test
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 9. Verify all services after rotation</span><span>
+</span>python 70_04_setup_rotation.py --verify
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PHASE 4: CLEANUP AND AUDIT (Day 6-7)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 10. Remove all hardcoded passwords from:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → Python scripts (replace with secret_helper.get_secret())</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → Lambda environment variables (replaced with SECRET_ARN)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → Glue job arguments (replaced with secret reference)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → Git repositories (search for password patterns)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 11. Generate compliance audit report</span><span>
+</span>python 70_04_setup_rotation.py --audit
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 12. Set up rotation monitoring</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → CloudWatch alarm on rotation Lambda errors</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#     → Monthly audit report generation (Lambda on schedule)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ONGOING: AUTOMATIC ROTATION (every 90 days)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ═══════════════════════════════════════════════════════════</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Day 1: MariaDB secret rotates automatically</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Day 8: Redshift secret rotates automatically (staggered)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># All services: pick up new credentials within 1 hour (cache TTL)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Zero downtime: alternating users ensure overlap</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Audit: CloudTrail logs every GetSecretValue call</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Monitoring: alarm if rotation fails</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE vs AFTER — CREDENTIAL MANAGEMENT:
+</span>
+┌──────────────────────────────────────────────────────────────────────────┐
+│ BEFORE (insecure):                                                       │
+│                                                                          │
+│ → Passwords hardcoded in 15+ locations                                  │
+│ → Same password for 12 months (never rotated)                           │
+│ → Visible in: Glue console, Lambda env vars, Git repos, CloudWatch logs │
+│ → Password change = update 15 configs manually = 4 hours + errors       │
+│ → No audit trail: can't answer "who accessed this credential?"          │
+│ → Dev and Prod share same password                                       │
+│ → Credential leak = permanent unauthorized access                        │
+│                                                                          │
+│ SECURITY SCORE: ❌❌❌ (critical vulnerabilities)                        │
+├──────────────────────────────────────────────────────────────────────────┤
+│ AFTER (secure):                                                          │
+│                                                                          │
+│ → Passwords centralized in Secrets Manager (single source of truth)     │
+│ → Auto-rotated every 90 days (SOC 2 compliant)                         │
+│ → Zero hardcoded passwords in code, env vars, or configs                │
+│ → Password change = automatic (rotation Lambda) = 0 manual effort       │
+│ → Full audit trail: CloudTrail logs every access                        │
+│ → Different credentials per environment (dev ≠ staging ≠ prod)          │
+│ → Credential leak = 90-day window (not permanent)                       │
+│ → Zero downtime rotation (alternating users)                            │
+│ → Resource policies: each role reads ONLY its needed secrets            │
+│                                                                          │
+│ SECURITY SCORE: ✅✅✅ (SOC 2 compliant)                                │
+│                                                                          │
+│ COST:                                                                    │
+│ → Secrets Manager: 4 secrets × $0.40 = $1.60/month                     │
+│ → API calls: ~$0.05/month                                               │
+│ → Rotation Lambdas: ~$0.01/month (run once per 90 days)                │
+│ → TOTAL: ~$1.66/month for enterprise-grade credential management        │
+│                                                                          │
+│ vs COST OF A CREDENTIAL BREACH:                                          │
+│ → Average data breach cost: $4.45 million (IBM 2023 report)             │
+│ → $1.66/month is the cheapest insurance in the entire platform          │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Secrets Manager: centralized, encrypted, versioned, auditable credential storage
+→ NEVER hardcode passwords — in code, env vars, connection properties, or configs
+→ Rotation strategy: alternating users (A/B) → zero downtime during rotation
+→ 4-step rotation: createSecret → setSecret → testSecret → finishSecret
+→ AWSCURRENT/AWSPREVIOUS labels: ensure old password works during transition
+→ Caching: retrieve once, cache 1 hour → reduces API calls, picks up rotation
+→ Redshift Data API SecretArn: no password in Lambda code at all
+→ Glue Connection SECRET_ID: Glue retrieves credentials from secret at runtime
+→ Resource policies: scope each role to ONLY its needed secrets
+→ CloudTrail audit: every GetSecretValue logged (who, when, which secret)
+→ Test rotation MANUALLY before enabling automatic schedule
+→ Stagger rotation schedules: don't rotate all secrets on same day
+→ Rotation Lambda needs VPC access: must reach database to change password
+→ SOC 2 compliance: 90-day rotation + audit trail + least-privilege access
+→ Cost: $1.66/month — cheapest insurance in the entire platform
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 8: MariaDB setup — passwords created here, now managed by SM
+  → Project 10: Redshift setup — cluster credentials now in SM
+  → Project 31: Glue JDBC — connection now references secret ARN
+  → Project 56: Cross-account IAM — external_id now in SM
+  → Project 61: Cross-account ETL — MariaDB creds now from SM
+  → Project 63: MV refresh Lambda — Redshift creds now from SM
+  → Project 65: CDC merge — Data API now uses SecretArn
+  → Project 66: Event-driven pipeline — all Lambdas use SM
+  → Project 67: Redshift Serverless — Data API SecretArn parameter
+  → Project 69: Cost optimization — SM cost: $1.66/month (negligible)
+
+→ FORWARD:
+  → Project 71: Data Mesh — each domain manages its own secrets
+  → Project 74: Lake Formation — credential management for governed access
+  → Project 75: DR — secrets must be replicated to DR region
+  → Project 76: CI/CD — secret ARNs in deployment configs (not values)
+  → Project 78: SLA pipeline — rotation failures are SLA-impacting events
+  → Project 79: Migration — on-prem credentials migrated to SM
+  → Project 80: Capstone — security is key interview discussion topic</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Credential management is now enterprise-grade. Auto-rotation. Audit trail.
+</span>Zero hardcoded passwords. SOC 2 compliant.
+
+THEN: The CDO (Chief Data Officer) announces the next strategic initiative:
+
+→ QuickCart now has 5 AWS accounts:
+  - Account A: Operations (MariaDB)
+  - Account B: Analytics (Redshift, S3 Data Lake, Glue)
+  - Account C: Marketing (DynamoDB, S3)
+  - Account D: Finance (new — needs its own data products)
+  - Account E: Customer Success (new — needs customer analytics)
+
+→ Current problem: Account B is the BOTTLENECK
+  - Every team asks Account B to build their pipelines
+  - Data Engineering team: 3 people serving 5 departments
+  - Backlog: 47 data requests, 6-month wait time
+  - Each department wants different data products
+  - Central team can't scale to meet demand
+
+→ Data Mesh principle: DECENTRALIZE data ownership
+  - Each department OWNS and PUBLISHES their data products
+  - Shared infrastructure: S3, Glue Catalog, governance
+  - Central team: provides platform, not pipelines
+  - Self-service: departments build their own ETL
+
+CDO: "We need a Data Mesh. Each team owns their domain data.
+      They publish data products. Other teams can discover and consume.
+      Central platform team provides guardrails, not gatekeeping."
+
+→ Project 71: "Build a Multi-Account Data Mesh: Producers Publish, Consumers Subscribe"
+→ Introduces: Data Mesh → Domain Ownership → Data Products
+             → Publish/Subscribe via Glue + S3 + Redshift Data Sharing
+             → Self-Service with Governance</code></pre></div>
+<hr>
+</div>
+</div>
+
+
+<!-- ========== data-index="5" ========== -->
+<div class="chat-message" data-index="5"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-69.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 70 of 80</span>
+    <span class="nav-project-title">ROTATE DB CREDENTIALS WITHOUT BREAKING ANY PIPELINE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-71.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-71.html") window.location = "project-71.html";
+  if (e.key === 'ArrowLeft' && "project-69.html") window.location = "project-69.html";
+});
+</script>
+</body>
+</html>

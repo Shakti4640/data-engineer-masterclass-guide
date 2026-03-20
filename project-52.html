@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 52: PIPELINE LOAD SPIKES — EC2 WORKERS MUST SCALE AUTOMATICALLY — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:65%"></div></div>
+<div id="progress-label">65%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 52 of 80</div>
+  <div class="project-title">PIPELINE LOAD SPIKES — EC2 WORKERS MUST SCALE AUTOMATICALLY</div>
+  <div class="project-tags"><span class="project-tag">EC2</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Black Friday approaching
+</span>Team: 8 engineers, 3 data engineers
+
+CURRENT ARCHITECTURE (from Projects 27, 28, 51):
+→ SNS topic fans out to 4 filtered SQS queues (Project 51)
+→ Each queue has ONE EC2 worker polling and processing (Project 27)
+→ Workers are manually launched, manually managed
+
+NORMAL DAY (Monday):
+→ ETL Queue:   ~5,000 messages/day → 1 worker handles easily
+→ Order Queue: ~50,000 messages/day → 1 worker handles with margin
+→ Alert Queue: ~200 messages/day → 1 worker barely awake
+
+BLACK FRIDAY (actual numbers from last year):
+→ ETL Queue:   ~500,000 messages/day (100x spike at midnight)
+→ Order Queue: ~5,000,000 messages/day (100x spike at 6 AM)
+→ Alert Queue: ~50,000 messages/day (cascading failures)
+
+WHAT HAPPENED LAST BLACK FRIDAY:
+→ 12:01 AM: File landing events flood ETL Queue
+→ 12:15 AM: Single ETL worker backlog hits 200,000 messages
+→ 12:30 AM: Visibility timeout expires → messages re-appear → duplicates
+→ 1:00 AM:  On-call engineer wakes up, SSH into EC2, manually starts 5 more workers
+→ 1:30 AM:  Backlog starts draining
+→ 6:00 AM:  Order Queue explodes → same problem
+→ 6:15 AM:  Engineer manually starts 20 more Order workers
+→ 11:00 PM: Traffic normalizes → 25 idle workers still running
+→ COST: 25 workers × 23 hours × $0.10/hr = $57.50 wasted on idle machines
+→ SLA BREACHED: 90 minutes of processing delay
+
+CTO: "This cannot happen again. Workers must scale UP when queue
+      grows and scale DOWN when queue empties — automatically."
+
+REQUIREMENTS:
+→ Scale OUT when queue depth &gt; 1,000 messages (add workers)
+→ Scale IN when queue depth &lt; 100 messages (remove workers)
+→ Minimum: 1 worker always running (baseline)
+→ Maximum: 20 workers (budget cap)
+→ Scale-out must happen within 3 minutes
+→ Scale-in must wait 15 minutes of low traffic (avoid thrashing)
+→ Each filtered queue (from Project 51) scales INDEPENDENTLY</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand what Auto Scaling Group (ASG) does
+</span>→ Manages a FLEET of EC2 instances as one unit
+→ Automatically launches new instances (scale out)
+→ Automatically terminates idle instances (scale in)
+→ Maintains desired count even if an instance dies (self-healing)
+→ Distributes across Availability Zones (high availability)
+
+Step 2: Understand the scaling trigger
+→ We need: "when SQS queue has many messages → add EC2 workers"
+→ SQS publishes metric: ApproximateNumberOfMessagesVisible (to CloudWatch)
+→ CloudWatch Alarm watches this metric
+→ Alarm triggers ASG scaling policy
+→ ASG launches/terminates EC2 instances
+
+Step 3: Understand Launch Template
+→ Defines WHAT to launch: AMI, instance type, security group, IAM role
+→ Includes User Data script: bootstrap the worker on boot
+→ Worker script auto-starts, auto-connects to SQS, auto-processes
+→ No SSH needed — fully automated
+
+Step 4: Design the scaling chain
+→ SQS Queue (metric source)
+   → CloudWatch Alarm (decision maker)
+     → ASG Scaling Policy (action taker)
+       → EC2 Launch Template (instance blueprint)
+         → Worker Script (actual processing)
+
+Step 5: Choose scaling strategy
+→ Option A: Simple Scaling — 1 alarm = 1 action (add N instances)
+→ Option B: Step Scaling — different actions at different thresholds
+→ Option C: Target Tracking — maintain metric at target value (simplest)
+→ We use Step Scaling for fine-grained control + Target Tracking for comparison</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────┐
+│                    ETL PIPELINE AUTO-SCALING                         │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  quickcart-etl-queue (SQS)                                           │
+│       │                                                              │
+│       │ publishes metric every 5 min                                 │
+│       ▼                                                              │
+│  CloudWatch Metric: ApproximateNumberOfMessagesVisible               │
+│       │                                                              │
+│       ├──→ Alarm: ETL-Queue-High (&gt; 1,000 msgs)                     │
+│       │         │                                                    │
+│       │         ▼                                                    │
+│       │    ASG Policy: Scale OUT                                     │
+│       │    ┌─────────────────────────────────────────┐               │
+│       │    │ 1,000 - 5,000 msgs  → add 2 instances  │               │
+│       │    │ 5,000 - 20,000 msgs → add 5 instances  │               │
+│       │    │ 20,000+ msgs        → add 10 instances │               │
+│       │    └─────────────────────────────────────────┘               │
+│       │                                                              │
+│       └──→ Alarm: ETL-Queue-Low (&lt; 100 msgs for 15 min)             │
+│                 │                                                    │
+│                 ▼                                                    │
+│            ASG Policy: Scale IN                                      │
+│            ┌─────────────────────────────────────────┐               │
+│            │ &lt; 100 msgs for 15 min → remove 2       │               │
+│            │ 0 msgs for 15 min     → scale to min 1 │               │
+│            └─────────────────────────────────────────┘               │
+│                                                                      │
+│  Auto Scaling Group: quickcart-etl-workers-asg                       │
+│  ┌────────────────────────────────────────────────┐                  │
+│  │ Min: 1    Desired: 1    Max: 20                │                  │
+│  │                                                 │                  │
+│  │ Launch Template: quickcart-etl-worker-lt        │                  │
+│  │ → AMI: Amazon Linux 2023                        │                  │
+│  │ → Type: t3.medium                               │                  │
+│  │ → IAM Role: EC2-SQS-Worker-Role (Project 6)    │                  │
+│  │ → User Data: bootstrap + start worker.py        │                  │
+│  │                                                 │                  │
+│  │ Instances:                                      │                  │
+│  │ ┌─────────┐ ┌─────────┐ ┌─────────┐           │                  │
+│  │ │Worker-1 │ │Worker-2 │ │Worker-3 │  ...       │                  │
+│  │ │ (AZ-a)  │ │ (AZ-b)  │ │ (AZ-a)  │           │                  │
+│  │ └────┬────┘ └────┬────┘ └────┬────┘           │                  │
+│  │      │           │           │                  │                  │
+│  │      └───────────┼───────────┘                  │                  │
+│  │                  │                               │                  │
+│  │                  ▼                               │                  │
+│  │         quickcart-etl-queue                      │                  │
+│  │         (all workers poll same queue)            │                  │
+│  └────────────────────────────────────────────────┘                  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+KEY INSIGHT:
+→ Multiple workers can poll the SAME SQS queue safely
+→ SQS Visibility Timeout ensures no two workers process same message
+→ (Covered in Project 13 and Project 27)
+→ More workers = faster drain rate = lower backlog</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Manual scaling (current — last Black Friday disaster)
+</span>→ Engineer SSHs in, starts more worker processes
+→ Forgets to stop them after → wasted cost
+→ 3 AM response time → SLA breach
+
+Option B: Cron-based scheduled scaling
+→ Scale to 20 workers at 11 PM every Black Friday
+→ Scale back at midnight
+→ PROBLEMS: doesn't handle unexpected spikes (random viral product)
+→ Over-provisions on slow days → wasted cost
+
+Option C: CloudWatch Alarm + ASG Step Scaling (this project) ✅
+→ React to ACTUAL queue depth — not predicted load
+→ Step policies: proportional response to backlog size
+→ Scale-in cooldown prevents thrashing
+→ Fully automatic — zero human intervention
+
+Option D: Target Tracking Scaling
+→ Tell ASG: "keep backlog per instance at 500 messages"
+→ ASG calculates how many instances needed
+→ Simpler to configure but less fine-grained control
+→ We implement BOTH for comparison
+
+Option E: Lambda consumers instead of EC2
+→ Each message triggers a Lambda invocation
+→ Infinite auto-scaling built-in
+→ PROBLEMS: 15-min max runtime, cold starts, cost at high volume
+→ Better for lightweight processing, not heavy ETL
+
+DECISION: Option C (Step Scaling) + Option D (Target Tracking demo)
+→ Reason: production-grade, cost-efficient, fully automated
+→ Step scaling for fine-grained control on ETL Queue
+→ Target tracking for simplicity comparison</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use Launch Template (NOT Launch Configuration)
+</span>   → Launch Configuration is legacy — cannot be modified after creation
+   → Launch Template supports versioning, defaults, overrides
+   → Can create new versions without recreating ASG
+
+2. Include FULL worker bootstrap in User Data
+   → Install Python, pip, dependencies
+   → Download worker script from S3 (not baked into AMI)
+   → Start worker as systemd service (survives reboot)
+   → This way: update worker script in S3, launch new instance = new code
+
+3. Use IAM Instance Profile (from Project 6)
+   → EC2 workers need: sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes
+   → Plus whatever the processing logic needs (s3:GetObject, etc.)
+   → NEVER put credentials in User Data
+
+4. Spread across multiple Availability Zones
+   → ASG distributes instances across AZs automatically
+   → If one AZ goes down, workers in other AZs continue processing
+   → Queue doesn't care which AZ the worker is in
+
+5. Set scale-in cooldown period (300-900 seconds)
+   → After removing an instance, WAIT before removing another
+   → Prevents "scale in too fast → queue grows → scale out again" thrashing
+   → 15 minutes is a good default for data workloads
+
+6. Enable instance scale-in protection for active workers
+   → If a worker is mid-processing a batch, don't terminate it
+   → Use lifecycle hooks OR application-level protection
+
+7. Tag ASG instances for cost tracking
+   → Tag: AutoScalingGroup=quickcart-etl-workers
+   → Tag: CostCenter=Data-Engineering
+   → Shows up in AWS Cost Explorer per-ASG
+
+8. Set up SNS notification on ASG scaling events
+   → Know when instances are launched/terminated
+   → Useful for debugging and audit trails
+   → Reuses SNS knowledge from Projects 12, 51</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT scale on CPU/Memory metrics for queue workers
+</span>   → CPU can be low even with 500K message backlog
+   → Worker may be I/O-bound (waiting on S3, Redshift)
+   → Scale on QUEUE DEPTH — that's the actual demand signal
+
+2. DO NOT set scale-in cooldown too short (&lt;5 minutes)
+   → Scenario: queue drains → scale in → new messages arrive → scale out
+   → Repeat every 2 minutes = thrashing
+   → Each launch/terminate costs time + money
+   → Minimum 10-15 minutes for data workloads
+
+3. DO NOT use the same ASG for different queue types
+   → ETL workers and Order workers have different:
+     - Instance types (ETL needs more memory)
+     - Scaling thresholds (ETL tolerates higher backlog)
+     - Processing logic
+   → One ASG per queue type (from Project 51 filtered routing)
+
+4. DO NOT forget to handle graceful shutdown
+   → ASG sends SIGTERM before terminating an instance
+   → Worker must: finish current message, delete from queue, then exit
+   → If worker is killed mid-processing: message re-appears after visibility timeout
+   → Idempotent processing (from Project 27) is critical
+
+5. DO NOT set Max too high without budget approval
+   → 20 × t3.medium × 24 hours = $38.40/day = $1,152/month
+   → If bug causes infinite scale-out: massive bill
+   → Set Max conservatively, increase only when proven needed
+
+6. DO NOT bake worker code into AMI
+   → AMI rebuild takes 15-30 minutes
+   → Code changes require new AMI → new Launch Template version → rolling update
+   → Instead: download latest code from S3 on boot (User Data)
+   → Code update = upload to S3 + terminate old instances
+
+7. DO NOT ignore Desired Capacity vs Min Capacity
+   → Min = absolute minimum (even during zero traffic)
+   → Desired = current target (ASG adjusts this via scaling policies)
+   → If you set Desired=10 manually, scaling policies override it
+   → Set initial Desired = Min, let policies manage from there</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────┬──────────────────────┬──────────────────────────────────────────────┐
+</span>│ Scenario                       │ Use                  │ Why                                          │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Scale based on queue depth     │ SQS + CloudWatch +   │ Direct demand signal — queue IS the backlog  │
+│ (this project)                 │ ASG Step Scaling     │                                              │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Scale based on simple target   │ ASG Target Tracking  │ "Keep backlog/instance at X" — simplest      │
+│ (demo in this project)         │                      │ setup, ASG calculates instance count          │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Predictable daily load pattern │ ASG Scheduled Scaling│ Scale to 10 at 6PM, back to 2 at 6AM        │
+│                                │                      │ Combine with dynamic for spikes               │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Web server traffic scaling     │ ALB + ASG + CPU      │ RequestCount or CPU → scale web tier          │
+│                                │ Target Tracking      │ Not relevant for queue-based data pipelines   │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Lightweight per-message tasks  │ Lambda + SQS trigger │ Auto-scales to 1000 concurrent invocations    │
+│ (&lt;15 min each)                 │                      │ No infrastructure to manage                   │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Container-based workers        │ ECS/Fargate + SQS    │ Same concept but with containers, not EC2     │
+│                                │ + Application Auto   │ Better for microservices architecture          │
+│                                │ Scaling              │                                               │
+├────────────────────────────────┼──────────────────────┼──────────────────────────────────────────────┤
+│ Kubernetes workers             │ KEDA + SQS           │ K8s-native autoscaler based on queue metrics  │
+│                                │                      │ Beyond scope of this project                  │
+└────────────────────────────────┴──────────────────────┴──────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE EC2 AUTO SCALING FOR QUEUE PROCESSING</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When each message takes &lt; 30 seconds to process
+</span>   → Lambda is cheaper and simpler
+   → Lambda SQS trigger handles scaling automatically
+   → No ASG, no Launch Template, no User Data
+
+2. When processing requires GPU
+   → GPU instances (p3, g4) have limited availability
+   → ASG may fail to launch if no GPU capacity
+   → Use: reserved GPU instances + manual management
+   → Or: SageMaker Processing for ML workloads
+
+3. When processing requires licensed software per-instance
+   → Each new EC2 = new license cost
+   → Scaling to 20 instances = 20 licenses
+   → Use: fixed fleet with queue prioritization instead
+
+4. When message volume is steady (no spikes)
+   → Fixed 2 workers handle 100K messages/day consistently
+   → Auto scaling adds complexity for zero benefit
+   → Use: simple EC2 fleet with CloudWatch alarm for anomalies
+
+5. When processing is stateful (must resume from exact point)
+   → ASG can terminate any instance during scale-in
+   → Stateful processing loses in-progress work
+   → Use: ECS with persistent volumes, or EBS-backed instances with lifecycle hooks</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│              EC2 AUTO SCALING — INTERNAL MECHANICS                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  COMPONENT 1: LAUNCH TEMPLATE                                                │
+│  ═════════════════════════════                                               │
+│  Blueprint for every instance ASG will launch                                │
+│  Contains:                                                                   │
+│  → AMI ID: which OS image to use                                             │
+│  → Instance Type: t3.medium, c5.xlarge, etc.                                 │
+│  → Key Pair: SSH access (optional for automated workers)                     │
+│  → Security Group: network access rules                                      │
+│  → IAM Instance Profile: what AWS services the instance can access           │
+│  → User Data: bash script that runs ON FIRST BOOT                            │
+│  → Block Device Mappings: EBS volume config                                  │
+│  → Tags: propagated to every launched instance                               │
+│                                                                              │
+│  Versioning:                                                                 │
+│  → v1: initial worker code                                                   │
+│  → v2: updated dependencies                                                 │
+│  → v3: new processing logic                                                 │
+│  → ASG can use: $Latest, $Default, or specific version                       │
+│                                                                              │
+│  COMPONENT 2: AUTO SCALING GROUP (ASG)                                       │
+│  ═════════════════════════════════════                                        │
+│  The MANAGER that maintains a fleet of identical instances                    │
+│                                                                              │
+│  Core settings:                                                              │
+│  → MinSize: never go below this (e.g., 1)                                    │
+│  → MaxSize: never go above this (e.g., 20)                                   │
+│  → DesiredCapacity: current target (e.g., 3)                                 │
+│  → VPC Subnets: which AZs to spread across                                  │
+│  → Health Check: how to detect unhealthy instances                           │
+│                                                                              │
+│  ASG CONTROL LOOP (runs continuously):                                       │
+│  ┌──────────────────────────────────────────────────┐                        │
+│  │ 1. Count running instances                        │                        │
+│  │ 2. Compare to DesiredCapacity                     │                        │
+│  │ 3. If running &lt; desired → LAUNCH new instances    │                        │
+│  │ 4. If running &gt; desired → TERMINATE excess        │                        │
+│  │ 5. If instance unhealthy → TERMINATE + replace    │                        │
+│  │ 6. Wait → repeat                                  │                        │
+│  └──────────────────────────────────────────────────┘                        │
+│                                                                              │
+│  SELF-HEALING:                                                               │
+│  → Worker crashes → ASG health check detects → terminates → launches new     │
+│  → AZ goes down → instances lost → ASG launches in surviving AZs             │
+│  → No human intervention needed                                              │
+│                                                                              │
+│  COMPONENT 3: SCALING POLICIES                                               │
+│  ═════════════════════════════                                                │
+│  Rules that CHANGE DesiredCapacity based on metrics                          │
+│                                                                              │
+│  TYPE A: SIMPLE SCALING                                                      │
+│  → One alarm → one action                                                    │
+│  → "If queue &gt; 1000 → add 2 instances"                                       │
+│  → Cooldown period before next evaluation                                    │
+│  → LIMITATION: only one step, can't scale proportionally                     │
+│                                                                              │
+│  TYPE B: STEP SCALING (used in this project)                                 │
+│  → One alarm → MULTIPLE actions at different thresholds                      │
+│  → "If queue 1000-5000 → add 2"                                             │
+│  → "If queue 5000-20000 → add 5"                                            │
+│  → "If queue 20000+ → add 10"                                               │
+│  → Evaluates continuously — no cooldown between steps                        │
+│  → MORE RESPONSIVE than Simple Scaling                                       │
+│                                                                              │
+│  TYPE C: TARGET TRACKING (also demonstrated)                                 │
+│  → "Keep ApproximateNumberOfMessages / InstanceCount = 500"                  │
+│  → ASG auto-creates alarms and policies internally                           │
+│  → SIMPLEST to configure — just set the target value                         │
+│  → Internally: creates both scale-out and scale-in alarms                    │
+│                                                                              │
+│  COMPONENT 4: CLOUDWATCH INTEGRATION                                         │
+│  ════════════════════════════════════                                         │
+│                                                                              │
+│  SQS → CloudWatch (automatic, free):                                         │
+│  → ApproximateNumberOfMessagesVisible (backlog)                              │
+│  → ApproximateNumberOfMessagesNotVisible (in-flight)                         │
+│  → ApproximateNumberOfMessagesDelayed (delayed queue)                        │
+│  → Published every 5 minutes (1-minute with detailed monitoring)             │
+│                                                                              │
+│  Custom Metric (for target tracking):                                        │
+│  → BacklogPerInstance = MessagesVisible / InstanceCount                      │
+│  → Must be published manually (Python script or Lambda)                      │
+│  → This is what Target Tracking optimizes against                            │
+│                                                                              │
+│  SCALING TIMELINE (worst case):                                              │
+│  ┌──────────────────────────────────────────────────────────────┐            │
+│  │ T+0:00  Messages flood into SQS queue                        │            │
+│  │ T+1:00  CloudWatch receives SQS metric (1-5 min lag)         │            │
+│  │ T+1:30  Alarm evaluates → transitions to ALARM state         │            │
+│  │ T+1:30  ASG receives scaling action                           │            │
+│  │ T+2:00  ASG calls EC2 RunInstances API                        │            │
+│  │ T+2:30  Instance enters "Pending" state                       │            │
+│  │ T+3:00  Instance enters "Running" state                       │            │
+│  │ T+3:30  User Data script installs dependencies                │            │
+│  │ T+4:00  Worker script starts polling SQS                      │            │
+│  │                                                                │            │
+│  │ TOTAL: ~4 minutes from spike to first message processed       │            │
+│  │ (Can be reduced to ~2 min with pre-baked AMI + 1-min metrics) │            │
+│  └──────────────────────────────────────────────────────────────┘            │
+│                                                                              │
+│  SCALE-IN MECHANICS:                                                         │
+│  ═══════════════════                                                         │
+│  → ASG selects instance to terminate based on POLICY:                        │
+│    Default: "OldestInstance" in AZ with most instances                       │
+│    Options: OldestLaunchTemplate, ClosestToNextBillingHour, Random           │
+│  → Sends SIGTERM to instance (if lifecycle hook configured)                  │
+│  → Worker receives signal → finishes current message → exits                 │
+│  → ASG terminates instance                                                   │
+│  → Unprocessed messages return to queue after visibility timeout             │
+│                                                                              │
+│  LIFECYCLE HOOKS (for graceful shutdown):                                     │
+│  → ASG pauses before termination → sends notification                        │
+│  → Worker has N seconds to finish work                                       │
+│  → Worker calls CompleteLifecycleAction when done                            │
+│  → THEN ASG proceeds with termination                                        │
+│  → Timeout: default 3600 seconds (1 hour max)                                │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Scaled to 20 instances but queue isn't draining faster"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: bottleneck is NOT the worker count
+→ Bottleneck is downstream: Redshift connection limit, S3 throttling, MariaDB locks
+→ 20 workers all hitting Redshift with COPY = connection exhaustion
+→ Fix: identify actual bottleneck BEFORE scaling
+→ Rule: scale workers only if workers ARE the bottleneck
+
+PITFALL 2: "Instances launch but never start processing"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: User Data script fails silently
+→ pip install fails (no internet → NAT Gateway missing)
+→ Worker script has syntax error
+→ S3 download of worker code fails (IAM permission missing)
+→ Fix: log User Data output to /var/log/user-data.log
+→ Debug: check CloudWatch Logs agent output
+→ Test: launch ONE instance manually with User Data before creating ASG
+
+PITFALL 3: "Scale-out/scale-in loop — constant oscillation"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: cooldown period too short
+→ Timeline:
+  T+0: Queue = 2000 → scale out +5 instances
+  T+3: Queue = 200 (draining) → scale in -5 instances
+  T+6: Queue = 1500 (new messages) → scale out +5 again
+→ Fix: set scale-in cooldown to 600-900 seconds (10-15 min)
+→ Fix: set scale-out alarm evaluation period to 2+ datapoints
+
+PITFALL 4: "Instance terminated mid-processing → duplicate message"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: ASG terminates instance during scale-in
+→ Worker was mid-processing a message
+→ Visibility timeout expires → message reappears → another worker processes it
+→ Result: DUPLICATE processing
+→ Fix 1: Lifecycle hooks — give worker time to finish
+→ Fix 2: Idempotent processing (from Project 27 — use message dedup ID)
+→ Fix 3: SQS FIFO with exactly-once processing (from Project 13)
+
+PITFALL 5: "Health check kills healthy workers"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ ASG default health check: EC2 status checks (instance reachable?)
+→ EC2 is reachable but worker process crashed → ASG thinks it's healthy
+→ Fix: use custom health check via CloudWatch agent
+→ Worker publishes heartbeat metric → if missing → mark unhealthy
+
+PITFALL 6: "InsufficientInstanceCapacity — can't launch"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: AWS ran out of requested instance type in your AZ
+→ Happens during major events (everyone scaling for Black Friday)
+→ Fix: use multiple instance types in Mixed Instances Policy
+→ Fix: spread across 3+ AZs
+→ Fix: use common types (t3, m5) — exotic types have less capacity
+
+PITFALL 7: "Scaling policy fires but ASG doesn't scale"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause 1: already at MaxSize → can't add more
+→ Cause 2: in cooldown period → waiting before next action
+→ Cause 3: alarm in INSUFFICIENT_DATA state → policy not triggered
+→ Debug: ASG Activity History shows every scaling decision + reason
+→ Check: aws autoscaling describe-scaling-activities</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCALING DIMENSIONS:
+</span>
+1. INSTANCE COUNT (horizontal scaling)
+   → Min=1, Max=20 for ETL queue
+   → Each t3.medium processes ~100 messages/sec
+   → 20 instances = 2,000 messages/sec = 7.2M messages/hour
+   → If that's not enough: increase Max (with budget approval)
+
+2. INSTANCE SIZE (vertical scaling)
+   → t3.medium (2 vCPU, 4 GB) for lightweight processing
+   → c5.xlarge (4 vCPU, 8 GB) for CPU-heavy transforms
+   → r5.xlarge (4 vCPU, 32 GB) for memory-heavy processing
+   → Mixed Instances Policy: ASG picks cheapest available type
+
+3. PROCESSING EFFICIENCY (code optimization)
+   → Batch processing: receive 10 messages at once (from Project 27)
+   → Batch delete: delete 10 messages in one API call
+   → Connection pooling: reuse DB connections across messages
+   → 10x efficiency = 10x fewer instances needed
+
+4. QUEUE ARCHITECTURE (from Project 51)
+   → Each filtered queue has its OWN ASG
+   → ETL ASG: min=1, max=20 (heavy processing)
+   → Order ASG: min=2, max=50 (high volume, light processing)
+   → Alert ASG: min=1, max=3 (low volume, fast processing)
+   → Independent scaling per workload type
+
+COST AT SCALE:
+┌──────────────────┬──────────┬─────────────┬──────────────┐
+│ Scenario         │ Instances│ Hours/Day   │ Daily Cost   │
+├──────────────────┼──────────┼─────────────┼──────────────┤
+│ Normal day       │ 1-2      │ 24          │ $2.30-$4.61  │
+│ Busy day         │ 5-8      │ 8 peak+1 off│ $5.76-$8.83  │
+│ Black Friday     │ 10-20    │ 16 peak+1off│ $18.43-$36.10│
+│ Worst case (bug) │ 20       │ 24          │ $46.08       │
+└──────────────────┴──────────┴─────────────┴──────────────┘
+(t3.medium on-demand: $0.0416/hr in us-east-2)
+
+OPTIMIZATION:
+→ Use Spot Instances for fault-tolerant queue workers
+→ Spot = 60-90% cheaper than on-demand
+→ If Spot is interrupted: message returns to queue → another worker picks up
+→ Perfect for SQS consumers (stateless, idempotent)
+→ Mixed: 1 on-demand (baseline) + up to 19 Spot (burst)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR AND DEBUG AUTO SCALING:
+</span>
+1. ASG Activity History:
+   → aws autoscaling describe-scaling-activities --auto-scaling-group-name &lt;name&gt;
+   → Shows EVERY scaling decision: launch, terminate, failed launch
+   → Includes reason: "User requested", "Alarm triggered", "Health check"
+
+2. CloudWatch Dashboard (build custom):
+   → Panel 1: SQS ApproximateNumberOfMessagesVisible (queue depth)
+   → Panel 2: ASG GroupInServiceInstances (worker count)
+   → Panel 3: SQS NumberOfMessagesSent (incoming rate)
+   → Panel 4: SQS NumberOfMessagesDeleted (processing rate)
+   → Overlay: scaling events as annotations
+
+3. Scaling Policy Evaluation:
+   → CloudWatch Alarm state: OK → ALARM → OK
+   → Each transition triggers (or doesn't trigger) a scaling action
+   → View: aws cloudwatch describe-alarms --alarm-names &lt;name&gt;
+
+4. Per-Instance Monitoring:
+   → CloudWatch agent on each worker → CPU, memory, disk
+   → Application logs → CloudWatch Logs → filter for errors
+   → Worker heartbeat metric → detect crashed workers
+
+5. Cost Tracking:
+   → Tag instances with ASG name + queue name
+   → AWS Cost Explorer → filter by tag → cost per queue per day
+   → Compare: auto-scaled cost vs. fixed-fleet cost</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(52)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: IAM Role for Worker Instances</h3>
+
+<h3>Step 2: Worker Script (What Each EC2 Instance Runs)</h3>
+
+<h3>Step 3: Launch Template + Auto Scaling Group + Scaling Policies</h3>
+
+<h3>Step 4: Load Simulator — Flood Queue to Trigger Scale-Out</h3>
+
+<h3>Step 5: Target Tracking Policy (Simpler Alternative)</h3>
+
+<h3>Step 6: ASG Activity Inspector — Debug Scaling Decisions</h3>
+
+<h3>Step 7: Lifecycle Hook for Graceful Shutdown</h3>
+
+<h3>Step 8: Cleanup Script</h3>
+
+<h3>Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create IAM role for worker instances (one-time)</span><span>
+</span>python 52_01_create_worker_iam_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Upload worker script to S3 (or keep inline in User Data)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    In production: aws s3 cp 52_02_sqs_worker.py s3://quickcart-scripts/</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create Launch Template + ASG + Scaling Policies + Alarms</span><span>
+</span>python 52_03_create_auto_scaling.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Simulate Black Friday load + monitor auto-scaling response</span><span>
+</span>python 52_04_load_simulator.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4b. Monitor only (separate terminal)</span><span>
+</span>python 52_04_load_simulator.py monitor
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. (Optional) Set up Target Tracking as alternative</span><span>
+</span>python 52_05_target_tracking_alternative.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Inspect scaling decisions and debug</span><span>
+</span>python 52_06_inspect_scaling_activity.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Add graceful shutdown lifecycle hook</span><span>
+</span>python 52_07_lifecycle_hook.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Cleanup</span><span>
+</span>python 52_08_cleanup.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED MONITORING OUTPUT:
+</span>
+============================================================
+📊 LIVE MONITORING — Queue Depth vs Instance Count
+   Duration: 15 minutes | Interval: 15s
+============================================================
+Time         Queue Depth    In-Flight   Instances  Desired  Status
+---------------------------------------------------------------------------
+  00:00:00          5,000            0          1        1  🔴 HIGH — expect scale OUT
+  00:00:15          5,000            0          1        3  🔴 HIGH — expect scale OUT
+  00:00:30          4,980           20          1        3  🔴 HIGH — expect scale OUT
+  00:00:45          4,950           50          1        3  🔴 HIGH — expect scale OUT
+  00:01:00          4,900          100          1        3  🔴 HIGH — expect scale OUT
+  00:01:15          4,850          100          2        3  🔴 HIGH — expect scale OUT
+  00:01:30          4,780          120          3        3  🔴 HIGH — expect scale OUT
+  00:02:00          4,500          200          3        3  🔴 HIGH — expect scale OUT
+  00:03:00          3,800          300          3        3  🔴 HIGH — expect scale OUT
+  00:04:00          3,000          400          3        3  🔴 HIGH — expect scale OUT
+  00:05:00          2,100          500          3        3  🔴 HIGH — expect scale OUT
+  00:06:00          1,200          600          3        3  🔴 HIGH — expect scale OUT
+  00:07:00            500          700          3        3  🟡 MODERATE
+  00:08:00            100          400          3        3  🟡 MODERATE
+  00:09:00             20          100          3        3  🟢 LOW — may scale IN
+  00:10:00              0            5          3        3  ⚪ EMPTY — will scale IN
+  ...
+  00:24:00              0            0          3        1  ⚪ EMPTY — will scale IN
+  00:25:00              0            0          1        1  ⚪ EMPTY — will scale IN
+---------------------------------------------------------------------------
+📊 Monitoring complete</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Auto Scaling Group manages a FLEET of identical EC2 instances
+→ Launch Template defines WHAT to launch (AMI, type, IAM role, bootstrap)
+→ Scaling Policies define WHEN and HOW MUCH to scale
+→ Step Scaling: proportional response at different thresholds (fine control)
+→ Target Tracking: maintain metric at target value (simpler to configure)
+→ CloudWatch Alarms bridge SQS metrics to ASG scaling actions
+→ Scale on QUEUE DEPTH — not CPU/memory for queue-based workers
+→ Scale-out fast (1-min evaluation) | Scale-in slow (15-min sustained)
+→ Lifecycle hooks enable graceful shutdown during scale-in
+→ Multiple workers safely poll same SQS queue (visibility timeout protects)
+→ User Data bootstraps workers automatically — zero SSH needed
+→ Each filtered queue (Project 51) gets its OWN independent ASG
+
+HOW THIS CONNECTS TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 5:  EC2 fundamentals — launch, SSH, security groups
+→ Project 6:  IAM Instance Profiles — EC2 authenticates to AWS services
+→ Project 13: SQS fundamentals — visibility timeout, retention
+→ Project 27: EC2 SQS consumer — long polling, delete after process
+→ Project 50: DLQ — failed messages quarantined (workers still fail sometimes)
+→ Project 51: Filtered routing — each queue has different traffic patterns
+              → Each filtered queue scales independently
+
+WHAT THIS CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 53: "Non-Technical Analyst Wants to Clean Data Without Code"
+  - Glue DataBrew: visual data preparation
+  - No EC2, no ASG, no infrastructure
+  - Serverless data cleaning for non-engineers
+  - Contrasts with the heavy infrastructure of Projects 51-52
+  - Shows when to use managed services vs. build-your-own
+  
+  Key transition:
+  - Projects 51-52: YOU manage the infrastructure (SNS, SQS, EC2, ASG)
+  - Project 53: AWS manages everything (serverless, visual, no-code)
+  - Interview question: "When would you choose one over the other?"</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Intelligent message routing (Project 51)
+→ Auto-scaling workers per queue (Project 52)
+→ Black Friday handled automatically
+
+BUT: The business analyst (Sarah) says:
+"I need to clean up the customer CSV before it goes into the Gold layer.
+ Remove duplicates, fix phone number formats, standardize state codes.
+ I don't know Python. I don't have AWS access. I just want a spreadsheet-
+ like interface where I drag, drop, and click."
+
+Engineering Lead: "We can't give her EC2 access or teach her Glue ETL."
+YOU: "We don't need to. Glue DataBrew gives her a visual, no-code 
+      data cleaning tool that reads from S3 and writes back to S3.
+      She builds recipes in a UI. We schedule them. Done."
+
+→ Project 53: "Non-Technical Analyst Wants to Clean Data Without Code"
+→ Introduces: Glue DataBrew, Datasets, Recipes, Projects, Profile Jobs,
+   Recipe Jobs, Scheduled Runs, Output to S3</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-51.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 52 of 80</span>
+    <span class="nav-project-title">PIPELINE LOAD SPIKES — EC2 WORKERS MUST SCALE AUTOMATICALLY</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-53.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-53.html") window.location = "project-53.html";
+  if (e.key === 'ArrowLeft' && "project-51.html") window.location = "project-51.html";
+});
+</script>
+</body>
+</html>

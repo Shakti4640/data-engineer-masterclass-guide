@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 49: ENCAPSULATE COMPLEX REDSHIFT ETL LOGIC IN STORED PROCEDURES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:61%"></div></div>
+<div id="progress-label">61%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 49 of 80</div>
+  <div class="project-title">ENCAPSULATE COMPLEX REDSHIFT ETL LOGIC IN STORED PROCEDURES</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — data platform serving 50+ internal users
+</span>Team: 5-person data team, analytics engineer struggling with Redshift ETL
+
+CURRENT STATE (built through Projects 1–48):
+→ CDC extracts → S3 Bronze → Glue Silver → Glue Gold (Projects 42, 44)
+→ Redshift MERGE from staging tables (Project 42)
+→ Reverse ETL: Redshift → S3 → MariaDB (Project 43)
+→ All orchestrated via Step Functions (Project 41)
+
+THE COMPLEXITY PROBLEM:
+
+  Current Redshift load pipeline (orchestrated from Glue/Step Functions):
+  
+  Statement 1:  DROP TABLE IF EXISTS staging_orders
+  Statement 2:  CREATE TABLE staging_orders (LIKE orders)
+  Statement 3:  COPY staging_orders FROM 's3://...' IAM_ROLE '...'
+  Statement 4:  SELECT COUNT(*) FROM staging_orders  → validate
+  Statement 5:  DELETE FROM staging_orders WHERE order_id IN 
+                (SELECT order_id FROM staging_orders GROUP BY order_id HAVING COUNT(*) &gt; 1)
+  Statement 6:  BEGIN TRANSACTION
+  Statement 7:  MERGE INTO orders USING staging_orders ON ...
+  Statement 8:  DROP TABLE staging_orders
+  Statement 9:  COMMIT
+  Statement 10: COPY staging_customers FROM 's3://...'
+  Statement 11: MERGE INTO customers USING staging_customers ON ...
+  Statement 12: DROP TABLE staging_customers
+  Statement 13: COPY staging_products FROM 's3://...'
+  Statement 14: MERGE INTO products USING staging_products ON ...
+  Statement 15: DROP TABLE staging_products
+  Statement 16: REFRESH MATERIALIZED VIEW customer_summary
+  Statement 17: REFRESH MATERIALIZED VIEW revenue_daily
+  Statement 18: ANALYZE orders
+  Statement 19: ANALYZE customers
+  Statement 20: ANALYZE products
+
+  EACH statement is sent individually from Glue via psycopg2:
+  → 20 round trips × ~100ms network latency = 2 seconds just in latency
+  → Each statement: no shared transaction context (unless explicitly managed)
+  → If statement 7 fails: statements 1-6 already executed → partial state
+  → Error handling: Glue catches psycopg2 exception → but what about cleanup?
+
+PROBLEMS THE ANALYTICS ENGINEER FACES:
+
+  Problem 1: NO ATOMICITY
+  → Step 7 (MERGE orders) succeeds
+  → Step 11 (MERGE customers) fails
+  → Result: orders updated but customers stale → inconsistent state
+  → Analysts see: "Why do new orders reference customer_ids that don't exist?"
+
+  Problem 2: COPY-PASTE LOGIC
+  → The staging → dedup → merge → drop pattern repeats for EVERY entity
+  → 3 entities × same pattern = 3 copies of same logic
+  → Bug fix in one copy → forget to fix the other two
+  → New entity added → copy-paste → introduce new bugs
+
+  Problem 3: TESTING IS PAINFUL
+  → To test one SQL change: must run entire Glue job (~5 minutes)
+  → Can't test MERGE logic in isolation
+  → Can't unit test SQL logic from Redshift console
+
+  Problem 4: ERROR HANDLING IS PRIMITIVE
+  → Glue catches: "psycopg2.Error: relation does not exist"
+  → But: staging tables may be left behind (orphaned)
+  → But: partial MERGE may have committed
+  → No rollback strategy beyond "re-run everything from scratch"
+
+  Problem 5: PERFORMANCE
+  → 20 individual round trips to Redshift
+  → Each trip: parse SQL, plan query, execute, return result
+  → Stored procedure: send once, execute all 20 steps server-side
+  → Network savings: 20× fewer round trips
+
+ANALYTICS ENGINEER: "I want to call ONE procedure:
+  CALL etl.load_daily_data('2025-01-15');
+  
+  It should:
+  → Load all 3 entities (orders, customers, products)
+  → Deduplicate each staging table
+  → MERGE each into target
+  → Refresh materialized views
+  → Run ANALYZE on all tables
+  → All within ONE transaction (all-or-nothing)
+  → If ANY step fails: rollback everything, log the error
+  → Return: success/failure + row counts + duration"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Redshift Stored Procedures
+</span>
+  Redshift supports PL/pgSQL stored procedures (since 2019):
+  → CREATE OR REPLACE PROCEDURE schema.name(params)
+  → Language: plpgsql (PostgreSQL procedural language)
+  → Supports: variables, IF/ELSE, loops, cursors, exceptions
+  → Supports: RAISE for logging, RAISE EXCEPTION for errors
+  → Supports: transaction control (COMMIT, ROLLBACK)
+  → Called via: CALL schema.procedure_name(args)
+
+  KEY DIFFERENCE from PostgreSQL:
+  → Redshift procedures can control transactions (COMMIT/ROLLBACK inside)
+  → PostgreSQL functions CANNOT commit/rollback (run within caller's transaction)
+  → This makes Redshift procedures perfect for ETL orchestration
+
+Step 2: Design the procedure hierarchy
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │                    PROCEDURE HIERARCHY                        │
+  │                                                              │
+  │  etl.load_daily_data(process_date)     ← Master orchestrator │
+  │  ├── etl.load_entity('orders', ...)    ← Per-entity loader   │
+  │  │   ├── Create staging table                                │
+  │  │   ├── COPY from S3                                        │
+  │  │   ├── Validate staging                                    │
+  │  │   ├── Deduplicate staging                                 │
+  │  │   ├── MERGE into target                                   │
+  │  │   └── Drop staging table                                  │
+  │  ├── etl.load_entity('customers', ...) ← Same pattern reused │
+  │  ├── etl.load_entity('products', ...)  ← Same pattern reused │
+  │  ├── etl.refresh_views()               ← Materialized views  │
+  │  ├── etl.run_analyze()                 ← Statistics update   │
+  │  └── etl.log_run_result(...)           ← Audit logging       │
+  └──────────────────────────────────────────────────────────────┘
+
+  Benefits:
+  → load_entity: ONE procedure for ALL entities (no copy-paste)
+  → load_daily_data: orchestrates everything in one call
+  → Each procedure: independently testable from Redshift console
+  → Error handling: EXCEPTION block catches and logs failures
+  → Transaction: all entities loaded atomically
+
+Step 3: Design the audit/logging mechanism
+
+  → Create etl.run_log table to track every procedure execution
+  → Columns: run_id, procedure_name, entity, status, rows_affected,
+    error_message, started_at, completed_at, duration_seconds
+  → Queryable: "Show me all failed ETL runs in the last 7 days"
+  → Alertable: Step Functions checks return value → SNS if failed
+
+Step 4: Design error handling strategy
+
+  LEVEL 1: Statement-level error → catch, log, continue or abort
+  LEVEL 2: Entity-level error → rollback entity, try next entity
+  LEVEL 3: Pipeline-level error → rollback all, log, raise to caller
+
+  QuickCart choice: LEVEL 3 (all-or-nothing)
+  → If ANY entity fails → ROLLBACK everything
+  → Reason: data consistency across entities matters
+  → Orders reference customer_ids → both must be in sync</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  Step Functions (Project 41)
+       │
+       │ CALL etl.load_daily_data('2025-01-15')
+       │ (single round trip)
+       ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  REDSHIFT (server-side execution)                               │
+  │                                                                 │
+  │  etl.load_daily_data('2025-01-15')                              │
+  │  │                                                              │
+  │  ├── BEGIN                                                      │
+  │  │                                                              │
+  │  ├── CALL etl.load_entity('orders', 's3://...', 'order_id')    │
+  │  │   ├── CREATE staging_orders                                  │
+  │  │   ├── COPY staging_orders FROM s3                            │
+  │  │   ├── Validate: COUNT(*) &gt; 0                                │
+  │  │   ├── Dedup: DELETE duplicates                               │
+  │  │   ├── MERGE INTO orders                                      │
+  │  │   └── DROP staging_orders                                    │
+  │  │                                                              │
+  │  ├── CALL etl.load_entity('customers', 's3://...', 'cust_id')  │
+  │  │   └── (same pattern)                                         │
+  │  │                                                              │
+  │  ├── CALL etl.load_entity('products', 's3://...', 'prod_id')   │
+  │  │   └── (same pattern)                                         │
+  │  │                                                              │
+  │  ├── CALL etl.refresh_views()                                   │
+  │  │   ├── REFRESH MATERIALIZED VIEW customer_summary             │
+  │  │   └── REFRESH MATERIALIZED VIEW revenue_daily                │
+  │  │                                                              │
+  │  ├── CALL etl.run_analyze()                                     │
+  │  │   ├── ANALYZE orders                                         │
+  │  │   ├── ANALYZE customers                                      │
+  │  │   └── ANALYZE products                                       │
+  │  │                                                              │
+  │  ├── CALL etl.log_run_result('SUCCESS', ...)                    │
+  │  │                                                              │
+  │  ├── COMMIT                                                     │
+  │  │                                                              │
+  │  └── EXCEPTION WHEN OTHERS THEN                                 │
+  │      ├── ROLLBACK                                               │
+  │      ├── CALL etl.log_run_result('FAILED', ...)                 │
+  │      └── RAISE                                                  │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+       │
+       │ Returns: success/failure
+       ▼
+  Step Functions → SNS notification (Project 41)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a dedicated ETL schema in Redshift
+</span>   → CREATE SCHEMA etl;
+   → All procedures, staging tables, logs live here
+   → Separates ETL logic from business data (public schema)
+   → GRANT USAGE ON SCHEMA etl TO etl_role
+
+2. Use parameterized procedures (not hardcoded values)
+   → load_entity(entity_name, s3_path, pk_column, iam_role)
+   → Same procedure works for orders, customers, products
+   → Adding new entity: just add a new CALL, no new procedure
+
+3. Use RAISE for logging inside procedures
+   → RAISE INFO 'Loading entity: %', entity_name;
+   → RAISE INFO 'Staging rows: %', staging_count;
+   → RAISE WARNING 'Dedup removed % rows', dup_count;
+   → RAISE EXCEPTION 'Validation failed: 0 rows in staging';
+   → INFO/WARNING: logged to SVL_STORED_PROC_MESSAGES
+   → EXCEPTION: aborts execution, triggers EXCEPTION handler
+
+4. Use etl.run_log table for audit trail
+   → Every procedure execution logged with timing + row counts
+   → Queryable: SELECT * FROM etl.run_log WHERE status = 'FAILED'
+   → Enables: "When did the last successful load happen?"
+
+5. Return status via OUT parameters or result set
+   → Redshift procedures support INOUT parameters
+   → Return: status, total_rows_loaded, duration_seconds
+   → Caller (Glue/Step Functions) reads return value → decides next action
+
+6. Test procedures from Redshift console FIRST
+   → CALL etl.load_entity('orders', 's3://...', 'order_id', 'arn:...');
+   → Verify: staging created, COPY works, MERGE works, staging dropped
+   → Much faster iteration than testing via Glue job
+
+7. Use CURRENT_TIMESTAMP for timing inside procedures
+   → start_time := CURRENT_TIMESTAMP;
+   → ... execute steps ...
+   → duration := EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - start_time);
+   → Accurate server-side timing (no network latency included)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT put business logic in stored procedures
+</span>   → Stored procedures: ETL orchestration (load, merge, validate)
+   → NOT for: complex transformations, ML features, report generation
+   → Keep business logic in Glue ETL (Silver→Gold) or dbt models
+   → Procedures = plumbing, not business logic
+
+2. DO NOT use cursors for row-by-row processing
+   → Redshift is columnar MPP — optimized for set-based operations
+   → Cursor loop on 5M rows: hours (row-by-row = anti-pattern)
+   → SET-based: MERGE INTO orders USING staging → seconds
+   → Only use cursors for: iterating over entity list (small loops)
+
+3. DO NOT hardcode S3 paths or IAM roles in procedures
+   → Pass as parameters: s3_path VARCHAR, iam_role VARCHAR
+   → Enables: dev/staging/prod with same procedure, different paths
+   → Enables: testing with different S3 locations
+
+4. DO NOT skip the EXCEPTION handler
+   → Without EXCEPTION: error propagates to caller, staging tables orphaned
+   → With EXCEPTION: cleanup staging, log error, then re-raise
+   → ALWAYS clean up temp resources in EXCEPTION block
+
+5. DO NOT COMMIT inside a nested procedure call (be careful)
+   → Redshift: COMMIT inside procedure commits EVERYTHING
+   → If outer procedure calls inner procedure that COMMITs
+   → Outer procedure's ROLLBACK won't undo inner's COMMIT
+   → Rule: only the OUTERMOST procedure should COMMIT/ROLLBACK
+   → Inner procedures: do work, let outer handle transactions
+
+6. DO NOT create procedures with side effects that can't be rolled back
+   → DROP TABLE: DDL — not rolled back by ROLLBACK
+   → TRUNCATE: DDL — not rolled back
+   → CREATE TABLE: DDL — not rolled back
+   → Solution: use DELETE (DML, rollback-able) instead of TRUNCATE
+   → Or: accept DDL side effects and handle in EXCEPTION cleanup
+
+7. DO NOT ignore the SVL_STORED_PROC_MESSAGES system view
+   → All RAISE INFO/WARNING/NOTICE messages logged here
+   → Essential for debugging: "What did the procedure actually do?"
+   → Query: SELECT * FROM svl_stored_proc_messages ORDER BY recordtime DESC</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────────┬──────────────────────────────┬──────────────────────────────┐
+</span>│ Pattern                            │ Use When                     │ Don't Use When               │
+├────────────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Redshift Stored Procedures         │ Multi-step Redshift ETL      │ Simple single-statement load │
+│ (THIS PROJECT)                     │ Need atomicity across steps  │ Logic belongs in Glue/Spark  │
+│                                    │ Reusable patterns            │ Complex transformations      │
+│                                    │ Testing from SQL console     │                              │
+├────────────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Individual SQL from Glue/Python    │ Simple COPY + single MERGE   │ &gt;5 SQL statements per entity │
+│ (Project 42 original approach)     │ Quick prototype              │ Need transaction control     │
+├────────────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ dbt models                         │ Silver→Gold transformations  │ ETL plumbing (COPY, staging) │
+│                                    │ Business logic in SQL        │ Need COPY FROM S3            │
+│                                    │ Version-controlled models    │ Need procedural logic        │
+├────────────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Glue ETL (PySpark)                 │ S3-to-S3 transformations     │ Redshift-internal operations │
+│ (Projects 25, 34, 44)             │ Schema evolution handling     │ Simple SQL orchestration     │
+│                                    │ Complex data cleaning        │                              │
+├────────────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Redshift Materialized Views        │ Pre-computed aggregations    │ ETL orchestration            │
+│ (Project 63)                       │ Auto-refresh                 │ Multi-table operations       │
+└────────────────────────────────────┴──────────────────────────────┴──────────────────────────────┘</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                 INTERNAL MECHANICS: REDSHIFT STORED PROCEDURES                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ PL/pgSQL Execution Model in Redshift                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                      │
+│                                                                                 │
+│  When you call: CALL etl.load_daily_data('2025-01-15')                         │
+│                                                                                 │
+│  1. Redshift leader node receives the CALL                                      │
+│  2. Leader looks up procedure definition in pg_proc catalog                     │
+│  3. PL/pgSQL interpreter starts executing procedure body                       │
+│  4. Each SQL statement inside the procedure:                                    │
+│     a. Parsed and planned by Redshift query planner                            │
+│     b. Distributed to compute nodes (if needed)                                │
+│     c. Results returned to leader                                               │
+│     d. PL/pgSQL interpreter processes result                                   │
+│  5. Variables, IF/ELSE, loops: executed on leader node only                    │
+│  6. SQL statements (COPY, MERGE, SELECT): distributed to compute nodes        │
+│                                                                                 │
+│  KEY INSIGHT:                                                                   │
+│  → Procedural logic (variables, loops): leader node only                       │
+│  → Data operations (COPY, MERGE, SELECT): fully distributed MPP               │
+│  → This is why cursors are slow: each iteration = leader → compute → leader   │
+│  → Set-based operations: single distribute → parallel execution → fast         │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Transaction Control Inside Procedures                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                     │
+│                                                                                 │
+│  UNIQUE TO REDSHIFT (not standard PostgreSQL):                                  │
+│  → Procedures CAN issue COMMIT and ROLLBACK                                    │
+│  → Functions CANNOT (they run within caller's transaction)                      │
+│                                                                                 │
+│  Transaction behavior:                                                          │
+│  ┌──────────────────────────────────────────────────────────────┐              │
+│  │ CALL my_procedure();                                          │              │
+│  │                                                                │              │
+│  │ -- Inside procedure:                                           │              │
+│  │ BEGIN;  -- starts new transaction                              │              │
+│  │   INSERT INTO orders VALUES (...);                             │              │
+│  │   INSERT INTO customers VALUES (...);                          │              │
+│  │   -- Both inserts are in SAME transaction                      │              │
+│  │ COMMIT; -- both committed atomically                           │              │
+│  │                                                                │              │
+│  │ -- Or on error:                                                │              │
+│  │ EXCEPTION WHEN OTHERS THEN                                     │              │
+│  │   ROLLBACK; -- both inserts rolled back                        │              │
+│  └──────────────────────────────────────────────────────────────┘              │
+│                                                                                 │
+│  IMPORTANT CAVEAT:                                                              │
+│  → DDL statements (CREATE, DROP, ALTER) auto-commit in Redshift                │
+│  → CREATE TABLE staging_x → immediately committed                              │
+│  → If later ROLLBACK: CREATE is NOT rolled back                                │
+│  → Solution: use IF EXISTS checks and cleanup in EXCEPTION handler             │
+│                                                                                 │
+│                                                                                 │
+│  ❸ RAISE Statement — Logging Mechanism                                         │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                       │
+│                                                                                 │
+│  RAISE levels:                                                                  │
+│  → RAISE DEBUG 'msg'     → lowest, usually suppressed                          │
+│  → RAISE LOG 'msg'       → logged to SVL_STORED_PROC_MESSAGES                 │
+│  → RAISE INFO 'msg'      → logged + returned to client (psycopg2 notices)     │
+│  → RAISE NOTICE 'msg'    → same as INFO                                        │
+│  → RAISE WARNING 'msg'   → logged + returned as warning                        │
+│  → RAISE EXCEPTION 'msg' → ABORTS execution, enters EXCEPTION handler         │
+│                                                                                 │
+│  Format strings:                                                                │
+│  RAISE INFO 'Loaded % rows into %', row_count, table_name;                    │
+│  → % is replaced by the variable value                                          │
+│  → Up to 9 % placeholders per RAISE                                            │
+│                                                                                 │
+│  Viewing messages:                                                              │
+│  SELECT * FROM svl_stored_proc_messages                                         │
+│  WHERE querytxt LIKE '%load_daily%'                                             │
+│  ORDER BY recordtime DESC LIMIT 50;                                             │
+│                                                                                 │
+│                                                                                 │
+│  ❹ EXCEPTION Handling                                                          │
+│  ━━━━━━━━━━━━━━━━━━━                                                          │
+│                                                                                 │
+│  BEGIN                                                                          │
+│    -- dangerous operations here                                                 │
+│  EXCEPTION                                                                      │
+│    WHEN OTHERS THEN                                                             │
+│      -- error handling here                                                     │
+│      -- Access error info via:                                                  │
+│      --   SQLERRM (error message string)                                       │
+│      --   SQLSTATE (5-character error code)                                    │
+│      RAISE INFO 'Error: %, State: %', SQLERRM, SQLSTATE;                      │
+│      ROLLBACK;                                                                  │
+│      -- Optionally re-raise:                                                   │
+│      RAISE;  -- re-raises the original exception to caller                     │
+│  END;                                                                           │
+│                                                                                 │
+│  Common SQLSTATE codes:                                                         │
+│  → '42P01': undefined table (relation does not exist)                          │
+│  → '23505': unique constraint violation                                         │
+│  → '42601': syntax error                                                        │
+│  → '57014': query cancelled (timeout)                                           │
+│  → '08006': connection failure                                                  │
+│  → 'P0001': user-defined exception (from RAISE EXCEPTION)                     │
+│                                                                                 │
+│                                                                                 │
+│  ❺ Performance: Procedure vs Individual Statements                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                             │
+│                                                                                 │
+│  Individual statements from Glue (20 statements):                               │
+│  → 20 × network round trip: ~100ms each = 2,000ms                             │
+│  → 20 × query parse + plan: ~50ms each = 1,000ms                              │
+│  → Actual execution: ~30,000ms (30 seconds)                                    │
+│  → Total: ~33 seconds                                                           │
+│                                                                                 │
+│  Stored procedure (1 CALL):                                                     │
+│  → 1 × network round trip: ~100ms                                              │
+│  → 20 × query parse + plan: ~50ms each = 1,000ms (server-side)                │
+│  → Actual execution: ~30,000ms (same — data operations identical)              │
+│  → Total: ~31 seconds                                                           │
+│                                                                                 │
+│  SAVINGS: ~2 seconds (network latency elimination)                              │
+│  → Not huge for performance, but MASSIVE for:                                   │
+│    - Atomicity (all-or-nothing)                                                │
+│    - Error handling (cleanup in EXCEPTION)                                      │
+│    - Code reuse (one procedure for all entities)                               │
+│    - Testability (CALL from SQL console)                                       │
+│    - Maintainability (logic in one place)                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "ROLLBACK doesn't undo CREATE TABLE"
+</span>→ Cause: DDL statements auto-commit in Redshift
+→ CREATE TABLE staging_x → committed immediately
+→ Later ROLLBACK → staging_x still exists
+→ Fix: always DROP TABLE IF EXISTS at START of procedure
+→ Fix: also DROP in EXCEPTION handler (cleanup)
+
+PITFALL 2: "Procedure hangs — never returns"
+→ Cause: COPY FROM S3 waiting for nonexistent file
+→ Or: MERGE on massive table without proper dist/sort keys
+→ Or: lock contention with concurrent queries
+→ Fix: set statement_timeout before CALL
+→ SET statement_timeout TO 1800000; -- 30 minutes
+→ CALL etl.load_daily_data('2025-01-15');
+
+PITFALL 3: "RAISE INFO messages not visible in psycopg2"
+→ Cause: psycopg2 default doesn't show NOTICE/INFO messages
+→ Fix: conn.notices list collects them
+→ Or: query SVL_STORED_PROC_MESSAGES after CALL completes
+
+PITFALL 4: "Procedure works in console but fails from Glue"
+→ Cause: different user/role permissions
+→ Console: admin user with full access
+→ Glue: etl_role with limited grants
+→ Fix: GRANT EXECUTE ON PROCEDURE etl.load_daily_data TO etl_role
+→ Fix: GRANT ALL ON SCHEMA etl TO etl_role
+
+PITFALL 5: "Inner procedure COMMITs, outer ROLLBACK doesn't undo"
+→ Cause: COMMIT inside inner procedure commits everything
+→ Outer procedure's ROLLBACK has nothing to undo
+→ Fix: only outermost procedure issues COMMIT/ROLLBACK
+→ Inner procedures: do work, don't touch transaction control
+
+PITFALL 6: "Procedure silently succeeds but no data loaded"
+→ Cause: COPY loaded 0 rows (empty S3 file)
+→ Procedure didn't validate row count after COPY
+→ MERGE with 0 staging rows = no changes (succeeds silently)
+→ Fix: always validate COUNT(*) &gt; 0 after COPY
+→ If 0 rows: RAISE EXCEPTION 'No data to load'
+
+PITFALL 7: "Can't see procedure source code"
+→ Cause: Redshift doesn't have pg_get_functiondef for procedures
+→ Fix: query pg_proc_info or use SHOW PROCEDURE
+→ Or: store procedure source in version control (Git)
+→ Deploy via CI/CD (Project 76)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(49)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create ETL Schema and Audit Table</h3>
+
+<h3>Step 2: Create Core Stored Procedures</h3>
+
+<h3>Step 3: Caller Script (from Glue or Step Functions)</h3>
+
+<h3>Step 4: Monitoring and Diagnostics</h3>
+
+<h3>Step 5: Adding a New Entity (demonstrates extensibility)</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create ETL schema + audit tables + entity config</span><span>
+</span>python 49_01_create_etl_schema.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Create all stored procedures</span><span>
+</span>python 49_02_create_stored_procedures.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY PIPELINE (automated via Step Functions)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Full pipeline: ONE call does everything</span><span>
+</span><span>python 49_03_call_procedures.py load </span><span class="token" style="color: rgb(54, 172, 170);">2025</span><span>-01-15
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONITORING</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># View run history</span><span>
+</span><span>python 49_03_call_procedures.py </span><span class="token" style="color: rgb(57, 58, 52);">history</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Full diagnostics</span><span>
+</span>python 49_04_procedure_diagnostics.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Compare before/after</span><span>
+</span>python 49_03_call_procedures.py compare
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ADDING NEW ENTITIES</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Add a new entity (10 minutes instead of 2 hours)</span><span>
+</span><span>python 49_05_add_new_entity.py </span><span class="token" style="color: rgb(57, 58, 52);">add</span><span> order_returns return_id </span><span class="token" style="color: rgb(163, 21, 21);">"s3://quickcart-datalake-prod/silver/order_returns/"</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Deactivate temporarily</span><span>
+</span>python 49_05_add_new_entity.py deactivate order_returns
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># TESTING (from Redshift console — no Glue needed!)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Test single entity from SQL console:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CALL etl.load_entity('orders', 's3://...', 'order_id', 'public', 'orders', 'arn:...', 'test_001', 0);</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Test full pipeline from SQL console:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CALL etl.load_daily_data('2025-01-15', '');</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># View procedure messages:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SELECT * FROM svl_stored_proc_messages ORDER BY recordtime DESC LIMIT 30;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># View audit log:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SELECT * FROM etl.run_log ORDER BY started_at DESC LIMIT 20;</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Run summary:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># CALL etl.get_run_summary(7);</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Daily Load):
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║  REDSHIFT ETL — Stored Procedure Call                                 ║
+║  Date: 2025-01-15                                                     ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+🚀 Calling: etl.load_daily_data('2025-01-15')
+
+📋 Procedure Messages:
+   ════════════════════════════════════════════════════
+   [run_20250115_000500] ETL PIPELINE START — Date: 2025-01-15
+   ════════════════════════════════════════════════════
+   [run_20250115_000500] PHASE 1: Loading entities...
+   [run_20250115_000500] Loading: orders
+   [run_20250115_000500] Staging table created: etl.staging_orders
+   [run_20250115_000500] COPY from: s3://quickcart-datalake-prod/silver/orders/year=2025/month=01/day=15/
+   [run_20250115_000500] Staging rows: 11219
+   [run_20250115_000500] No duplicates found in orders
+   [run_20250115_000500] Executing MERGE for orders
+   [run_20250115_000500] orders complete: 11219 staged, 11219 merged, 8000 new, 3219 updated (4.2s)
+   [run_20250115_000500] Loading: customers
+   [run_20250115_000500] customers complete: 342 staged, 342 merged, 12 new, 330 updated (1.8s)
+   [run_20250115_000500] Loading: products
+   [run_20250115_000500] products complete: 87 staged, 87 merged, 3 new, 84 updated (0.9s)
+   [run_20250115_000500] PHASE 2: Refreshing views...
+   [run_20250115_000500] Refreshing: public.customer_summary
+   [run_20250115_000500] Refreshing: public.revenue_daily
+   [run_20250115_000500] All materialized views refreshed
+   [run_20250115_000500] PHASE 3: Running ANALYZE...
+   [run_20250115_000500] ANALYZE public.orders
+   [run_20250115_000500] ANALYZE public.customers
+   [run_20250115_000500] ANALYZE public.products
+   ════════════════════════════════════════════════════
+   [run_20250115_000500] ETL PIPELINE COMPLETE
+   [run_20250115_000500] Entities loaded: 3
+   [run_20250115_000500] Total rows: 11648
+   [run_20250115_000500] Duration: 12.4 seconds
+   ════════════════════════════════════════════════════
+
+============================================================
+📊 RESULT: SUCCESS
+⏱  Duration: 12.8 seconds
+============================================================</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Before vs After Comparison):
+</span>
+======================================================================
+📊 BEFORE vs AFTER COMPARISON
+======================================================================
+
+   Aspect                    Before (Project 42)            After (Project 49)
+   ─────────────────────────────────────────────────────────────────────────────────
+   Network round trips       20                             1
+   Lines of Python code      ~150                           ~10
+   Transaction control       Manual (fragile)               Automatic (EXCEPTION)
+   Atomicity                 None (partial state)           All-or-nothing
+   Error cleanup             Manual try/except              EXCEPTION handler
+   Code reuse                Copy-paste per entity          One procedure for all
+   Testing                   Run entire Glue job            CALL from SQL console
+   Audit trail               CloudWatch logs                etl.run_log table (queryable)
+   Adding new entity         Copy 20 statements             Add row to entity_config
+   Debugging                 Read Glue job logs             SVL_STORED_PROC_MESSAGES
+   ─────────────────────────────────────────────────────────────────────────────────
+
+   💡 Key insight: same data operations, better engineering
+      The MERGE, COPY, ANALYZE still run identically.
+      What changed: orchestration, error handling, reusability.</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Redshift stored procedures: PL/pgSQL with COMMIT/ROLLBACK inside
+→ Procedures execute SERVER-SIDE — no network round trips per statement
+→ EXCEPTION handler: catch errors, cleanup staging, log, re-raise
+→ Dynamic SQL (EXECUTE): build MERGE statements from metadata
+→ Entity config table: data-driven pipeline — add entities without code changes
+→ RAISE INFO/WARNING: server-side logging → SVL_STORED_PROC_MESSAGES
+→ Audit log table (etl.run_log): queryable history of every pipeline run
+→ DDL auto-commits: CREATE/DROP not rolled back — handle in EXCEPTION cleanup
+→ Only outermost procedure should COMMIT/ROLLBACK (avoid nested commits)
+→ Testing from SQL console: CALL directly, no Glue job needed
+→ Cursor loops: OK for iterating entity list, NOT for processing data rows
+
+ARCHITECTURE IMPROVEMENT:
+━━━━━━━━━━━━━━━━━━━━━━━
+  BEFORE (20 statements from Glue):
+  Glue ──SQL1──→ Redshift
+  Glue ──SQL2──→ Redshift
+  Glue ──SQL3──→ Redshift
+  ... (20 round trips, no atomicity)
+  Glue ──SQL20──→ Redshift
+
+  AFTER (1 CALL from Glue):
+  Glue ──CALL──→ Redshift
+                  ├── SQL1 (server-side)
+                  ├── SQL2 (server-side)
+                  ├── ... (all 20 steps)
+                  ├── SQL20 (server-side)
+                  ├── COMMIT (atomic)
+                  └── Return status
+
+ADDING NEW ENTITY:
+━━━━━━━━━━━━━━━━━
+  BEFORE: 2 hours (copy-paste 20 SQL statements, modify each, test)
+  AFTER:  10 minutes (INSERT one row into entity_config, done)
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 21: Redshift COPY basics (now inside procedure)
+→ Project 39: Distribution/sort keys (ANALYZE refreshes statistics)
+→ Project 42: CDC MERGE logic (now encapsulated in load_entity procedure)
+→ Project 41: Step Functions (calls procedure instead of 20 statements)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 50: Messages Keep Failing — Don't Lose Them, Quarantine Them
+   (SQS Dead Letter Queue — when pipeline messages fail processing,
+    we need a safety net to capture them instead of losing them.
+    Same principle as our EXCEPTION handler: don't lose data on failure.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Stored procedures made the Redshift ETL robust:
+</span>→ Atomic: all-or-nothing across entities
+→ Auditable: every run logged with row counts + duration
+→ Extensible: add entity = add config row
+→ Testable: CALL from SQL console
+
+But the operations team notices a different problem:
+
+"Our SQS queue (Project 27, 28, 30) processes file arrival messages.
+ Sometimes a message fails processing — bad file format, 
+ network timeout, Glue job quota exceeded.
+ 
+ When a message fails, SQS retries it 3 times, then... it disappears.
+ Gone forever. We never know it failed.
+ 
+ Last week: 47 messages silently vanished over 3 days.
+ That's 47 files that were never processed.
+ Nobody noticed until the weekly data quality check.
+ 
+ Can we QUARANTINE failed messages instead of losing them?"
+
+→ Project 50: "Messages Keep Failing — Don't Lose Them, Quarantine Them"
+→ Introduces: SQS Dead Letter Queue, Redrive Policy, maxReceiveCount,
+  DLQ monitoring, reprocessing failed messages</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="41" ========== -->
+<div class="chat-message" data-index="41"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-48.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 49 of 80</span>
+    <span class="nav-project-title">ENCAPSULATE COMPLEX REDSHIFT ETL LOGIC IN STORED PROCEDURES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-50.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-50.html") window.location = "project-50.html";
+  if (e.key === 'ArrowLeft' && "project-48.html") window.location = "project-48.html";
+});
+</script>
+</body>
+</html>

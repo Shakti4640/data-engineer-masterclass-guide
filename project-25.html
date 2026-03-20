@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 25: CONVERT RAW CSVs INTO OPTIMIZED PARQUET VIA GLUE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:31%"></div></div>
+<div id="progress-label">31%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 25 of 80</div>
+  <div class="project-title">CONVERT RAW CSVs INTO OPTIMIZED PARQUET VIA GLUE</div>
+  <div class="project-tags"><span class="project-tag">Glue</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — analysts querying S3 via Athena (Project 24)
+</span>Situation:
+→ Daily CSV exports land in S3 (Project 1):
+   - orders/     → 30 files × 50 MB = 1.5 GB (CSV)
+   - customers/  → 30 files × 10 MB = 300 MB (CSV)
+   - products/   → 30 files × 2 MB  = 60 MB (CSV)
+
+→ Athena cost comparison (proven in Project 24):
+   - raw_orders (CSV):     scans 1,500 MB per query → $0.0075
+   - curated_orders (Parquet): scans 50 MB per query → $0.00025
+   - Same query, 30x cost difference
+
+→ 10 analysts × 30 queries/day × 30 days = 9,000 queries/month
+   - On CSV:     9,000 × $0.0075 = $67.50/month
+   - On Parquet: 9,000 × $0.00025 = $2.25/month
+   - SAVINGS: $65.25/month just from format conversion
+
+→ Problem gets WORSE as data grows:
+   - 6 months: CSVs grow to 9 GB → $0.045 per query
+   - 1 year: CSVs grow to 18 GB → $0.09 per query
+   - Parquet stays proportionally cheap (columnar pruning)
+
+→ Additional problems with raw CSV:
+   - No column pruning (Athena reads entire row)
+   - No predicate pushdown (no row group statistics)
+   - No compression (raw text wastes storage)
+   - String types everywhere (crawler couldn't infer dates — Project 23)
+   - Schema mismatches possible (source system adds column)
+
+CTO: "Convert everything to Parquet. Automate it."
+YOU: "Glue ETL job. Reads CSV from S3, transforms, writes Parquet.
+      Runs nightly after data lands. Athena queries Parquet only.
+      CSVs stay as raw backup in 'bronze' layer.
+      Parquet becomes the 'silver' query layer."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand WHY Parquet is better than CSV
+</span>→ CSV: row-based → must read entire row even for 1 column
+→ Parquet: columnar → reads only requested columns
+→ CSV: no type metadata → everything is string
+→ Parquet: embedded schema → exact types (int, double, date, timestamp)
+→ CSV: no compression by default → 1.5 GB raw text
+→ Parquet: Snappy compression built-in → ~200 MB for same data
+→ CSV: no statistics → Athena scans everything
+→ Parquet: row group statistics (min/max) → skips irrelevant chunks
+
+Step 2: Understand what Glue ETL does
+→ Managed Apache Spark service
+→ Reads from S3 (CSV, JSON, Parquet, ORC, Avro)
+→ Transforms data (clean, cast types, filter, join, rename)
+→ Writes to S3 in optimized format (Parquet, ORC)
+→ Updates Glue Catalog automatically
+→ Serverless: spins up workers, runs job, shuts down
+→ Billed per DPU-second (1 DPU = ~$0.44/hour)
+
+Step 3: Understand Glue's DynamicFrame
+→ Glue's extension of Spark DataFrame
+→ Handles schema inconsistencies (CSV columns that vary)
+→ ResolveChoice: handles ambiguous types (string vs int)
+→ ApplyMapping: rename and retype columns
+→ Relationalize: flatten nested structures
+→ Can convert to/from Spark DataFrame for complex operations
+
+Step 4: Plan the ETL pipeline
+→ Source: s3://bucket/daily_exports/orders/*.csv (raw CSV)
+→ Transform: cast types, clean nulls, validate
+→ Target: s3://bucket/silver/orders/*.parquet (optimized)
+→ Catalog: update Glue table to point at Parquet location
+→ Schedule: run nightly after CSV upload completes</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  S3 BRONZE LAYER (raw)                    S3 SILVER LAYER (optimized)
+  ────────────────────                     ─────────────────────────────
+  daily_exports/                           silver/
+   ├── orders/                              ├── orders/
+   │    ├── orders_20250101.csv             │    ├── part-00000.snappy.parquet
+   │    ├── orders_20250102.csv             │    ├── part-00001.snappy.parquet
+   │    └── ... (30 files, 1.5 GB)         │    └── ... (~200 MB total)
+   │                                        │
+   ├── customers/                           ├── customers/
+   │    └── ... (300 MB CSV)               │    └── ... (~40 MB Parquet)
+   │                                        │
+   └── products/                            └── products/
+        └── ... (60 MB CSV)                      └── ... (~8 MB Parquet)
+         │                                        ▲
+         │                                        │
+         └──────── GLUE ETL JOB ─────────────────┘
+                   (nightly)
+                   
+                   1. Read CSV from bronze
+                   2. Cast types (string → date, int, double)
+                   3. Clean nulls and invalid values
+                   4. Write Parquet to silver
+                   5. Update Glue Catalog
+
+  ATHENA QUERIES:
+  ───────────────
+  BEFORE: SELECT * FROM raw_orders         → scans 1,500 MB (CSV)
+  AFTER:  SELECT * FROM silver_orders      → scans 200 MB (Parquet)
+  COLUMN: SELECT status, amount FROM silver → scans 50 MB (2 columns only)
+
+  COST REDUCTION:
+  ───────────────
+  Glue job cost:  ~$0.15 per run (2 DPU × 5 minutes)
+  Savings/day:    ~$2.18 (from cheaper Athena queries)
+  Net savings:    $2.03/day = $60.90/month</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Athena CTAS (Create Table As Select)
+</span>→ CREATE TABLE silver_orders WITH (format='PARQUET') AS SELECT * FROM raw_orders
+→ Simple one-liner — converts and creates table
+→ BUT: runs as Athena query → charged per TB scanned ($7.50 for 1.5 GB)
+→ BUT: no incremental support — recreates entire table each time
+→ BUT: limited transformation capability
+→ Good for: one-time conversion, small tables
+→ Covered in Project 36
+
+Option B: Glue ETL Job (recommended)
+→ Full Spark engine for transformation
+→ Supports incremental processing (Job Bookmarks — Project 33)
+→ Rich transformation library (DynamicFrame)
+→ Handles schema evolution (ResolveChoice — Project 45)
+→ Can process multiple tables in one job
+→ Billed per DPU-second (cheaper than Athena for large conversions)
+→ SELECTED ✅
+
+Option C: EMR Spark Job
+→ Full Spark cluster you manage
+→ Maximum flexibility
+→ But: cluster management overhead, EC2 costs
+→ Overkill for simple CSV → Parquet conversion
+→ Use when: Glue's managed environment is too limiting
+
+Option D: Lambda function with PyArrow
+→ Read CSV → convert to Parquet → write to S3
+→ Works for small files (&lt; 500 MB)
+→ Lambda memory limit: 10 GB, timeout: 15 minutes
+→ Not suitable for 1.5 GB+ datasets
+→ Good for: single-file event-driven conversion
+
+DECISION: Option B — Glue ETL Job
+→ Right-sized for daily batch conversion
+→ Handles schema evolution as data grows
+→ Incremental processing with Job Bookmarks
+→ Integrates with Glue Catalog natively</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ALWAYS write Parquet with Snappy compression
+</span>   → Snappy: fast compression/decompression, good ratio
+   → GZIP: better ratio but slower (use for archival)
+   → Snappy is Parquet default — no extra configuration
+   → 1.5 GB CSV → ~200 MB Parquet with Snappy
+
+2. ALWAYS cast types during conversion
+   → CSV crawler inferred everything as STRING (Project 23)
+   → Cast in Glue: order_date STRING → DATE, quantity STRING → INT
+   → Parquet stores exact types → Athena queries work correctly
+   → No more WHERE order_date &gt; '2025-01-15' string comparison bugs
+
+3. ALWAYS coalesce output files to reasonable count
+   → Glue default: creates hundreds of tiny Parquet files
+   → Tiny files = slow Athena LIST + per-file overhead
+   → Ideal Parquet file size: 128 MB – 512 MB
+   → Use repartition() or coalesce() to control output count
+   → Detailed in Project 62 (small file problem)
+
+4. ALWAYS update Glue Catalog after writing Parquet
+   → Either: run crawler on silver/ prefix (automatic)
+   → Or: Glue job writes with catalog update enabled (programmatic)
+   → Without catalog update: Athena doesn't see new Parquet table
+
+5. KEEP both CSV and Parquet layers
+   → CSV = bronze (raw, immutable backup)
+   → Parquet = silver (optimized query layer)
+   → If Parquet gets corrupted: regenerate from CSV
+   → Never delete source CSVs after conversion
+
+6. SET Glue job parameters externally
+   → Don't hardcode S3 paths in job script
+   → Use job parameters: --source_path, --target_path
+   → Enables reuse across environments (dev/staging/prod)
+
+7. ENABLE Glue Job Bookmarks for incremental processing
+   → First run: processes ALL files
+   → Subsequent runs: processes only NEW files since last run
+   → Prevents reprocessing already-converted CSVs
+   → Covered deeply in Project 33
+
+8. LOG transformation metrics
+   → Input rows, output rows, dropped rows, type cast failures
+   → Write metrics to CloudWatch or S3
+   → Essential for data quality monitoring</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT delete source CSVs after conversion
+</span>   → Parquet is derived data — can be regenerated
+   → CSV is the source of truth — cannot be regenerated
+   → If conversion had a bug: you need CSVs to re-run
+   → Move old CSVs to Glacier (Project 4) — don't delete
+
+2. DO NOT create one giant Parquet file
+   → Single 1.5 GB Parquet file → single Athena worker reads it
+   → Other workers idle → slow query
+   → Split into 4-16 files for parallelism
+   → Rule: each file 128-512 MB
+
+3. DO NOT create thousands of tiny Parquet files
+   → Glue default with many input CSVs → many output files
+   → 1000 × 1 MB files → S3 LIST overhead dominates Athena query
+   → Use coalesce() to merge into fewer larger files
+   → This is the #1 Glue ETL performance issue (Project 62)
+
+4. DO NOT skip type casting
+   → Writing CSV data as-is to Parquet preserves STRING types
+   → Parquet with all STRING columns = almost no benefit over CSV
+   → The TYPE INFORMATION is what makes Parquet powerful
+   → Cast during ETL: string → int, double, date, timestamp, boolean
+
+5. DO NOT use Glue ETL for simple SELECT * conversion
+   → If no transformation needed: Athena CTAS is simpler (Project 36)
+   → Glue ETL shines when: type casting, filtering, joining, cleaning
+   → For pure format conversion: evaluate CTAS first
+
+6. DO NOT hardcode column names in Glue script
+   → Source schema may change (new column added)
+   → Hardcoded mapping breaks when schema evolves
+   → Use DynamicFrame's flexible schema handling
+   → Or: explicit mapping with fallback for unknown columns
+
+7. DO NOT over-provision DPUs
+   → 2 DPU (minimum) handles 1.5 GB CSV in ~5 minutes
+   → 10 DPU for same data: ~2 minutes but 5x cost
+   → Start with 2 DPU → increase only if job exceeds time budget
+   → Each DPU: 4 vCPU, 16 GB RAM
+
+8. DO NOT ignore Glue job error logs
+   → Job fails silently with partial output
+   → CloudWatch Logs: /aws-glue/jobs/error
+   → Always check: output row count vs input row count
+   → Missing rows = type cast failures or filter issues</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use               │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ CSV → Parquet with transforms    │ Glue ETL Job      │ Full Spark engine, type casting, │
+│                                  │ (this project)    │ schema handling, incremental     │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ CSV → Parquet (no transforms)    │ Athena CTAS       │ One SQL statement, simple        │
+│                                  │ (Project 36)      │ No Spark overhead                │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Small file (&lt; 500 MB) event-     │ Lambda + PyArrow  │ Instant trigger, sub-second      │
+│ driven conversion                │                   │ startup, pay per invocation      │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Complex multi-source ETL         │ Glue ETL Job      │ Join 5 tables, aggregate,        │
+│ (joins, aggregations)            │                   │ business logic                   │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Non-technical user data cleaning │ Glue DataBrew     │ Visual UI, no code               │
+│                                  │ (Project 53)      │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Massive scale (100 TB+)          │ EMR Spark         │ Full control, custom cluster     │
+│                                  │                   │ tuning, spot instances           │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ Real-time streaming conversion   │ Kinesis Firehose  │ Converts JSON → Parquet in       │
+│                                  │ (Project 72)      │ real-time as data streams in     │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE ETL</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data is already in Parquet/ORC
+</span>   → No conversion needed — already optimized
+   → Glue ETL adds cost for zero benefit
+   → Just crawl and query directly
+
+2. When total data &lt; 100 MB
+   → Glue minimum: 2 DPU × 10 min billing = ~$0.15
+   → Athena CTAS on 100 MB CSV: ~$0.0005
+   → CTAS is 300x cheaper for tiny datasets
+
+3. When you need sub-minute latency
+   → Glue job cold start: 30-60 seconds
+   → Job execution: 2-10 minutes minimum
+   → For real-time: Lambda or Kinesis Firehose
+
+4. When transformation is pure SQL (no Python/Spark needed)
+   → Athena CTAS handles SQL-based transformations
+   → Glue adds Spark overhead unnecessarily
+   → Use Glue only when you need Python logic, loops, API calls
+
+5. When budget is extremely tight and data is small
+   → Glue minimum billing: 1 minute per DPU (minimum 2 DPU)
+   → $0.44/hour per DPU → $0.015 per minute per DPU
+   → Even a 30-second job costs ~$0.03
+   → For micro-budgets: Lambda + PyArrow for small files</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│                   GLUE ETL JOB — INTERNAL EXECUTION FLOW                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  PHASE 1: JOB INITIALIZATION                                                │
+│  ───────────────────────────                                                │
+│  1. Glue service receives StartJobRun API call                              │
+│  2. Allocates DPU workers from managed fleet                                │
+│     → 1 DPU = 4 vCPU + 16 GB RAM                                           │
+│     → Minimum: 2 DPU for Spark jobs                                         │
+│     → Maximum: 100 DPU (soft limit)                                         │
+│  3. Initializes Spark cluster on allocated workers                          │
+│     → Spark driver on one worker                                            │
+│     → Spark executors on remaining workers                                  │
+│  4. Downloads job script from S3                                            │
+│  5. Loads Glue libraries (GlueContext, DynamicFrame)                        │
+│  6. Cold start total: 30-90 seconds                                         │
+│                                                                             │
+│  PHASE 2: DATA READING (Source)                                              │
+│  ──────────────────────────────                                              │
+│  1. GlueContext.create_dynamic_frame.from_catalog() or from_options()       │
+│  2. Reads table metadata from Glue Data Catalog                             │
+│     → S3 location, format, columns, SerDe                                   │
+│  3. Spark generates S3 file list                                            │
+│  4. Partitions files across executor tasks                                  │
+│  5. Each task reads its assigned files in parallel                          │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  DynamicFrame vs DataFrame:                                     │        │
+│  │                                                                 │        │
+│  │  SPARK DATAFRAME:                                               │        │
+│  │  → Strict schema: all rows must match declared schema           │        │
+│  │  → Schema mismatch → job fails                                  │        │
+│  │  → Standard Spark — works everywhere                            │        │
+│  │                                                                 │        │
+│  │  GLUE DYNAMICFRAME:                                             │        │
+│  │  → Flexible schema: each row can have different structure       │        │
+│  │  → Schema mismatch → handled gracefully                         │        │
+│  │  → ChoiceType: column with mixed types (int + string)           │        │
+│  │  → ResolveChoice: you decide how to handle mixed types          │        │
+│  │  → Glue-specific — only in AWS Glue                             │        │
+│  │                                                                 │        │
+│  │  WHEN TO USE WHICH:                                             │        │
+│  │  → DynamicFrame: reading messy CSV data with inconsistencies    │        │
+│  │  → DataFrame: complex transformations (window, UDF, ML)         │        │
+│  │  → Convert between them: toDF() and fromDF()                    │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 3: TRANSFORMATION                                                    │
+│  ────────────────────────                                                   │
+│  1. DynamicFrame transforms (Glue-native):                                  │
+│     → ApplyMapping: rename columns, change types                            │
+│     → ResolveChoice: handle ambiguous types                                 │
+│     → DropNullFields: remove columns that are always null                   │
+│     → Filter: remove rows based on condition                                │
+│     → Relationalize: flatten nested structures                              │
+│                                                                             │
+│  2. Spark DataFrame transforms (via toDF()):                                │
+│     → withColumn: add/modify columns                                        │
+│     → filter/where: row filtering                                           │
+│     → groupBy/agg: aggregations                                             │
+│     → join: combine tables                                                  │
+│     → Window functions                                                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  APPLYMAPPING EXAMPLE:                                          │        │
+│  │                                                                 │        │
+│  │  Input (CSV):                                                   │        │
+│  │  ┌──────────┬─────────┬──────────┬────────────┐                 │        │
+│  │  │ order_id │ qty     │ amount   │ order_date │                 │        │
+│  │  │ (string) │ (string)│ (string) │ (string)   │                 │        │
+│  │  └──────────┴─────────┴──────────┴────────────┘                 │        │
+│  │                                                                 │        │
+│  │  ApplyMapping([                                                 │        │
+│  │    ("order_id", "string", "order_id", "string"),                │        │
+│  │    ("qty", "string", "quantity", "int"),        ← rename+retype │        │
+│  │    ("amount", "string", "total_amount", "double"), ← retype    │        │
+│  │    ("order_date", "string", "order_date", "date")  ← retype    │        │
+│  │  ])                                                             │        │
+│  │                                                                 │        │
+│  │  Output (Parquet):                                              │        │
+│  │  ┌──────────┬──────────┬──────────────┬────────────┐            │        │
+│  │  │ order_id │ quantity │ total_amount │ order_date │            │        │
+│  │  │ (string) │ (int)   │ (double)     │ (date)     │            │        │
+│  │  └──────────┴──────────┴──────────────┴────────────┘            │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 4: DATA WRITING (Target)                                             │
+│  ──────────────────────────────                                             │
+│  1. GlueContext.write_dynamic_frame.from_options()                          │
+│  2. Spark partitions data across output tasks                               │
+│  3. Each task writes one Parquet file to S3                                 │
+│  4. Parquet writer:                                                         │
+│     → Creates row groups (default: 128 MB per group)                        │
+│     → Computes column statistics (min, max, null count)                     │
+│     → Applies Snappy compression per column chunk                           │
+│     → Writes Parquet footer with schema + statistics                        │
+│  5. Files written as: part-00000-{hash}.snappy.parquet                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  PARQUET FILE INTERNAL STRUCTURE:                               │        │
+│  │                                                                 │        │
+│  │  ┌─────────────────────────────────────┐                        │        │
+│  │  │ Row Group 1 (128 MB uncompressed)   │                        │        │
+│  │  │  ├── Column: order_id (string)      │                        │        │
+│  │  │  │   └── compressed data chunks     │                        │        │
+│  │  │  ├── Column: quantity (int)         │                        │        │
+│  │  │  │   └── compressed data chunks     │                        │        │
+│  │  │  ├── Column: total_amount (double)  │                        │        │
+│  │  │  │   └── compressed data chunks     │                        │        │
+│  │  │  └── Column: order_date (date)      │                        │        │
+│  │  │      └── compressed data chunks     │                        │        │
+│  │  ├─────────────────────────────────────┤                        │        │
+│  │  │ Row Group 2 ...                     │                        │        │
+│  │  ├─────────────────────────────────────┤                        │        │
+│  │  │ FOOTER:                             │                        │        │
+│  │  │  ├── Schema (column names + types)  │                        │        │
+│  │  │  ├── Row group locations            │                        │        │
+│  │  │  ├── Column statistics per group:   │                        │        │
+│  │  │  │   ├── min value                  │                        │        │
+│  │  │  │   ├── max value                  │                        │        │
+│  │  │  │   ├── null count                 │                        │        │
+│  │  │  │   └── distinct count (optional)  │                        │        │
+│  │  │  └── Total row count                │                        │        │
+│  │  └─────────────────────────────────────┘                        │        │
+│  │                                                                 │        │
+│  │  WHY THIS STRUCTURE MATTERS:                                    │        │
+│  │  → Athena reads FOOTER first (tiny, fast)                       │        │
+│  │  → Knows which row groups to skip (min/max filtering)           │        │
+│  │  → Reads only needed COLUMN CHUNKS (column pruning)             │        │
+│  │  → Decompresses only what it reads                              │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+│  PHASE 5: CATALOG UPDATE                                                    │
+│  ───────────────────────                                                    │
+│  1. If catalog update enabled in write options:                             │
+│     → Glue automatically creates/updates table in catalog                   │
+│     → Points table location to new Parquet S3 path                          │
+│  2. If not enabled: run crawler (Project 23) on output path                 │
+│  3. Athena sees updated table immediately after catalog update              │
+│                                                                             │
+│  PHASE 6: JOB COMPLETION                                                    │
+│  ───────────────────────                                                    │
+│  1. Spark job finishes                                                      │
+│  2. Workers deallocated                                                     │
+│  3. Job metrics written to CloudWatch                                       │
+│  4. Job status: SUCCEEDED / FAILED / TIMEOUT                                │
+│  5. Logs available in CloudWatch: /aws-glue/jobs/output                     │
+│                                                                             │
+│  COST MODEL:                                                                │
+│  ──────────                                                                 │
+│  → Billed per DPU-second (minimum 1 minute per DPU)                         │
+│  → 1 DPU-hour = $0.44                                                       │
+│  → 2 DPU × 5 minutes = 2 × 5/60 × $0.44 = $0.073                          │
+│  → 10 DPU × 5 minutes = 10 × 5/60 × $0.44 = $0.367                        │
+│  → Glue 2.0+: per-second billing (no 10-min minimum)                       │
+│  → Glue 1.0: 10-minute minimum billing (legacy)                            │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Glue creates 500 tiny Parquet files for 1.5 GB input"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: 30 input CSV files → Spark creates many tasks → many output files
+→ Each Spark task writes one output file
+→ 500 × 3 MB files instead of 4 × 200 MB files
+→ Athena impact: slow S3 LIST, per-file overhead, expensive queries
+→ Fix: repartition() or coalesce() before writing
+→ dyf.toDF().coalesce(4).write.parquet(...)
+→ 4 files for 2 dc2.large nodes × 2 slices = optimal for Redshift too
+
+PITFALL 2: "Type cast fails — job errors on 'N/A' in numeric column"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CSV has "N/A", "", or "null" in numeric columns
+→ ApplyMapping with ("amount", "string", "amount", "double") → crash
+→ Fix A: ResolveChoice with "cast:double" (casts or nulls invalid)
+→ Fix B: Filter invalid rows before type cast
+→ Fix C: Use Spark's col().cast("double") which returns null on failure
+
+PITFALL 3: "Output Parquet has all STRING columns"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: no ApplyMapping or type casting in the job
+→ Just read CSV → write Parquet → still STRING types
+→ Parquet file is smaller (compression) but no column pruning benefit
+→ Fix: ALWAYS include explicit type mapping in the job
+
+PITFALL 4: "Job runs successfully but Athena shows old data"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Glue Catalog table still points to old S3 location
+→ Job wrote Parquet to new path but catalog not updated
+→ Fix: enable catalog update in write_dynamic_frame
+→ Or: run crawler on output path after job completes (Project 23)
+
+PITFALL 5: "Job takes 15 minutes for 1.5 GB — expected 5 minutes"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: only 2 DPU for data with many columns and complex transforms
+→ Cause B: Spark repartition/shuffle on large dataset
+→ Cause C: writing too many small files (S3 multipart overhead)
+→ Fix A: increase DPU to 4-6 for faster processing
+→ Fix B: minimize shuffles — use coalesce() not repartition()
+→ Fix C: coalesce to fewer output files
+
+PITFALL 6: "Glue Job Bookmark processes same files again"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: bookmark only works with from_catalog() not from_options()
+→ Or: job failed midway → bookmark not committed
+→ Fix: use from_catalog() for bookmark support
+→ Reset bookmark: aws glue reset-job-bookmark --job-name ...
+→ Covered deeply in Project 33
+
+PITFALL 7: "Parquet output is LARGER than CSV input"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: all columns are STRING → Parquet can't compress efficiently
+→ Strings compress poorly compared to integers/doubles
+→ Fix: cast numeric columns to proper types BEFORE writing
+→ int + double columns compress 5-10x better than string equivalents
+→ With proper types: 1.5 GB CSV → ~200 MB Parquet
+→ Without proper types: 1.5 GB CSV → ~1.2 GB Parquet (barely better)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME vs DPU:
+</span>━━━━━━━━━━━━━━━━━━
+→ 100 MB:   2 DPU, ~2 min,  cost: ~$0.03
+→ 1 GB:     2 DPU, ~5 min,  cost: ~$0.07
+→ 10 GB:    4 DPU, ~10 min, cost: ~$0.29
+→ 100 GB:   10 DPU, ~20 min, cost: ~$1.47
+→ 1 TB:     20 DPU, ~45 min, cost: ~$6.60
+→ 10 TB:    50 DPU, ~2 hrs,  cost: ~$44.00
+
+DPU SIZING FORMULA (rough):
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ 2 DPU handles ~1 GB per 5 minutes (simple conversion)
+→ Add 1 DPU per additional 500 MB for complex transforms
+→ Start small, measure, increase if needed
+→ Auto-scaling available: Glue 3.0+ with flex execution
+
+OUTPUT FILE SIZING:
+━━━━━━━━━━━━━━━━━━
+→ Target: 128-512 MB per Parquet file
+→ Formula: total_data_size / target_file_size = file_count
+→ 1.5 GB / 200 MB = ~8 files (use coalesce(8))
+→ 10 GB / 256 MB = ~40 files (use coalesce(40))
+
+INCREMENTAL PROCESSING (Project 33):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Day 1: process 1.5 GB (30 files) → 5 minutes
+→ Day 2: process 50 MB (1 new file) → 2 minutes
+→ Day 30: process 50 MB (1 new file) → 2 minutes
+→ Without incremental: Day 30 processes 3 GB (60 files) → 8 minutes
+→ With incremental: always ~2 minutes (only new files)
+
+COST OPTIMIZATION:
+━━━━━━━━━━━━━━━━━━
+→ Use Glue 3.0+ for per-second billing (vs 10-min minimum in 1.0)
+→ Use auto-scaling to avoid over-provisioning DPUs
+→ Schedule during off-peak for potential cost benefits
+→ Use Job Bookmarks to avoid reprocessing (Project 33)
+→ Combine multiple small tables in one job run</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CONVERSION WORKED CORRECTLY:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Row count comparison:
+   → CSV:     SELECT COUNT(*) FROM raw_orders;
+   → Parquet: SELECT COUNT(*) FROM silver_orders;
+   → Must match exactly
+
+2. Aggregate comparison:
+   → CSV:     SELECT SUM(total_amount) FROM raw_orders;
+   → Parquet: SELECT SUM(total_amount) FROM silver_orders;
+   → Must match (or close — floating point rounding)
+
+3. Schema verification:
+   → Check Glue Catalog: column types should be int/double/date
+   → Not all string (common mistake)
+
+4. File size verification:
+   → aws s3 ls s3://bucket/silver/orders/ --summarize
+   → Should be ~200 MB (vs 1.5 GB CSV)
+   → If similar to CSV → types not cast properly
+
+5. Athena data scan comparison:
+   → Same query on both tables
+   → Parquet should scan 70-95% less data
+
+6. Sample data spot-check:
+   → SELECT * FROM silver_orders LIMIT 10;
+   → Verify values look correct
+   → Dates are actual dates, not strings
+   → Numbers are actual numbers, not quoted strings</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(25)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create IAM Role for Glue ETL Job</h3>
+
+<h3>Step 2: Glue ETL Job Script (The Core Conversion Logic)</h3>
+
+<h3>Step 3: Create and Configure Glue Job</h3>
+
+<h3>Step 4: Create Catalog Table for Silver Layer (After Job Runs)</h3>
+
+<h3>Step 5: Create Jobs for Customers and Products Tables</h3>
+
+<h3>Step 6: Validate Conversion — CSV vs Parquet Comparison</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+============================================================
+🔍 CONVERSION VALIDATION REPORT
+============================================================
+
+────────────────────────────────────────────────────────
+🔍 VALIDATING: raw_orders → silver_orders
+────────────────────────────────────────────────────────
+   ⏳ Counting CSV rows...
+   ⏳ Counting Parquet rows...
+
+   📊 Row Count: ✅ MATCH
+      CSV:     10,000,000
+      Parquet: 10,000,000
+
+   💰 Data Scan Comparison:
+      CSV scan:     1502.438 MB
+      Parquet scan: 0.000 MB
+      Savings:      100.0% less data scanned
+
+   ⏳ CSV aggregate check...
+   ⏳ Parquet aggregate check...
+
+   📊 Revenue Check: ✅ MATCH
+      CSV total:     $2548319472.50
+      Parquet total: $2548319472.50
+
+   📋 Schema Comparison:
+      Column               CSV Type        Parquet Type    Status
+      ──────────────────── ─────────────── ─────────────── ──────────
+      order_id             string          string          ✅ Same
+      customer_id          string          string          ✅ Same
+      product_id           string          string          ✅ Same
+      quantity             string          int             ⬆️ IMPROVED
+      unit_price           string          double          ⬆️ IMPROVED
+      total_amount         string          double          ⬆️ IMPROVED
+      status               string          string          ✅ Same
+      order_date           string          date            ⬆️ IMPROVED
+
+────────────────────────────────────────────────────────
+🔍 VALIDATING: raw_customers → silver_customers
+────────────────────────────────────────────────────────
+   📊 Row Count: ✅ MATCH
+      CSV:     1,500,000
+      Parquet: 1,500,000
+
+   💰 Data Scan Comparison:
+      CSV scan:     298.125 MB
+      Parquet scan: 0.000 MB
+      Savings:      100.0% less data scanned
+
+────────────────────────────────────────────────────────
+🔍 VALIDATING: raw_products → silver_products
+────────────────────────────────────────────────────────
+   📊 Row Count: ✅ MATCH
+      CSV:     150,000
+      Parquet: 150,000
+
+============================================================
+📊 VALIDATION SUMMARY
+============================================================
+   ✅ PASSED — raw_orders → silver_orders
+   ✅ PASSED — raw_customers → silver_customers
+   ✅ PASSED — raw_products → silver_products
+
+   🎉 All conversions validated successfully!
+   Analysts can now query silver_* tables for optimal cost</code></pre></div>
+<h3>Step 7: S3 Storage Comparison</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+======================================================================
+💾 STORAGE COMPARISON: CSV (Bronze) vs PARQUET (Silver)
+======================================================================
+
+   Table           CSV Size   CSV Files      Parquet   PQ Files    Savings
+   ─────────────── ──────────── ────────── ──────────── ────────── ──────────
+   Orders            1502.4 MB        30      198.7 MB         4     86.8%
+   Customers          298.1 MB        30       39.2 MB         4     86.9%
+   Products            58.6 MB        30        7.8 MB         4     86.7%
+   ─────────────── ──────────── ────────── ──────────── ────────── ──────────
+   TOTAL             1859.1 MB                245.7 MB                86.8%
+
+   💰 Monthly Storage Cost (S3 Standard):
+      CSV:     $0.0418/month
+      Parquet: $0.0055/month
+      Savings: $0.0363/month
+
+   💰 Monthly Athena Query Cost (9,000 queries):
+      CSV tables:     $67.50/month
+      Parquet tables: $2.96/month
+      Savings:        $64.54/month
+======================================================================</code></pre></div>
+<h3>Step 8: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 with CSV files (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Glue Catalog with raw_* tables (Project 23)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Athena workgroups configured (Project 24)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create IAM role for Glue ETL</span><span>
+</span>python 01_create_glue_etl_role.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Upload Glue job script to S3</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Copy 02_csv_to_parquet_job.py content</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    Upload: aws s3 cp 02_csv_to_parquet_job.py s3://quickcart-raw-data-prod/glue-scripts/</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Create Glue job definition and run</span><span>
+</span>python 03_create_glue_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Create silver layer catalog tables</span><span>
+</span>python 04_create_silver_catalog.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Create and run jobs for all tables</span><span>
+</span>python 05_create_all_conversion_jobs.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Validate conversion</span><span>
+</span>python 06_validate_conversion.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Compare storage savings</span><span>
+</span>python 07_storage_comparison.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 8. Tell analysts: use silver_* tables instead of raw_*</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue ETL = managed Apache Spark for serverless data transformation
+→ DynamicFrame handles messy CSV data with flexible schema
+→ ApplyMapping: rename columns + cast types in one operation
+→ ResolveChoice: gracefully handle mixed types (string + int in same column)
+→ CSV → Parquet conversion delivers 3 benefits:
+   1. Storage: 87% smaller (1.5 GB → 200 MB)
+   2. Query cost: 95% cheaper ($67/mo → $3/mo on Athena)
+   3. Query speed: 5-10x faster (columnar reads + row group skipping)
+→ TYPE CASTING is critical — Parquet with all strings barely helps
+→ Coalesce output files: prevent thousands of tiny files
+→ Keep both layers: CSV (bronze/raw) + Parquet (silver/optimized)
+→ Job Bookmarks enable incremental processing (don't reprocess old files)
+→ Programmatic catalog tables give exact control over schema
+→ Always validate: row count + aggregates + schema after conversion
+
+BRONZE → SILVER PATTERN (Foundation for Project 44):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ BRONZE: raw CSVs as-is from source (daily_exports/)
+→ SILVER: cleaned, typed, optimized Parquet (silver/)
+→ GOLD:  aggregated, business-ready tables (gold/) — Project 44
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 where source CSVs live
+→ Project 23: Crawlers created raw_* catalog tables (source for Glue)
+→ Project 24: Athena queries that will be 30x cheaper on Parquet
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 26: Add partitioning to Parquet for ANOTHER 10x cost savings
+→ Project 33: Job Bookmarks for incremental processing (don't reprocess)
+→ Project 34: Complex transforms (filter, join, aggregate inside Glue)
+→ Project 35: Chain Crawler → ETL → Crawler as orchestrated workflow
+→ Project 44: Full Bronze → Silver → Gold data lake architecture
+→ Project 45: Schema evolution when source columns change
+→ Project 62: Small file compaction problem and solutions</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Bronze layer: raw CSVs (daily_exports/) ✅
+→ Silver layer: optimized Parquet (silver/) ✅
+→ Athena queries are 30x cheaper on Parquet ✅
+
+BUT: analyst runs a date-filtered query:
+  SELECT * FROM silver_orders WHERE order_date = DATE '2025-01-15'
+
+Result: scans 200 MB (entire Parquet dataset)
+Expected: should scan only ~7 MB (one day's data)
+
+WHY? The Parquet files contain ALL dates mixed together
+→ Athena must read every file to find January 15th rows
+→ Parquet row group statistics help a BIT (skip some groups)
+→ But true date filtering requires PARTITIONING
+
+With partitioning:
+  s3://bucket/silver/orders/order_date=2025-01-15/file.parquet
+→ Athena reads ONLY that folder → scans 7 MB instead of 200 MB
+→ ANOTHER 30x cost reduction on top of CSV → Parquet savings
+
+Total optimization chain:
+  CSV unpartitioned:        $0.0075 per query (1,500 MB scan)
+  Parquet unpartitioned:    $0.00025 per query (50 MB scan)
+  Parquet PARTITIONED:      $0.000008 per query (1.7 MB scan)
+  → 1000x total cost reduction from original CSV
+
+→ Project 26: "Slash Athena Query Cost by 90% with Partitioning"
+→ Introduces: Partitioned Parquet → MSCK REPAIR → Partition Projection
+→ The final piece of the Athena cost optimization puzzle</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-24.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 25 of 80</span>
+    <span class="nav-project-title">CONVERT RAW CSVs INTO OPTIMIZED PARQUET VIA GLUE</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-26.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-26.html") window.location = "project-26.html";
+  if (e.key === 'ArrowLeft' && "project-24.html") window.location = "project-24.html";
+});
+</script>
+</body>
+</html>

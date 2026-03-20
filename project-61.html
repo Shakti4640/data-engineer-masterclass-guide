@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 61: ACCOUNT A&#x27;s MARIADB ON EC2 MUST FEED ACCOUNT B&#x27;s REDSHIFT — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:76%"></div></div>
+<div id="progress-label">76%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 61 of 80</div>
+  <div class="project-title">ACCOUNT A&#x27;s MARIADB ON EC2 MUST FEED ACCOUNT B&#x27;s REDSHIFT</div>
+  <div class="project-tags"><span class="project-tag">EC2</span><span class="project-tag">MariaDB</span><span class="project-tag">Redshift</span><span class="project-tag phase">🟠 Phase 4: Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" has grown — acquired a subsidiary "FastShip"
+</span>
+ACCOUNT A [REDACTED:BANK_ACCOUNT_NUMBER]1) — "QuickCart-Operations"
+→ VPC: vpc-0aaa1111 (CIDR: 10.1.0.0/16) in us-east-2
+→ EC2 instance running MariaDB (Project 8)
+   - Private IP: 10.1.3.50
+   - Port: 3306
+   - Contains: orders, customers, products tables
+   - Security Group: sg-mariadb-ops (allows 10.1.0.0/16 on 3306)
+→ This is the OLTP source of truth
+
+ACCOUNT B (222222222222) — "QuickCart-Analytics"
+→ VPC: vpc-0bbb2222 (CIDR: 10.2.0.0/16) in us-east-2
+→ Redshift cluster: quickcart-analytics-cluster
+   - Private subnet: 10.2.5.0/24
+   - Port: 5439
+→ Glue jobs run here for all ETL
+→ Analysts query Redshift for dashboards
+
+PROBLEM:
+→ Analytics team needs orders/customers/products data in Redshift
+→ Data lives in Account A's MariaDB
+→ Accounts are completely isolated — no network path exists
+→ Cannot expose MariaDB to public internet
+→ Cannot copy credentials across accounts
+→ Must be automated — nightly refresh at 2 AM
+→ Security team requires: no public endpoints, encrypted in transit, audit trail
+
+CTO: "We need Account A's operational data in Account B's warehouse.
+      Both stay private. Make it work."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the NETWORK problem first
+</span>→ Two VPCs in two different AWS accounts
+→ By default: ZERO connectivity between them
+→ MariaDB is on a PRIVATE subnet — no public IP
+→ Redshift is on a PRIVATE subnet — no public IP
+→ Even if Glue (Account B) wanted to connect → packets have no route
+
+Step 2: Identify what must talk to what
+→ Glue ENI (Account B VPC) → MariaDB (Account A VPC) on port 3306
+→ Glue ENI (Account B VPC) → Redshift (Account B VPC) on port 5439
+→ Glue ENI (Account B VPC) → S3 (for temp storage) via VPC Endpoint
+
+Step 3: Evaluate cross-account network options
+
+┌──────────────────────────┬──────────────┬───────────────────────────────────┐
+│ Option                   │ Complexity   │ Fit                               │
+├──────────────────────────┼──────────────┼───────────────────────────────────┤
+│ VPC Peering              │ Low-Medium   │ ✅ Best for 2-account, same-region │
+│ Transit Gateway          │ Medium-High  │ Overkill — designed for 10+ VPCs  │
+│ PrivateLink              │ Medium       │ Good for service exposure, not DB │
+│ VPN over Internet        │ High         │ Unnecessary — both in AWS         │
+│ Public IP + Security Grp │ Low          │ ❌ Security nightmare              │
+│ Dump to S3 + cross-acct  │ Low          │ Viable but adds latency/steps     │
+│ DMS (Database Migration) │ Medium       │ Viable but still needs VPC Peering│
+└──────────────────────────┴──────────────┴───────────────────────────────────┘
+
+DECISION: VPC Peering + Glue JDBC
+→ Simplest secure path for 2-account connectivity
+→ No data traverses public internet
+→ Traffic stays on AWS backbone
+→ Glue in Account B connects directly to MariaDB in Account A</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+  ACCOUNT [REDACTED:BANK_ACCOUNT_NUMBER]111)                    ACCOUNT [REDACTED:BANK_ACCOUNT_NUMBER]222)
+  ┌─────────────────────────┐                ┌──────────────────────────────┐
+  │ VPC: 10.1.0.0/16        │                │ VPC: 10.2.0.0/16             │
+  │                         │                │                              │
+  │  ┌──────────────────┐   │   VPC Peering  │  ┌────────────────────────┐  │
+  │  │ EC2 + MariaDB    │   │◄──────────────►│  │ Glue ETL Job           │  │
+  │  │ 10.1.3.50:3306   │   │  pcx-0abcdef   │  │ (ENI in 10.2.6.0/24)  │  │
+  │  │ sg-mariadb-ops   │   │                │  │ sg-glue-eni            │  │
+  │  └──────────────────┘   │                │  └───────────┬────────────┘  │
+  │                         │                │              │               │
+  │  Route Table:           │                │              ▼               │
+  │  10.2.0.0/16 → pcx-*   │                │  ┌────────────────────────┐  │
+  │                         │                │  │ Redshift Cluster       │  │
+  │  SG: allow 10.2.6.0/24 │                │  │ 10.2.5.x:5439         │  │
+  │       on port 3306      │                │  │ sg-redshift-analytics  │  │
+  │                         │                │  └────────────────────────┘  │
+  │                         │                │                              │
+  │                         │                │  Route Table:                │
+  │                         │                │  10.1.0.0/16 → pcx-*        │
+  └─────────────────────────┘                └──────────────────────────────┘
+
+FLOW:
+1. VPC Peering connects both VPCs at network layer
+2. Route tables in BOTH VPCs point to peering connection
+3. Security groups in BOTH VPCs allow cross-VPC traffic
+4. Glue job (Account B) uses JDBC to READ from MariaDB (Account A)
+5. Glue job transforms data → writes to Redshift (Account B)
+6. All traffic: private, encrypted, auditable</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: VPC Peering + Glue JDBC Direct ✅ (CHOSEN)
+</span>→ Glue ENI sits in Account B's VPC
+→ Peering routes traffic to Account A's MariaDB
+→ Single Glue job: read MariaDB → transform → write Redshift
+→ Cleanest architecture, fewest moving parts
+
+Option B: Dump MariaDB → S3 (Account A) → Cross-Account S3 Read → Glue (Account B)
+→ Avoids VPC Peering entirely
+→ But: extra step (dump script), extra storage, extra latency
+→ Lose real-time column selection (must dump entire table)
+→ Already covered in Projects 20 + 56 — combine those
+
+Option C: AWS DMS (Database Migration Service)
+→ Purpose-built for database replication
+→ But: DMS replication instance STILL needs VPC Peering to reach source
+→ Adds another managed service + cost ($0.018/hr for dms.t3.medium)
+→ Better for continuous CDC — overkill for nightly batch
+
+Option D: Transit Gateway
+→ Designed for hub-and-spoke with 10+ VPCs
+→ $0.05/hr + $0.02/GB — expensive for 2-VPC setup
+→ Revisit when QuickCart has 5+ accounts
+
+DECISION: Option A — minimal services, maximum control, interview-relevant</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Use NON-OVERLAPPING CIDRs
+</span>   → Account A: 10.1.0.0/16
+   → Account B: 10.2.0.0/16
+   → VPC Peering FAILS if CIDRs overlap — this is NON-NEGOTIABLE
+
+2. Place Glue ENIs in a DEDICATED subnet
+   → Create subnet 10.2.6.0/24 specifically for Glue
+   → Attach dedicated security group sg-glue-eni
+   → Makes security rules surgical and auditable
+
+3. Security groups: reference by CIDR, not by SG ID
+   → Cross-account SG referencing works ONLY within same peering
+   → Safer to use CIDR blocks explicitly
+   → sg-mariadb-ops: allow 10.2.6.0/24 on 3306
+
+4. Enable DNS resolution on peering connection
+   → Both sides must enable:
+     - "Allow DNS resolution from Account B" (requester side)
+     - "Allow DNS resolution from Account A" (accepter side)
+   → Without this: Glue can reach IP but not hostname
+
+5. Create MariaDB user specifically for Glue
+   → User: glue_reader@'10.2.%'
+   → Grants: SELECT only on needed tables
+   → No INSERT/UPDATE/DELETE — principle of least privilege
+
+6. Store MariaDB credentials in Account B's Secrets Manager
+   → Glue Connection references secret ARN
+   → Rotation possible without changing Glue job (Project 70)
+
+7. Enable VPC Flow Logs on BOTH VPCs
+   → Proves to security team: traffic flows only on expected ports
+   → Helps debug "connection timeout" issues
+
+8. Test connectivity BEFORE building Glue job
+   → Launch EC2 in Account B's Glue subnet
+   → Attempt: mysql -h 10.1.3.50 -P 3306 -u glue_reader -p
+   → If this works → Glue will work
+   → If this fails → fix network first, don't blame Glue</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT make MariaDB publicly accessible
+</span>   → "Just give it an Elastic IP and whitelist Account B's NAT Gateway"
+   → This exposes DB to entire internet — one SG misconfiguration = breach
+   → VPC Peering keeps traffic 100% private
+
+2. DO NOT use overlapping CIDRs
+   → If both VPCs use 10.0.0.0/16 → peering creation fails
+   → If both use 172.31.0.0/16 (default VPC) → same problem
+   → ALWAYS use custom VPCs with planned CIDR allocation
+
+3. DO NOT forget route tables on BOTH sides
+   → Peering connection alone does NOTHING
+   → You must add routes in BOTH VPCs pointing to the peering connection
+   → Missing route on Account A side = packets go to Account A but can't return
+
+4. DO NOT open all ports in security groups
+   → "Allow all traffic from 10.2.0.0/16" — too broad
+   → Only allow port 3306 from 10.2.6.0/24 (Glue subnet only)
+
+5. DO NOT use MariaDB root user for Glue
+   → Root has DROP DATABASE, GRANT, SHUTDOWN privileges
+   → One bug in Glue script = catastrophe
+   → Create dedicated read-only user
+
+6. DO NOT skip testing with EC2 before configuring Glue
+   → Glue connection errors are vague: "Connection timed out"
+   → Could mean: wrong route, wrong SG, wrong subnet, wrong password
+   → EC2 test isolates NETWORK from APPLICATION issues
+
+7. DO NOT peer VPCs across regions for this use case
+   → Inter-region peering: $0.01/GB data transfer
+   → Latency: 50-100ms vs &lt;1ms same-region
+   → Both VPCs must be in SAME region (us-east-2)
+
+8. DO NOT create peering from wrong account direction then wonder why
+   → Account A REQUESTS, Account B ACCEPTS (or vice versa)
+   → Requester and accepter must BOTH modify route tables
+   → Peering stays "pending-acceptance" until accepter approves</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────┬──────────────────┬───────────────────────────────────────┐
+</span>│ Scenario                    │ Use              │ Why                                   │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ 2 VPCs, same region,       │ VPC Peering      │ Free (no hourly charge), low latency, │
+│ simple connectivity         │                  │ no bandwidth limit                    │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ 5+ VPCs, hub-and-spoke     │ Transit Gateway  │ Centralized routing, scales to 5000   │
+│ topology                    │                  │ VPCs, but $0.05/hr + $0.02/GB         │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Expose single service       │ PrivateLink      │ Consumer sees ENI in their VPC,       │
+│ (API, NLB) across accounts  │                  │ no route table changes needed          │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ On-prem to AWS              │ Site-to-Site VPN │ Encrypted tunnel over internet         │
+│                             │ or Direct Connect│ or dedicated fiber                     │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Continuous DB replication   │ AWS DMS          │ CDC support, minimal source impact     │
+│ with CDC                    │                  │ (still needs VPC Peering underneath)   │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Batch extract with          │ Glue JDBC over   │ Serverless, managed, transforms       │
+│ transformation              │ VPC Peering      │ in-flight, no infra to manage          │
+├─────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ File-based transfer only    │ S3 Cross-Account │ No VPC Peering needed, simpler        │
+│ (no direct DB access)       │ (Project 56)     │ but requires dump step                │
+└─────────────────────────────┴──────────────────┴───────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE THIS PATTERN</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When source DB is in a DIFFERENT region
+</span>   → Inter-region peering adds cost + latency
+   → Better: dump to S3 in source region → S3 CRR → process in target region
+
+2. When you need REAL-TIME replication (&lt; 1 minute lag)
+   → VPC Peering + Glue = batch (minimum ~5 min Glue startup)
+   → Use: DMS with CDC mode over peered VPCs
+   → Or: Kinesis-based streaming (Project 72)
+
+3. When 10+ accounts need the same source data
+   → VPC Peering = mesh topology = N*(N-1)/2 connections
+   → 10 accounts = 45 peering connections — unmanageable
+   → Use: Transit Gateway or dump-to-S3 + cross-account read
+
+4. When source DB is RDS (not EC2-hosted)
+   → RDS supports cross-account access via:
+     - RDS Proxy with IAM auth
+     - Snapshot sharing + restore
+   → These may be simpler than VPC Peering for RDS specifically
+
+5. When CIDR ranges overlap and cannot be changed
+   → VPC Peering is IMPOSSIBLE with overlapping CIDRs
+   → Use: PrivateLink (doesn't require non-overlapping CIDRs)
+   → Or: dump-to-S3 approach</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────┐
+</span>│                    VPC PEERING — INTERNAL MECHANICS                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  WHAT IS A VPC PEERING CONNECTION?                                           │
+│  → A networking construct between two VPCs                                   │
+│  → Uses AWS's PRIVATE backbone (not the internet)                            │
+│  → Appears as a virtual router between two VPCs                              │
+│  → Identified by: pcx-0123456789abcdef0                                      │
+│  → Has TWO sides: Requester VPC + Accepter VPC                               │
+│                                                                              │
+│  CREATION FLOW:                                                              │
+│  ┌────────────────────┐     ┌─────────────────────┐                          │
+│  │ Account A          │     │ Account B            │                          │
+│  │ (Requester)        │     │ (Accepter)           │                          │
+│  │                    │     │                      │                          │
+│  │ 1. CreateVpcPeer   │────►│ 2. Peering appears   │                          │
+│  │    Request sent    │     │    Status: pending   │                          │
+│  │                    │     │                      │                          │
+│  │                    │◄────│ 3. AcceptVpcPeer     │                          │
+│  │                    │     │    Status: active    │                          │
+│  │                    │     │                      │                          │
+│  │ 4. Add route:      │     │ 5. Add route:        │                          │
+│  │ 10.2.0.0/16→pcx-* │     │ 10.1.0.0/16→pcx-*   │                          │
+│  │                    │     │                      │                          │
+│  │ 6. Update SG:      │     │ 7. Update SG:        │                          │
+│  │ Allow 10.2.6.0/24  │     │ Allow 10.1.3.50/32   │                          │
+│  │ on port 3306       │     │ (if needed)          │                          │
+│  └────────────────────┘     └─────────────────────┘                          │
+│                                                                              │
+│  PACKET FLOW (Glue ENI → MariaDB):                                           │
+│  ┌──────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐      │
+│  │Glue ENI  │──►│Route Table B │──►│VPC Peering   │──►│Route Table A │      │
+│  │10.2.6.10 │   │10.1.0.0/16  │   │pcx-0abcdef   │   │local route   │      │
+│  │          │   │→ pcx-0abc   │   │              │   │10.1.0.0/16  │      │
+│  └──────────┘   └──────────────┘   └──────────────┘   └──────┬───────┘      │
+│                                                               │              │
+│                                                               ▼              │
+│                                                      ┌──────────────┐        │
+│                                                      │SG Check:     │        │
+│                                                      │10.2.6.0/24   │        │
+│                                                      │allowed? ✅    │        │
+│                                                      └──────┬───────┘        │
+│                                                             │                │
+│                                                             ▼                │
+│                                                      ┌──────────────┐        │
+│                                                      │MariaDB EC2   │        │
+│                                                      │10.1.3.50:3306│        │
+│                                                      └──────────────┘        │
+│                                                                              │
+│  RETURN PACKET (MariaDB → Glue ENI):                                         │
+│  → Same path in reverse                                                      │
+│  → Account A route table: 10.2.0.0/16 → pcx-0abcdef                         │
+│  → Account B SG: allows return traffic (stateful — SGs track connections)    │
+│                                                                              │
+│  KEY PROPERTIES:                                                             │
+│  → NOT transitive: A↔B and B↔C does NOT mean A↔C                            │
+│  → NOT a gateway or VPN — no single point of failure                         │
+│  → No bandwidth bottleneck — uses AWS backbone                               │
+│  → No hourly charge — only standard data transfer rates                      │
+│  → Same-region peering: $0.01/GB each direction                              │
+│  → Cannot reference SG by ID cross-account (use CIDR)                        │
+│  → DNS resolution must be enabled explicitly on BOTH sides                   │
+│                                                                              │
+│  GLUE ENI MECHANICS (how Glue reaches MariaDB):                              │
+│  → Glue job configured with VPC + Subnet + Security Group                    │
+│  → At job start: Glue creates Elastic Network Interface (ENI)                │
+│  │  in YOUR specified subnet (10.2.6.0/24)                                   │
+│  → ENI gets private IP (e.g., 10.2.6.10)                                     │
+│  → All JDBC traffic originates FROM this ENI                                 │
+│  → ENI is subject to subnet's route table + its security group               │
+│  → Route table says 10.1.0.0/16 → pcx → traffic reaches Account A           │
+│  → MariaDB SG allows 10.2.6.0/24:3306 → connection accepted                 │
+│  → Glue reads data via MySQL wire protocol over TCP                          │
+│  → After job completes: ENI is deleted automatically                         │
+│                                                                              │
+│  GLUE → REDSHIFT MECHANICS (same VPC, simpler):                              │
+│  → Glue ENI (10.2.6.10) → Redshift (10.2.5.x) — same VPC                   │
+│  → Route table: local route handles 10.2.0.0/16 internally                  │
+│  → Redshift SG: allow 10.2.6.0/24 on port 5439                              │
+│  → Glue writes via Redshift JDBC → uses temp S3 dir for staging             │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Peering is Active but Glue still times out"
+</span>→ Cause: Route table not updated
+→ Peering connection alone does NOTHING — it's just a "virtual cable"
+→ You MUST add routes in BOTH VPCs:
+   Account A RT: 10.2.0.0/16 → pcx-xxx
+   Account B RT: 10.1.0.0/16 → pcx-xxx
+→ Verify: check BOTH route tables in console
+
+PITFALL 2: "Route added but still can't connect"
+→ Cause: Security group doesn't allow cross-VPC CIDR
+→ SG is evaluated AFTER routing
+→ MariaDB SG must explicitly allow 10.2.6.0/24 on port 3306
+→ Common mistake: SG only allows "sg-mariadb-ops" (self-reference)
+   which doesn't match traffic from Account B
+
+PITFALL 3: "Glue job fails: Could not find S3 endpoint"
+→ Cause: Glue ENI in private subnet has no internet access
+→ Glue needs S3 access for: scripts, temp dir, output
+→ Fix: Create S3 VPC Gateway Endpoint in Account B's VPC
+→ Attach to route table of Glue subnet
+→ This was covered conceptually in Project 31
+
+PITFALL 4: "Connection refused on port 3306"
+→ Cause: MariaDB bind-address is 127.0.0.1 (localhost only)
+→ Fix: Edit /etc/my.cnf → bind-address = 0.0.0.0
+→ Restart MariaDB: sudo systemctl restart mariadb
+→ Then: MariaDB listens on all interfaces including 10.1.3.50
+
+PITFALL 5: "Access denied for user 'glue_reader'@'10.2.6.10'"
+→ Cause: MariaDB user created with wrong host pattern
+→ CREATE USER 'glue_reader'@'localhost' → only allows local connections
+→ Fix: CREATE USER 'glue_reader'@'10.2.%' → allows entire Account B range
+→ Or: CREATE USER 'glue_reader'@'%' → allows any host (less secure)
+
+PITFALL 6: "Peering request stuck in pending-acceptance for hours"
+→ Cause: Accepter account hasn't approved yet
+→ Peering auto-expires after 7 days if not accepted
+→ Both accounts must coordinate — this is a manual approval step
+
+PITFALL 7: "Glue job reads 10M rows from MariaDB — MariaDB CPU hits 100%"
+→ Cause: Glue opens multiple parallel JDBC connections
+→ Each connection runs a query → MariaDB overwhelmed
+→ Fix: limit Glue DPUs, use hashfield/hashexpression carefully
+→ Or: add read replica in Account A, point Glue to replica
+
+PITFALL 8: "VPC Peering created between us-east-2 and eu-west-1"
+→ Works — inter-region peering IS supported
+→ But: $0.01/GB data transfer + 50-100ms latency
+→ For nightly batch: acceptable
+→ For real-time: unacceptable
+→ Best: keep both VPCs in same region
+
+PITFALL 9: "Overlapping CIDR — peering creation fails"
+→ ERROR: "VPC CIDR block conflicts with peering connection"
+→ Cannot be fixed without re-creating one VPC
+→ THIS is why CIDR planning matters on Day 1
+→ Enterprise pattern: central team allocates CIDR blocks per account
+
+PITFALL 10: "Glue connection test succeeds but job fails"
+→ Cause: Glue connection test uses a single ENI
+→ Job may use multiple ENIs in different AZs
+→ Ensure ALL subnets in Glue job config have correct route table entries
+→ Best practice: use single subnet for Glue connections</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DATA VOLUME SCALING:
+</span>→ 1 GB/night from MariaDB: trivial, single Glue job, 2 DPUs, ~5 min
+→ 10 GB/night: moderate, increase DPUs to 5-10, use partitioned reads
+→ 100 GB/night: heavy, must use parallel JDBC reads (hashfield)
+→ 1 TB/night: MariaDB cannot sustain this — need read replica or dump-to-S3
+
+MARIADB PROTECTION AT SCALE:
+→ Add read replica specifically for analytics extraction
+→ Point Glue JDBC to replica, not primary
+→ Primary handles OLTP traffic undisturbed
+→ Replica lag: typically &lt; 1 second for MariaDB async replication
+
+VPC PEERING SCALING:
+→ No bandwidth limit on peering connection
+→ No hourly charge
+→ Data transfer: $0.01/GB same-region
+→ 100 GB/night = $1/night = $30/month — very reasonable
+
+GLUE JOB SCALING:
+→ Max DPUs: 100 (Standard) or auto-scaling with Glue 2.0+
+→ Each DPU: 4 vCPU, 16 GB RAM
+→ 10 DPUs reading MariaDB in parallel = 10 concurrent connections
+→ MariaDB max_connections default: 151
+→ Ensure Glue connections &lt; 50% of MariaDB max_connections
+
+MULTI-TABLE SCALING:
+→ 3 tables: single Glue job with sequential reads
+→ 20 tables: one Glue job per table, run in parallel via Workflow
+→ 100 tables: dynamic job generation using Glue Workflow + parameterized jobs
+
+ACCOUNT SCALING:
+→ 2 accounts: single VPC peering — current pattern
+→ 5 accounts needing same MariaDB: 4 peering connections — manageable
+→ 20 accounts: Transit Gateway — hub-and-spoke
+→ 50 accounts: dump to S3 + cross-account reads (Project 56 pattern)
+
+COST AT SCALE (monthly):
+┌────────────────────┬───────────────┬───────────────────────────────┐
+│ Component          │ 10 GB/night   │ 100 GB/night                  │
+├────────────────────┼───────────────┼───────────────────────────────┤
+│ VPC Peering        │ $0/hr         │ $0/hr                         │
+│ Data Transfer      │ $3/month      │ $30/month                     │
+│ Glue Job (5 DPU)   │ $3.30/run     │ $6.60/run (10 DPU)            │
+│ Glue Monthly       │ $99/month     │ $198/month                    │
+│ Redshift (dc2.lg)  │ $180/month    │ $180/month (same cluster)     │
+├────────────────────┼───────────────┼───────────────────────────────┤
+│ TOTAL              │ ~$282/month   │ ~$408/month                   │
+└────────────────────┴───────────────┴───────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY EACH LAYER WORKS:
+</span>
+LAYER 1 — VPC Peering Active:
+→ Console: VPC → Peering Connections → Status = "Active"
+→ CLI: aws ec2 describe-vpc-peering-connections --filters Name=status-code,Values=active
+
+LAYER 2 — Routes Exist:
+→ Account A: aws ec2 describe-route-tables → find 10.2.0.0/16 → pcx-xxx
+→ Account B: aws ec2 describe-route-tables → find 10.1.0.0/16 → pcx-xxx
+
+LAYER 3 — Security Groups Allow Traffic:
+→ Account A SG: inbound rule for 10.2.6.0/24 on TCP 3306
+→ Account B SG (Glue): outbound rule for 10.1.3.50/32 on TCP 3306
+  (default: outbound allows all — but verify if restricted)
+
+LAYER 4 — MariaDB Accepts Remote Connections:
+→ From EC2 in Account B Glue subnet:
+  mysql -h 10.1.3.50 -P 3306 -u glue_reader -p
+→ If works: network is fine, DB is fine
+→ If "Connection timed out": network issue (route/SG)
+→ If "Access denied": DB user/host issue
+
+LAYER 5 — Glue Connection Test:
+→ Console: Glue → Connections → Test Connection
+→ Glue creates temporary ENI, attempts JDBC handshake
+→ Success = green check, Failure = error message (usually vague)
+
+LAYER 6 — Glue Job Execution:
+→ CloudWatch Logs: /aws-glue/jobs/output and /aws-glue/jobs/error
+→ Check: rows read from source, rows written to target
+→ Glue job metrics: Data Movement, Job Duration, Memory Usage
+
+LAYER 7 — Data Verification in Redshift:
+→ SELECT COUNT(*) FROM schema.orders;
+→ Compare with: SELECT COUNT(*) FROM mariadb_orders; (source)
+→ Counts must match for full loads
+
+VPC FLOW LOGS (forensic debugging):
+→ Enable on BOTH VPCs
+→ Filter: srcaddr=10.2.6.* dstaddr=10.1.3.50 dstport=3306
+→ ACCEPT = packets reaching MariaDB
+→ REJECT = security group or NACL blocking</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(61)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: VPC Peering Setup (run from Account A — requester)</h3>
+
+<h3>PART 2: Accept Peering (run from Account B — accepter)</h3>
+
+<h3>PART 3: Configure Route Tables (BOTH accounts)</h3>
+
+<h3>PART 4: Configure Security Groups (BOTH accounts)</h3>
+
+<h3>PART 5: Prepare MariaDB for Remote Access (Account A)</h3>
+
+<h3>PART 6: S3 VPC Endpoint (Account B — required for Glue)</h3>
+
+<h3>PART 7: Network Connectivity Test (Account B)</h3>
+
+<hr>
+<h3>PART 8: Store MariaDB Credentials in Secrets Manager (Account B)</h3>
+
+<hr>
+<h3>PART 9: Create Glue Connection to MariaDB (Account B)</h3>
+
+<hr>
+<h3>PART 10: The Glue ETL Job — MariaDB → Transform → Redshift</h3>
+
+<hr>
+<h3>PART 11: Deploy the Glue Job (Account B)</h3>
+
+<hr>
+<h3>PART 12: Schedule and Trigger the Job</h3>
+
+<hr>
+<h3>PART 13: Post-Load Validation in Redshift (Account B)</h3>
+
+<hr>
+<h3>PART 14: Execution Order Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER — One-time setup then nightly automation</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ONE-TIME SETUP (in order) ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Account A — Request VPC Peering</span><span>
+</span>python 61_01_create_vpc_peering.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Account B — Accept VPC Peering</span><span>
+</span>python 61_02_accept_vpc_peering.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: BOTH Accounts — Configure Routes</span><span>
+</span>python 61_03_configure_routes.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run add_route_account_a() from Account A</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run add_route_account_b() from Account B</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: BOTH Accounts — Configure Security Groups</span><span>
+</span>python 61_04_configure_security_groups.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run configure_account_a_sg() from Account A</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run create_glue_sg_account_b() from Account B</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Run configure_redshift_sg_account_b() from Account B</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 5: Account A — Prepare MariaDB for remote access</span><span>
+</span>python 61_05_prepare_mariadb.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 6: Account B — Create S3 VPC Endpoint</span><span>
+</span>python 61_06_s3_vpc_endpoint.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 7: Account B (from EC2 in Glue subnet) — Test connectivity</span><span>
+</span>python 61_07_test_connectivity.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 8: Account B — Store credentials</span><span>
+</span>python 61_08_store_credentials.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 9: Account B — Create Glue connections</span><span>
+</span>python 61_09_create_glue_connections.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Test both connections via Glue Console</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 10: Account B — Deploy Glue job</span><span>
+</span>python 61_11_deploy_glue_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 11: Account B — Schedule + first run</span><span>
+</span>python 61_12_schedule_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 12: Account B — Validate data in Redshift</span><span>
+</span>python 61_13_validate_redshift.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- NIGHTLY AUTOMATION (runs automatically at 2 AM UTC) ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Trigger → Glue Job → MariaDB Extract → Transform → Redshift Load</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Monitor via CloudWatch: /aws-glue/jobs/output</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED FINAL STATE:
+</span>
+ACCOUNT A                           ACCOUNT B
+┌───────────────────────┐           ┌──────────────────────────────┐
+│ VPC: 10.1.0.0/16      │           │ VPC: 10.2.0.0/16             │
+│                       │           │                              │
+│ MariaDB (10.1.3.50)   │ ◄──VPC──►│ Glue ENI (10.2.6.x)          │
+│  └─ quickcart DB      │  Peering  │  ├─ JDBC reads MariaDB       │
+│  └─ glue_reader user  │           │  ├─ Transforms data          │
+│                       │           │  └─ JDBC writes Redshift     │
+│ SG: allows 10.2.6/24  │           │                              │
+│ RT: 10.2.0/16→pcx     │           │ Redshift (10.2.5.x)          │
+│                       │           │  └─ quickcart_ops schema     │
+│                       │           │     ├─ orders                │
+│                       │           │     ├─ dim_customers          │
+│                       │           │     └─ dim_products           │
+│                       │           │                              │
+│                       │           │ S3 VPC Endpoint (for Glue)   │
+│                       │           │ RT: 10.1.0/16→pcx            │
+└───────────────────────┘           └──────────────────────────────┘
+
+Data flows nightly at 2 AM:
+MariaDB → [VPC Peering] → Glue ENI → Transform → [local route] → Redshift</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ VPC Peering creates a PRIVATE network bridge between two VPCs in different accounts
+→ Peering alone does NOTHING — requires routes + security groups on BOTH sides
+→ CIDRs MUST NOT overlap — this is the #1 non-negotiable requirement
+→ Glue ENIs live in YOUR VPC — they follow YOUR route tables and security groups
+→ Cross-account Glue JDBC works because the NETWORK carries the traffic, not IAM
+→ IAM handles permissions (what can this role do)
+→ VPC Peering handles connectivity (can packets reach the destination)
+→ ALWAYS test with EC2 before blaming Glue — isolate network vs application issues
+→ Security: dedicated MariaDB user (SELECT only), dedicated Glue subnet, tight SG rules
+→ VPC Peering is free (no hourly charge) — only standard data transfer applies
+
+WHAT THIS CONNECTS TO:
+━━━━━━━━━━━━━━━━━━━━━━
+→ BACKWARD CONNECTIONS:
+  → Project 8: MariaDB on EC2 — we're now exposing it cross-account
+  → Project 31: Glue JDBC Connection — same concept, now cross-VPC
+  → Project 32: Glue → Redshift write — same pattern, now part of larger flow
+  → Project 56: Cross-Account S3 — IAM-based, here we use network-based approach
+
+→ FORWARD CONNECTIONS:
+  → Project 62: Glue writes 50K tiny files — our Redshift staging may suffer this
+  → Project 65: Full incremental CDC — evolves this full-load into MERGE pattern
+  → Project 71: Data Mesh — this 2-account pattern scales to N accounts
+  → Project 75: Disaster Recovery — what happens when Account A's region fails?</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>The cross-account pipeline is running smoothly
+</span>3 tables load nightly from MariaDB → Redshift
+
+THEN: Data engineer notices Glue job writes to S3 staging:
+→ 50,000 tiny Parquet files (4 KB each) per run
+→ Athena queries on this data take 45 seconds (should take 3 seconds)
+→ S3 LIST operations are slow
+→ Redshift COPY is doing 50,000 individual file reads
+
+MANAGER: "Why are our queries so slow when we only have 200 MB of data?"
+YOU: "We have a SMALL FILE PROBLEM. Each Glue task writes its own output file.
+      200 MB spread across 50,000 files = overhead dominates actual data reading.
+      We need COMPACTION."
+
+→ Project 62: "Glue Writes 50,000 Tiny Files — Athena Hates It"
+→ Introduces: Small File Problem → Coalesce → Repartition → S3DistCp → Compaction Jobs</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="9" ========== -->
+<div class="chat-message" data-index="9"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-60.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 61 of 80</span>
+    <span class="nav-project-title">ACCOUNT A&#x27;s MARIADB ON EC2 MUST FEED ACCOUNT B&#x27;s REDSHIFT</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-62.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-62.html") window.location = "project-62.html";
+  if (e.key === 'ArrowLeft' && "project-60.html") window.location = "project-60.html";
+});
+</script>
+</body>
+</html>

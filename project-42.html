@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 42: CAPTURE ONLY CHANGED ROWS FROM MARIADB NIGHTLY — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:52%"></div></div>
+<div id="progress-label">52%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 42 of 80</div>
+  <div class="project-title">CAPTURE ONLY CHANGED ROWS FROM MARIADB NIGHTLY</div>
+  <div class="project-tags"><span class="project-tag">MariaDB</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — growing fast, 500K+ orders per month
+</span>Team: 3-person data team (you lead it)
+
+CURRENT STATE (built through Projects 1–41):
+→ MariaDB exports FULL tables to S3 nightly (Project 20, 29)
+→ File arrival auto-triggers ETL pipeline (Project 41)
+→ Glue transforms CSV → Parquet (Project 25)
+→ Redshift COPY loads data (Project 21)
+→ Everything is automated, zero human intervention
+
+THE WASTE PROBLEM:
+→ orders table in MariaDB: 5.2 million rows (growing 8K/day)
+→ Every night: FULL dump → 5.2M rows → 480 MB CSV
+→ Glue processes ALL 5.2M rows → writes 480 MB Parquet
+→ Redshift COPY replaces entire orders table
+
+ACTUAL CHANGES per night:
+→ ~8,000 new orders (INSERT)
+→ ~3,000 status updates (UPDATE: pending → shipped → completed)
+→ ~200 cancellations (UPDATE: status → cancelled)
+→ Total CHANGED rows: ~11,200 out of 5,200,000 = 0.22%
+
+COST IMPACT:
+→ Glue ETL: 4 DPUs × 8 minutes = $0.59/run
+→ Should be: 2 DPUs × 30 seconds = $0.02/run (29x cheaper)
+→ Redshift COPY: full table replace → locks table for 45 seconds
+→ Should be: merge 11K rows → 2 second operation
+→ S3 storage: 480 MB/day × 365 = 175 GB/year of redundant full dumps
+→ Should be: 1.5 MB/day × 365 = 0.5 GB/year
+
+BUSINESS IMPACT:
+→ Dashboard refresh delayed by 8 minutes (full Glue job runtime)
+→ Redshift table locked during COPY → analysts see stale data
+→ Monthly AWS bill: $18/month just for this one pipeline
+→ Should be: $0.60/month
+
+CTO: "We're reprocessing 5 million rows to capture 11,000 changes.
+      That's like reprinting an entire encyclopedia because
+      someone fixed one typo. Fix this."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand CDC (Change Data Capture) fundamentals
+</span>→ CDC = detect and extract ONLY the rows that changed since last run
+→ Three approaches exist:
+   a) Timestamp-based (watermark column)    ← THIS PROJECT
+   b) Log-based (binlog / WAL parsing)      ← Project 79 (DMS)
+   c) Trigger-based (database triggers)      ← Not recommended at scale
+
+Step 2: Evaluate which CDC approach fits QuickCart
+┌─────────────────────┬──────────────────┬─────────────┬──────────────────────┐
+│ Approach            │ Complexity       │ Captures    │ Best For             │
+│                     │                  │ Deletes?    │                      │
+├─────────────────────┼──────────────────┼─────────────┼──────────────────────┤
+│ Timestamp watermark │ Low              │ No*         │ Nightly batch CDC    │
+│ (updated_at column) │ (SQL WHERE only) │             │ INSERT + UPDATE      │
+├─────────────────────┼──────────────────┼─────────────┼──────────────────────┤
+│ Binlog parsing      │ High             │ Yes         │ Real-time CDC        │
+│ (DMS / Debezium)    │ (infra required) │             │ INSERT+UPDATE+DELETE │
+├─────────────────────┼──────────────────┼─────────────┼──────────────────────┤
+│ DB triggers         │ Medium           │ Yes         │ Low-volume tables    │
+│ (AFTER INSERT/etc)  │ (perf impact)    │             │ &lt; 10K rows/day       │
+└─────────────────────┴──────────────────┴─────────────┴──────────────────────┘
+
+*Timestamp-based can capture soft deletes (status = 'deleted')
+  but NOT hard deletes (DELETE FROM). For QuickCart, orders are never
+  hard-deleted (compliance), so timestamp-based is sufficient.
+
+DECISION: Timestamp-based watermark CDC
+→ Low complexity
+→ No additional infrastructure (no DMS, no Debezium)
+→ Uses existing MariaDB → Glue JDBC path (Project 31)
+→ Captures INSERTs and UPDATEs (all we need)
+
+Step 3: Design the watermark mechanism
+→ MariaDB orders table needs: updated_at TIMESTAMP column
+→ Every INSERT: updated_at = NOW()
+→ Every UPDATE: updated_at = NOW() (via ON UPDATE CURRENT_TIMESTAMP)
+→ CDC query: SELECT * FROM orders WHERE updated_at &gt; '{last_run_timestamp}'
+→ Store last_run_timestamp in: DynamoDB (persistent, queryable)
+
+Step 4: Design the merge strategy for Redshift
+→ Changed rows arrive at Redshift
+→ Some are NEW (INSERT) → must be added
+→ Some are UPDATED → must replace existing rows
+→ Redshift has no native MERGE (until recently — conditional)
+→ Classic pattern: staging table → DELETE matching → INSERT all from staging
+→ Modern pattern: Redshift MERGE statement (available since late 2023)
+
+Step 5: Fit into the existing event-driven pipeline (Project 41)
+→ MariaDB CDC export → S3 (only changed rows)
+→ S3 file arrival → EventBridge → Step Functions (Project 41)
+→ Step Functions → Glue ETL → Redshift MERGE
+→ Same architecture, just smarter extraction + loading</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                     MARIADB (Source)                              │
+  │  orders table:                                                    │
+  │  ┌──────────┬─────────┬────────┬──────────────────────────────┐  │
+  │  │ order_id │ status  │ amount │ updated_at                   │  │
+  │  ├──────────┼─────────┼────────┼──────────────────────────────┤  │
+  │  │ ORD-001  │ shipped │ 49.99  │ 2025-01-15 03:22:00          │  │ ← UPDATED
+  │  │ ORD-002  │ pending │ 129.50 │ 2025-01-15 14:05:33          │  │ ← NEW
+  │  │ ...      │ ...     │ ...    │ &lt; 2025-01-14 (not changed)   │  │ ← SKIP
+  │  └──────────┴─────────┴────────┴──────────────────────────────┘  │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+                         │ CDC Query: WHERE updated_at &gt; last_watermark
+                         │ (extracts only ~11K rows, not 5.2M)
+                         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  S3: daily_exports/orders_cdc/dt=2025-01-15/orders_cdc.csv     │
+  │  (1.5 MB instead of 480 MB)                                     │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+                         │ EventBridge triggers (Project 41)
+                         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Step Functions → Glue ETL Job                                   │
+  │  → Reads CDC CSV (11K rows)                                      │
+  │  → Converts to Parquet                                           │
+  │  → Writes to staging zone                                        │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  REDSHIFT (Target)                                               │
+  │                                                                   │
+  │  Step 1: COPY CDC Parquet → staging_orders (temp table)          │
+  │  Step 2: MERGE staging_orders INTO orders                         │
+  │          ON order_id                                               │
+  │          WHEN MATCHED → UPDATE all columns                        │
+  │          WHEN NOT MATCHED → INSERT                                │
+  │  Step 3: DROP staging_orders                                      │
+  │  Step 4: UPDATE watermark in DynamoDB                             │
+  └──────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  DynamoDB: cdc_watermarks                                        │
+  │  ┌─────────────┬──────────────────────┬────────────────────┐     │
+  │  │ entity_name │ last_watermark        │ last_run_at        │     │
+  │  ├─────────────┼──────────────────────┼────────────────────┤     │
+  │  │ orders      │ 2025-01-15T23:59:59  │ 2025-01-16 00:05   │     │
+  │  │ customers   │ 2025-01-15T23:59:59  │ 2025-01-16 00:03   │     │
+  │  │ products    │ 2025-01-15T23:59:59  │ 2025-01-16 00:02   │     │
+  │  └─────────────┴──────────────────────┴────────────────────┘     │
+  └──────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue Job Bookmarks alone (Project 33)
+</span>→ Bookmarks track WHICH S3 FILES were processed
+→ They do NOT track WHICH ROWS in MariaDB changed
+→ If you do a full dump to S3, bookmark sees "new file" → processes ALL rows
+→ Bookmarks solve: "don't reprocess old S3 files"
+→ Bookmarks do NOT solve: "extract only changed rows from MariaDB"
+→ VERDICT: Insufficient alone — need watermark extraction FIRST
+
+Option B: Full dump + Glue DynamicFrame filter
+→ Export all 5.2M rows to S3
+→ In Glue, filter where updated_at &gt; watermark
+→ Problem: still exporting 480 MB from MariaDB every night
+→ Network transfer waste, MariaDB load, S3 storage waste
+→ VERDICT: Solves Glue processing time but not extraction waste
+
+Option C: Watermark CDC at extraction point (MariaDB → S3)
+→ Query MariaDB: SELECT * WHERE updated_at &gt; watermark
+→ Export only 11K rows → 1.5 MB CSV
+→ Glue processes 1.5 MB (fast, cheap)
+→ Redshift merges 11K rows (fast, no table lock)
+→ VERDICT: ✅ Optimal — solves extraction + processing + loading
+
+Option D: AWS DMS (Database Migration Service) with CDC
+→ Reads MariaDB binlog in real-time
+→ Streams changes to S3/Kinesis/Redshift
+→ Captures INSERTs, UPDATEs, and DELETEs
+→ Problem: requires DMS replication instance ($$$)
+→ Problem: complex setup, ongoing maintenance
+→ VERDICT: Overkill for nightly batch — perfect for real-time (Project 79)
+
+DECISION: Option C — Watermark CDC at extraction</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Add updated_at column to MariaDB tables
+</span>   → DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+   → Every INSERT gets current timestamp
+   → Every UPDATE automatically refreshes timestamp
+   → Zero application code changes needed
+
+2. Add created_at column separately
+   → DEFAULT CURRENT_TIMESTAMP (no ON UPDATE)
+   → Distinguishes new rows from updated rows
+   → Useful for audit and debugging
+
+3. Index the updated_at column
+   → CREATE INDEX idx_orders_updated_at ON orders(updated_at)
+   → Without index: CDC query does full table scan (defeats the purpose)
+   → With index: query returns 11K rows in &lt;100ms
+
+4. Store watermark in DynamoDB (not in S3 or local file)
+   → DynamoDB: strongly consistent reads, atomic updates
+   → Survives EC2 termination, Glue job restarts
+   → Can be queried/audited easily
+   → Stores: entity_name, last_watermark, last_run_at, rows_extracted
+
+5. Use overlap window for watermark
+   → Don't query WHERE updated_at &gt; exactly_last_watermark
+   → Query WHERE updated_at &gt; (last_watermark - 5 minutes)
+   → WHY: clock skew, transaction commit delays, replication lag
+   → This means some rows are extracted TWICE (overlap)
+   → Redshift MERGE handles duplicates idempotently
+
+6. Use Redshift MERGE (not DELETE+INSERT) when possible
+   → MERGE is atomic — no window where data is missing
+   → DELETE+INSERT has a moment where rows are deleted but not yet re-inserted
+   → Concurrent queries during DELETE+INSERT see incomplete data
+
+7. Log extraction metrics
+   → rows_extracted, watermark_from, watermark_to, extraction_duration
+   → Enables trend analysis: is daily change volume growing?
+   → Alerts if rows_extracted = 0 (possible watermark bug)
+   → Alerts if rows_extracted &gt; 50% of total (possible full reload)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use auto_increment ID as watermark for UPDATE detection
+</span>   → Auto-increment only increases on INSERT
+   → Updated rows keep their original ID
+   → You'll miss ALL updates (only catch inserts)
+   → Use updated_at timestamp instead
+
+2. DO NOT set watermark to "NOW()" at extraction START
+   → If extraction takes 5 minutes (00:00 to 00:05)
+   → And a row is updated at 00:03
+   → Watermark set to 00:00 at start → 00:03 row is INCLUDED ✅
+   → But if watermark set to 00:05 at end → next run starts from 00:05
+   → Row updated at 00:04 could be missed if committed after extraction read
+   → SAFE: set watermark to MAX(updated_at) from EXTRACTED rows
+
+3. DO NOT rely on MariaDB NOW() matching extraction server clock
+   → MariaDB server time ≠ Glue job server time ≠ EC2 time
+   → Always use MariaDB's own timestamps from the extracted data
+   → Watermark = MAX(updated_at) FROM the data you just extracted
+
+4. DO NOT skip the staging table in Redshift
+   → Never MERGE directly from S3 into production table
+   → COPY to staging → MERGE from staging → DROP staging
+   → Staging allows: validation, row counts, rollback
+
+5. DO NOT forget to handle the FIRST RUN (no watermark exists)
+   → First run: watermark = '1970-01-01' (extract everything)
+   → Store initial watermark in DynamoDB
+   → Subsequent runs: use stored watermark
+
+6. DO NOT hard-delete rows in MariaDB if using timestamp CDC
+   → Hard DELETE removes the row — no updated_at to detect
+   → Use soft delete: UPDATE status = 'deleted', updated_at = NOW()
+   → Timestamp CDC will pick it up
+
+7. DO NOT extract without ORDER BY updated_at
+   → Without ORDER BY: MariaDB returns rows in arbitrary order
+   → If extraction fails midway, you can't resume reliably
+   → With ORDER BY: you know exactly where you stopped</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────┬─────────────────────────┬─────────────────────────────┐
+</span>│ CDC Method               │ Use When                │ Don't Use When              │
+├──────────────────────────┼─────────────────────────┼─────────────────────────────┤
+│ Timestamp Watermark      │ Nightly/hourly batch    │ Need to capture DELETEs     │
+│ (THIS PROJECT)           │ Source has updated_at   │ Source has no timestamp col  │
+│                          │ 99%+ rows are unchanged │ Need sub-minute latency     │
+│                          │ Budget-conscious         │                             │
+├──────────────────────────┼─────────────────────────┼─────────────────────────────┤
+│ Glue Job Bookmarks       │ S3-to-S3 processing     │ Source is a database        │
+│ (Project 33)             │ Don't reprocess old     │ Need row-level tracking     │
+│                          │ S3 files                │                             │
+├──────────────────────────┼─────────────────────────┼─────────────────────────────┤
+│ AWS DMS CDC              │ Real-time replication   │ Nightly batch is sufficient │
+│ (Project 79)             │ Need DELETE capture     │ Budget &lt; $100/month         │
+│                          │ Multi-table sync        │ Simple single-table CDC     │
+├──────────────────────────┼─────────────────────────┼─────────────────────────────┤
+│ Debezium + Kafka/Kinesis │ Event sourcing          │ No Kafka/Kinesis infra      │
+│                          │ Microservices CDC       │ Team lacks streaming skills  │
+│                          │ Complex multi-consumer  │                             │
+├──────────────────────────┼─────────────────────────┼─────────────────────────────┤
+│ Database Triggers        │ Very low volume         │ &gt; 1000 changes/hour         │
+│                          │ Legacy systems          │ Performance-sensitive source │
+│                          │ Need custom audit trail │                             │
+└──────────────────────────┴─────────────────────────┴─────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE TIMESTAMP WATERMARK CDC</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When source table has NO timestamp column and you CAN'T add one
+</span>   → Legacy system, no schema control
+   → Use: full dump + hash comparison (expensive but works)
+   → Or: DMS binlog-based CDC
+
+2. When rows are HARD DELETED
+   → DELETE FROM orders WHERE id = 123
+   → Row disappears — no updated_at to detect
+   → Use: DMS CDC (reads DELETE from binlog)
+   → Or: full dump comparison (find missing IDs)
+
+3. When you need sub-second latency
+   → Watermark CDC is batch (runs every N minutes/hours)
+   → Minimum practical interval: ~5 minutes
+   → For sub-second: DMS CDC or Debezium streaming
+
+4. When updated_at is not reliably maintained
+   → If application code sometimes skips updating the timestamp
+   → If bulk UPDATE scripts bypass the ON UPDATE trigger
+   → Symptom: rows change but updated_at stays old → missed by CDC
+   → Fix: enforce at DB level (ON UPDATE CURRENT_TIMESTAMP)
+
+5. When change volume is &gt; 50% of table
+   → If half the table changes daily, CDC overhead &gt; full dump
+   → Watermark query + staging + merge &gt; simple COPY + replace
+   → Threshold: when CDC rows &gt; ~30% of total, reconsider full dump</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: TIMESTAMP WATERMARK CDC                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ MariaDB ON UPDATE CURRENT_TIMESTAMP Behavior                               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                              │
+│                                                                                 │
+│  Column definition:                                                             │
+│  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP    │
+│                                                                                 │
+│  What MariaDB does internally:                                                  │
+│  → INSERT: sets updated_at = NOW() at time of INSERT commit                    │
+│  → UPDATE (any column): MariaDB automatically sets updated_at = NOW()          │
+│  → UPDATE (same values): MariaDB does NOT update timestamp                     │
+│    (optimization: if no column actually changed, no update)                     │
+│  → DELETE: row removed, no timestamp update (row is gone)                      │
+│                                                                                 │
+│  Precision:                                                                     │
+│  → TIMESTAMP: 1-second precision (sufficient for nightly batch)                │
+│  → TIMESTAMP(6): microsecond precision (needed for sub-second CDC)             │
+│  → QuickCart: TIMESTAMP is sufficient (batch runs once/night)                   │
+│                                                                                 │
+│  Index behavior:                                                                │
+│  → B-tree index on updated_at                                                   │
+│  → Range query: WHERE updated_at &gt; '2025-01-14 23:55:00'                       │
+│  → Index seek: O(log n) to find starting point                                  │
+│  → Index range scan: reads only matching rows                                   │
+│  → Without index: full table scan of 5.2M rows (defeats CDC purpose)           │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Watermark Storage in DynamoDB                                               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                       │
+│                                                                                 │
+│  Table: cdc_watermarks                                                          │
+│  Partition Key: entity_name (String)                                            │
+│                                                                                 │
+│  Item structure:                                                                │
+│  {                                                                              │
+│    "entity_name": "orders",                                                     │
+│    "last_watermark": "2025-01-14T23:59:59",                                    │
+│    "last_run_at": "2025-01-15T00:05:33",                                       │
+│    "rows_extracted": 11247,                                                     │
+│    "extraction_duration_seconds": 3.2,                                          │
+│    "status": "SUCCESS"                                                          │
+│  }                                                                              │
+│                                                                                 │
+│  WHY DynamoDB (not S3, not SSM Parameter Store):                                │
+│  → Strongly consistent reads (GetItem with ConsistentRead=True)                │
+│  → Atomic updates (PutItem is atomic)                                           │
+│  → Conditional writes (prevent race conditions if two runs overlap)             │
+│  → Sub-millisecond read latency                                                 │
+│  → Cost: ~$0.00 for this volume (on-demand: 1 read + 1 write per run)          │
+│                                                                                 │
+│                                                                                 │
+│  ❸ Overlap Window — Why 5 Minutes?                                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                           │
+│                                                                                 │
+│  SCENARIO without overlap:                                                      │
+│  → Last watermark: 2025-01-14 23:59:59                                          │
+│  → CDC query: WHERE updated_at &gt; '2025-01-14 23:59:59'                         │
+│  → Transaction A: begins at 23:59:58, commits at 00:00:01                      │
+│    - updated_at = 23:59:58 (set when UPDATE executed, not when committed)       │
+│    - 23:59:58 &lt; 23:59:59 → MISSED by CDC query!                                │
+│                                                                                 │
+│  SCENARIO with 5-minute overlap:                                                │
+│  → Last watermark: 2025-01-14 23:59:59                                          │
+│  → Adjusted query: WHERE updated_at &gt; '2025-01-14 23:54:59'                    │
+│  → Transaction A (23:59:58): 23:59:58 &gt; 23:54:59 → CAPTURED ✅                 │
+│  → Some rows from 23:55-23:59 are extracted AGAIN (duplicates)                  │
+│  → Redshift MERGE handles duplicates: WHEN MATCHED → UPDATE (idempotent)       │
+│                                                                                 │
+│  WHY 5 minutes (not 1, not 60):                                                 │
+│  → MariaDB max long-running transaction: typically &lt; 30 seconds                 │
+│  → Network latency between MariaDB and extraction script: &lt; 1 second            │
+│  → Clock skew between servers: &lt; 1 second (NTP synced)                          │
+│  → 5 minutes = generous safety margin without excessive overlap                 │
+│  → At 8K changes/day ≈ 5.5 changes/minute → overlap ≈ 28 extra rows            │
+│  → 28 duplicate rows vs missing rows: always choose duplicates                  │
+│                                                                                 │
+│                                                                                 │
+│  ❹ Redshift MERGE Statement Internals                                          │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                        │
+│                                                                                 │
+│  MERGE INTO orders AS target                                                    │
+│  USING staging_orders AS source                                                 │
+│  ON target.order_id = source.order_id                                           │
+│  WHEN MATCHED THEN UPDATE SET ...                                               │
+│  WHEN NOT MATCHED THEN INSERT ...                                               │
+│                                                                                 │
+│  Internal execution:                                                            │
+│  1. Redshift hash-joins staging_orders with orders on order_id                  │
+│  2. For MATCHED rows: generates UPDATE operations (in-place block rewrite)      │
+│  3. For NOT MATCHED rows: generates INSERT operations (append to blocks)        │
+│  4. All operations are in a single implicit transaction                         │
+│  5. If any step fails: entire MERGE rolls back                                  │
+│  6. Concurrent queries see either ALL old data or ALL new data (MVCC)           │
+│                                                                                 │
+│  PERFORMANCE:                                                                   │
+│  → staging_orders: 11K rows → tiny table                                        │
+│  → orders: 5.2M rows → distribution key on order_id                             │
+│  → Hash join: O(n) where n = staging rows                                       │
+│  → Total MERGE time: ~2-5 seconds for 11K rows                                 │
+│  → Compare: full table COPY replacement = 45 seconds + table lock               │
+│                                                                                 │
+│                                                                                 │
+│  ❺ Classic DELETE+INSERT Pattern (Fallback for older Redshift)                 │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                      │
+│                                                                                 │
+│  BEGIN TRANSACTION;                                                             │
+│  -- Delete existing rows that have updates                                      │
+│  DELETE FROM orders                                                             │
+│  WHERE order_id IN (SELECT order_id FROM staging_orders);                       │
+│  -- Insert all rows from staging (new + updated)                                │
+│  INSERT INTO orders SELECT * FROM staging_orders;                               │
+│  COMMIT;                                                                        │
+│                                                                                 │
+│  WHY this works:                                                                │
+│  → BEGIN/COMMIT = atomic (all or nothing)                                       │
+│  → DELETE removes old versions of updated rows                                  │
+│  → INSERT adds new versions + genuinely new rows                                │
+│  → Net effect: same as MERGE                                                    │
+│                                                                                 │
+│  WHY MERGE is better:                                                           │
+│  → Single statement vs three statements                                         │
+│  → Optimizer can plan the entire operation together                             │
+│  → Less transaction log overhead                                                │
+│  → Clearer intent (readable, auditable)                                         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "CDC query returns 0 rows but I know data changed"
+</span>→ Cause #1: updated_at column is NOT set to ON UPDATE CURRENT_TIMESTAMP
+   - Column defined as TIMESTAMP DEFAULT CURRENT_TIMESTAMP (no ON UPDATE)
+   - INSERT sets it, but UPDATE does NOT refresh it
+   - Fix: ALTER TABLE orders MODIFY updated_at TIMESTAMP ... ON UPDATE CURRENT_TIMESTAMP
+→ Cause #2: Application uses bulk UPDATE with explicit updated_at = old_value
+   - Bypasses ON UPDATE trigger
+   - Fix: remove explicit updated_at from UPDATE statements
+→ Cause #3: Watermark is AHEAD of actual data (clock skew)
+   - Fix: always derive watermark from MAX(updated_at) of extracted data
+
+PITFALL 2: "CDC extracts 5 million rows — same as full dump"
+→ Cause: watermark is '1970-01-01' (never updated after first run)
+   - DynamoDB write failed silently
+   - Fix: verify watermark update AFTER extraction, add error handling
+→ Cause: overlap window is too large (e.g., 24 hours)
+   - Everything from last 24 hours = nearly everything
+   - Fix: reduce overlap to 5 minutes
+
+PITFALL 3: "Duplicate rows appear in Redshift after CDC"
+→ Cause: Using INSERT instead of MERGE
+   - CDC row already exists in target → duplicate
+   - Fix: always use MERGE or DELETE+INSERT pattern
+→ NOT a problem if: using MERGE (WHEN MATCHED → UPDATE handles it)
+
+PITFALL 4: "Redshift MERGE fails: duplicate key in staging table"
+→ Cause: same order_id appears twice in CDC extract
+   - Happens when: row updated twice within overlap window
+   - Fix: deduplicate staging table before MERGE
+   - SELECT DISTINCT ON (order_id) ORDER BY updated_at DESC
+
+PITFALL 5: "MariaDB slows down during CDC extraction"
+→ Cause: CDC query without index does full table scan
+   - 5.2M row scan while production traffic is running
+   - Fix: ensure INDEX on updated_at exists
+→ Cause: extraction runs during peak hours
+   - Fix: schedule during low-traffic window OR use read replica
+
+PITFALL 6: "Watermark gets corrupted — stuck in infinite loop"
+→ Cause: DynamoDB write succeeded but with wrong value
+   - e.g., stored Python datetime object instead of ISO string
+   - Fix: always store as ISO 8601 string, validate on read
+→ Recovery: manually reset watermark in DynamoDB console
+
+PITFALL 7: "First run after adding CDC takes forever"
+→ Expected: first run extracts ALL historical rows (watermark = epoch)
+→ This is the "initial load" — equivalent to a full dump
+→ After first run, subsequent runs are incremental
+→ Solution: accept first run is slow, or do initial load via COPY (Project 21)
+  then set watermark to current timestamp in DynamoDB</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT LOAD (QuickCart):
+</span>→ 11K changed rows/day → 1.5 MB → processes in 30 seconds
+→ Cost: ~$0.02/run
+
+SCALING TO 100K CHANGES/DAY:
+→ 100K rows → ~15 MB → processes in ~2 minutes
+→ Redshift MERGE: ~10 seconds for 100K rows
+→ Still very efficient vs 5.2M full dump
+
+SCALING TO 1M CHANGES/DAY:
+→ 1M rows → ~150 MB → Glue needs 4+ DPUs
+→ Redshift MERGE: ~30-60 seconds for 1M rows
+→ Consider: switch from nightly to hourly batches
+→ 1M/24 = ~42K per hour → each batch processes faster
+
+SCALING TO 10M CHANGES/DAY:
+→ At this point: timestamp CDC overhead approaches full dump
+→ 10M changed out of maybe 20M total = 50% change rate
+→ SWITCH TO: DMS binlog-based CDC (Project 79)
+→ Or: Kinesis streaming with micro-batch (Project 72)
+
+WATERMARK TABLE (DynamoDB):
+→ 1 read + 1 write per entity per run
+→ 3 entities × 1 run/day = 3 reads + 3 writes/day
+→ DynamoDB on-demand: essentially free at this volume
+→ Even at 1000 entities × 24 runs/day = 24K reads + 24K writes/day
+→ Cost: ~$0.03/day
+
+STAGING TABLE (Redshift):
+→ Created and dropped each run
+→ No persistent storage cost
+→ If run fails mid-MERGE: staging table persists until next run drops it
+→ Add: DROP TABLE IF EXISTS staging_orders at start of each run</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR CDC PIPELINE HEALTH:
+</span>
+1. DynamoDB Watermark Audit
+   → After each run, DynamoDB stores: last_watermark, rows_extracted, duration
+   → Dashboard: plot rows_extracted over time
+   → Trend UP = table is growing or more updates
+   → Sudden DROP to 0 = watermark bug or source table issue
+   → Sudden SPIKE to millions = watermark reset or corruption
+
+2. Extraction Metrics (CloudWatch Custom Metrics)
+   → Metric: CDC/RowsExtracted (dimension: entity=orders)
+   → Metric: CDC/ExtractionDurationSeconds
+   → Metric: CDC/WatermarkLagSeconds (NOW - last_watermark)
+   → Alarm: if RowsExtracted = 0 for 2 consecutive runs
+   → Alarm: if WatermarkLagSeconds &gt; 48 hours (pipeline stalled)
+
+3. Redshift MERGE Audit
+   → After MERGE: SELECT COUNT(*) from staging vs affected rows
+   → Log: rows_inserted, rows_updated (from Redshift system tables)
+   → stl_merge or stl_insert for detailed operation logs
+
+4. Data Quality Check
+   → After MERGE: SELECT COUNT(*) FROM orders (Redshift)
+   → Compare with: SELECT COUNT(*) FROM orders (MariaDB)
+   → Difference should be 0 (or very small due to timing)
+   → Large difference = missed changes or duplicate inserts
+
+5. Step Functions Visual (Project 41)
+   → Each CDC run is a Step Functions execution
+   → Click to see: extraction time, row count, merge result
+   → Red state = failure, with error details</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(42)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Alter MariaDB Tables for CDC Support</h3>
+
+<h3>Step 2: Create DynamoDB Watermark Table</h3>
+
+<h3>Step 3: CDC Extraction Script (MariaDB → S3)</h3>
+
+<h3>Step 4: Redshift MERGE Script (Load CDC into Target)</h3>
+
+<h3>Step 5: Integrated CDC Pipeline (End-to-End Orchestrator)</h3>
+
+<h3>Step 6: Watermark Management Utility</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Add CDC columns to MariaDB tables</span><span>
+</span>python 42_01_alter_mariadb_for_cdc.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Create DynamoDB watermark table</span><span>
+</span>python 42_02_create_watermark_table.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DAILY RUN (automated via Project 41 Step Functions)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Full pipeline: Extract → Merge → Verify → Notify</span><span>
+</span>python 42_05_cdc_pipeline_orchestrator.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># OPERATIONS (manual when needed)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># View current watermarks</span><span>
+</span>python 42_06_watermark_utility.py list
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Rewind orders watermark by 24 hours (reprocess last day)</span><span>
+</span><span>python 42_06_watermark_utility.py rewind orders </span><span class="token" style="color: rgb(54, 172, 170);">24</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Reset to full initial load</span><span>
+</span><span>python 42_06_watermark_utility.py reset orders </span><span class="token" style="color: rgb(54, 172, 170);">1970</span><span>-01-01T00:00:00</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT (Daily CDC Run):
+</span>
+╔════════════════════════════════════════════════════════════════════════╗
+║              QUICKCART CDC PIPELINE — FULL RUN                        ║
+║              2025-01-15 00:05:00                                      ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+======================================================================
+📤 PHASE 1: CDC EXTRACTION
+======================================================================
+
+──────────────────────────────────────────────────
+📋 Entity: orders
+──────────────────────────────────────────────────
+   📋 Watermark: 2025-01-14T23:59:59
+   📋 Adjusted (−5min): 2025-01-14 23:54:59
+   🔍 Executing CDC query: WHERE updated_at &gt; '2025-01-14 23:54:59'
+   📊 Rows extracted: 11,247
+   📋 New watermark will be: 2025-01-15T23:58:42
+   📦 CSV size: 1,487.3 KB
+   ✅ Uploaded: s3://quickcart-raw-data-prod/cdc_exports/orders/dt=2025-01-15/...
+   ✅ Watermark updated: orders → 2025-01-15T23:58:42
+
+──────────────────────────────────────────────────
+📋 Entity: customers
+──────────────────────────────────────────────────
+   📊 Rows extracted: 342
+   📦 CSV size: 28.1 KB
+   ✅ Uploaded and watermark updated
+
+──────────────────────────────────────────────────
+📋 Entity: products
+──────────────────────────────────────────────────
+   📊 Rows extracted: 87
+   📦 CSV size: 6.2 KB
+   ✅ Uploaded and watermark updated
+
+======================================================================
+🔀 PHASE 2: REDSHIFT MERGE
+======================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 CDC MERGE: orders
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   📊 Target rows before merge: 5,188,753
+   ✅ Target table verified: public.orders
+   ✅ Staging table created: public.staging_orders
+   📥 COPY from: s3://quickcart-raw-data-prod/cdc_exports/orders/...
+   ✅ COPY complete: 11,247 rows in 1.2s
+   ⚠️  28 duplicate(s) found — deduplicating...
+   ✅ Deduplication complete: 11,247 → 11,219 rows
+   🔀 Executing MERGE: staging_orders → orders
+   ✅ MERGE complete in 3.4s
+   📊 Target rows after merge: 5,196,753
+   📊 Net new rows: 8,000
+   📊 Updated rows: 3,219
+   ✅ Staging table dropped
+   🎉 MERGE COMPLETE for orders
+
+======================================================================
+🔍 PHASE 3: CONSISTENCY VERIFICATION
+======================================================================
+
+   🔍 Data Consistency Check: orders
+      MariaDB:  5,196,755 rows
+      Redshift: 5,196,753 rows
+      Diff:     2 rows (0.000%)
+      ✅ CONSISTENT (within 0.1% tolerance)
+
+======================================================================
+📧 PHASE 4: NOTIFICATION
+======================================================================
+📧 Notification sent: ✅ QuickCart CDC Pipeline — SUCCESS
+
+╔════════════════════════════════════════════════════════════════════════╗
+║                        PIPELINE COMPLETE                              ║
+║                                                                        ║
+║                     Status: SUCCESS                                    ║
+║                     Duration: 18.7 seconds                             ║
+╚════════════════════════════════════════════════════════════════════════╝</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Timestamp watermark CDC: simplest CDC method for batch pipelines
+→ ON UPDATE CURRENT_TIMESTAMP: MariaDB auto-refreshes on any column change
+→ INDEX on updated_at: critical — without it, CDC query = full table scan
+→ Overlap window (5 min): prevents missed rows from clock skew / long transactions
+→ Overlap creates duplicates → MERGE handles them idempotently
+→ DynamoDB stores watermarks: strongly consistent, atomic, serverless
+→ Watermark = MAX(updated_at) from EXTRACTED data, NOT from system clock
+→ Staging table pattern: COPY → deduplicate → MERGE → DROP
+→ MERGE is atomic (all-or-nothing), DELETE+INSERT has a brief gap
+→ Data consistency verification: compare source vs target counts after merge
+
+COST COMPARISON (before vs after CDC):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Before (full dump):
+  → Extraction: 480 MB, 5.2M rows, 3 minutes
+  → Glue ETL: 4 DPU × 8 min = $0.59
+  → Redshift COPY: 45 seconds, full table lock
+  → S3 storage: 480 MB/day = 175 GB/year
+  → Monthly total: ~$18
+
+  After (CDC):
+  → Extraction: 1.5 MB, 11K rows, 3 seconds
+  → Glue ETL: 2 DPU × 30 sec = $0.02
+  → Redshift MERGE: 3 seconds, no table lock
+  → S3 storage: 1.5 MB/day = 0.5 GB/year
+  → Monthly total: ~$0.60
+
+  SAVINGS: 96.7%
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 20/29: Full dump extraction (replaced by CDC extraction)
+→ Project 21: Redshift COPY (still used for staging, but into temp table)
+→ Project 31: Glue JDBC connection (CDC uses same JDBC pattern)
+→ Project 33: Glue Job Bookmarks (complementary — tracks S3 files, not DB rows)
+→ Project 41: Event-driven trigger (CDC file triggers same pipeline)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 43: Sync Redshift Results BACK to MariaDB
+   (reverse direction: aggregated analytics → operational database)
+
+→ Project 65: Full Incremental CDC with MERGE at scale
+   (extend this pattern to 50+ tables, handle schema changes,
+    add data quality checks before merge)
+
+→ Project 79: DMS-based real-time CDC
+   (when timestamp watermark isn't enough: captures DELETEs,
+    sub-minute latency, binlog parsing)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CDC is working beautifully:
+</span>→ 11K changed rows extracted nightly
+→ Merged into Redshift in seconds
+→ Cost dropped from $18/month to $0.60/month
+
+Then the product team comes with a new request:
+
+"Our mobile app needs to show personalized product recommendations.
+ The recommendation model runs in Redshift (fast aggregations).
+ But the mobile app reads from MariaDB (low-latency OLTP).
+ 
+ Can you sync the Redshift recommendation results
+ BACK to MariaDB so the app can serve them?"
+
+Direction so far: MariaDB → S3 → Glue → Redshift (one-way)
+New requirement: Redshift → S3 → Glue → MariaDB (reverse!)
+
+This is the REVERSE ETL pattern:
+→ Warehouse → Operational database
+→ Analytics results → Application layer
+→ Aggregated insights → Customer-facing systems
+
+→ Project 43: "Sync Redshift Aggregated Results Back to MariaDB for App"
+→ Introduces: UNLOAD → S3 → Glue JDBC Write → MariaDB Upsert → Reverse ETL</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-41.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 42 of 80</span>
+    <span class="nav-project-title">CAPTURE ONLY CHANGED ROWS FROM MARIADB NIGHTLY</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-43.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-43.html") window.location = "project-43.html";
+  if (e.key === 'ArrowLeft' && "project-41.html") window.location = "project-41.html";
+});
+</script>
+</body>
+</html>

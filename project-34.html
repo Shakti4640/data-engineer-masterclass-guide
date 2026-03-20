@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 34: FILTER, CLEAN, JOIN, &amp; AGGREGATE INSIDE A GLUE JOB — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:42%"></div></div>
+<div id="progress-label">42%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 34 of 80</div>
+  <div class="project-title">FILTER, CLEAN, JOIN, &amp; AGGREGATE INSIDE A GLUE JOB</div>
+  <div class="project-tags"><span class="project-tag">Glue</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Silver layer needed
+</span>Current State (after Projects 31, 32, 33):
+→ Bronze layer in S3: raw extracts from MariaDB + partner feeds
+→ Incremental processing working (bookmarks + watermarks)
+→ Redshift has raw data loaded — but dashboards struggle
+
+THE MESS IN BRONZE LAYER:
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem 1 — DIRTY DATA:
+→ orders table has 3.2% rows with NULL customer_id
+→ partner feeds have empty string product_names
+→ Some prices are negative (returns coded as negative amounts)
+→ Email addresses have mixed case: "[email&#160;protected]" vs "[email&#160;protected]"
+
+Problem 2 — DUPLICATES:
+→ Partner feeds occasionally resend yesterday's file
+→ Same order_id appears 2-3 times across files
+→ MariaDB extraction picks up the same row if updated_at changes
+
+Problem 3 — DATA NEEDS JOINING:
+→ Orders have product_id but no product_name or category
+→ Dashboard needs: "Revenue by Product Category by Month"
+→ Requires JOIN: orders × products × customers
+
+Problem 4 — DATA NEEDS AGGREGATION:
+→ Raw orders: 45M individual transaction rows
+→ Dashboard query: GROUP BY category, month → 200 rows
+→ Running this GROUP BY on 45M rows every dashboard refresh = 8 seconds
+→ Pre-aggregate into silver layer → dashboard reads 200 rows → 0.2 seconds
+
+Problem 5 — NESTED/COMPLEX STRUCTURES:
+→ Partner feeds include a JSON column: order_metadata
+→ Contains: {"shipping_method": "express", "gift_wrap": true, "notes": "..."}
+→ Need to flatten into separate columns for querying
+
+→ Analytics team: "We need a SILVER LAYER that is clean, joined,
+   de-duplicated, and partially aggregated. Build it in Glue."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Map the transforms needed
+</span>→ FILTER: Remove NULL customer_ids, negative prices
+→ CLEAN: Normalize emails, trim strings, fix empty values
+→ DEDUPLICATE: Remove duplicate order_ids (keep latest)
+→ JOIN: orders × products, orders × customers
+→ DERIVE: Calculate total_revenue, extract date parts
+→ AGGREGATE: Pre-compute summary tables
+→ FLATTEN: Unnest JSON/struct columns
+
+Step 2: Understand Glue transform options
+→ DynamicFrame transforms (Glue-native):
+  - Filter, Map, ApplyMapping, ResolveChoice, Relationalize
+→ PySpark transforms (full Spark power):
+  - filter(), join(), groupBy(), window functions, UDFs
+→ SQL transforms (via SparkSQL):
+  - spark.sql("SELECT ... JOIN ... GROUP BY ...")
+→ Best approach: combine all three as needed
+
+Step 3: Design the silver layer output
+→ Input:  bronze/mariadb/orders/, customers/, products/
+→ Output: silver/
+           ├── clean_orders/          (filtered, deduped, enriched)
+           ├── clean_customers/       (normalized, deduped)
+           ├── order_details/         (orders joined with products + customers)
+           ├── daily_revenue_summary/ (pre-aggregated)
+           └── monthly_category_summary/ (pre-aggregated)
+
+Step 4: Dependencies from previous projects
+→ Project 25: DynamicFrame basics (read, write Parquet)
+→ Project 31: JDBC extraction (source data)
+→ Project 33: Incremental processing (only new data)
+→ Project 26: Partitioned output (date-partitioned silver tables)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────┐
+│                          GLUE ETL JOB                               │
+│                                                                     │
+│  ┌───────────┐     ┌───────────┐     ┌──────────┐     ┌─────────┐  │
+│  │ READ      │     │ CLEAN     │     │ JOIN     │     │ WRITE   │  │
+│  │           │     │           │     │          │     │         │  │
+│  │ bronze/   │────►│ Filter    │────►│ orders × │────►│ silver/ │  │
+│  │ orders    │     │ Dedup     │     │ products │     │ order_  │  │
+│  │ customers │     │ Normalize │     │ orders × │     │ details │  │
+│  │ products  │     │ Cast      │     │ customers│     │         │  │
+│  │           │     │ Flatten   │     │          │     │ summary │  │
+│  └───────────┘     └───────────┘     └──────────┘     └─────────┘  │
+│                                                                     │
+│  TRANSFORM PIPELINE:                                                │
+│  1. Read 3 tables from bronze (DynamicFrame)                        │
+│  2. Clean each table independently                                  │
+│  3. Deduplicate each table                                          │
+│  4. Join tables together                                            │
+│  5. Derive new columns                                              │
+│  6. Aggregate for summaries                                         │
+│  7. Write to silver (partitioned Parquet)                           │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: All DynamicFrame transforms (Glue-native only)
+</span>→ Filter, Map, ApplyMapping, ResolveChoice, DropNullFields
+→ Pros: integrates with Glue Catalog, Job Bookmarks
+→ Cons: limited join/aggregation support, verbose syntax
+
+Option B: All PySpark DataFrame transforms
+→ filter(), join(), groupBy(), window(), withColumn()
+→ Pros: full Spark power, familiar API, rich functions
+→ Cons: loses Glue-specific features (need DynamicFrame conversion)
+
+Option C: SparkSQL transforms
+→ Register DataFrames as temp views → run SQL
+→ Pros: familiar for SQL developers, readable
+→ Cons: harder to parameterize, less composable
+
+Option D: Hybrid approach (RECOMMENDED)
+→ READ with DynamicFrame (bookmark support — Project 33)
+→ CONVERT to DataFrame for transforms (full Spark power)
+→ CONVERT back to DynamicFrame for write (Glue Catalog integration)
+→ Best of both worlds
+
+DECISION: Option D — Hybrid DynamicFrame + PySpark
+→ Read/Write via DynamicFrame (Glue features)
+→ Transform via PySpark DataFrame (Spark power)
+→ This is how production Glue jobs are actually written</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Apply transforms in correct ORDER
+</span>   → Clean BEFORE join (reduce data volume for join)
+   → Deduplicate BEFORE join (avoid fan-out from dupes)
+   → Join BEFORE aggregate (need joined columns for GROUP BY)
+   → Aggregate LAST (final summary)
+
+2. Cache/persist DataFrames used in multiple joins
+   → orders_df is joined with BOTH products AND customers
+   → Without cache: Spark re-reads from S3 for each join
+   → df.cache() keeps it in memory across multiple actions
+
+3. Broadcast small dimension tables
+   → products: 50K rows (~2 MB) — tiny
+   → customers: 2M rows (~200 MB) — medium
+   → Broadcast products → avoids shuffle in join
+   → broadcast(products_df) tells Spark to send to all executors
+
+4. Handle schema mismatches with ResolveChoice
+   → Bronze data may have inconsistent types across partitions
+   → Same column: STRING in one file, INT in another
+   → ResolveChoice resolves ambiguity (covered in Project 45 deeply)
+
+5. Write silver tables with OVERWRITE per partition
+   → mode("overwrite") + partitionBy("year", "month", "day")
+   → Overwrites ONLY today's partition, preserves historical
+   → Safe for re-runs (idempotent)
+
+6. Register silver tables in Glue Catalog
+   → Athena and Redshift Spectrum need catalog entries
+   → Use Glue Crawler or manual registration (Project 23 pattern)
+
+7. Validate row counts at each stage
+   → After read: log count
+   → After filter: log count + how many removed
+   → After dedup: log count + how many duplicates
+   → After join: log count + verify no fan-out</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT join before cleaning
+</span>   → Dirty data + join = amplified mess
+   → NULL customer_ids joined with customers table = unexpected NULLs
+   → Clean first, then join
+
+2. DO NOT use collect() on large DataFrames
+   → collect() pulls ALL data to driver node memory
+   → 45M rows × 20 columns = driver OOM crash
+   → Use show(5), head(5), take(5) for sampling
+
+3. DO NOT create cartesian/cross joins accidentally
+   → join without condition = every row × every row
+   → 45M × 2M = 90 TRILLION rows → job crashes
+   → Always specify join condition explicitly
+
+4. DO NOT ignore join type implications
+   → INNER join: loses orders with unknown product_id
+   → LEFT join: keeps all orders, NULL for unknown products
+   → For silver layer: LEFT join preserves all transactions
+
+5. DO NOT aggregate at too fine a granularity
+   → GROUP BY order_id, customer_id, product_id, date, hour, minute
+   → Result: same number of rows as input → no aggregation benefit
+   → Aggregate at business-meaningful level: category + month
+
+6. DO NOT hardcode column names in transforms
+   → Source schema may change (new columns added)
+   → Use column lists from config, not hardcoded strings
+   → Project 45 covers schema evolution deeply
+
+7. DO NOT write all silver tables to one S3 prefix
+   → silver/everything/*.parquet → impossible to query one table
+   → silver/order_details/*.parquet → clean separation
+   → Each logical table = separate S3 prefix = separate Catalog table
+
+8. DO NOT skip null handling in join keys
+   → NULL == NULL returns FALSE in SQL/Spark joins
+   → Rows with NULL join keys silently drop from INNER joins
+   → Filter NULLs explicitly BEFORE join or use LEFT join</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌────────────────────────────────┬────────────────────────┬──────────────────────────────────┐
+</span>│ Transform Need                 │ Use                    │ Why                              │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Remove rows (NULL, invalid)    │ DynamicFrame.Filter()  │ Simple predicate, Glue-native    │
+│                                │ or df.filter()         │                                  │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Rename/reorder/cast columns    │ ApplyMapping           │ Declarative column mapping        │
+│                                │                        │ One call does rename+cast         │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Row-level transformation       │ Map() or               │ Map for DynamicFrame              │
+│ (custom logic per row)         │ df.withColumn()        │ withColumn for DataFrame          │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Deduplicate rows               │ df.dropDuplicates()    │ Spark native, efficient           │
+│                                │ or Window + row_number │ Window for "keep latest" logic    │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Join two datasets              │ df.join()              │ Full Spark join support            │
+│                                │ or Join.apply()        │ Glue Join for DynamicFrames       │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Aggregate (GROUP BY)           │ df.groupBy().agg()     │ Spark aggregation functions        │
+│                                │                        │ sum, count, avg, min, max         │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Flatten nested JSON/struct     │ Relationalize          │ Glue-specific: flattens nested     │
+│                                │ or df.select("col.*")  │ structures into flat tables       │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Resolve type ambiguity         │ ResolveChoice          │ Handles same column with           │
+│                                │                        │ different types across files       │
+├────────────────────────────────┼────────────────────────┼──────────────────────────────────┤
+│ Complex multi-step SQL logic   │ spark.sql()            │ Register as temp view, run SQL    │
+│                                │                        │ Familiar for SQL developers       │
+└────────────────────────────────┴────────────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE FOR TRANSFORMS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Simple column rename or type cast only
+</span>   → Use Athena CTAS (Project 36) — cheaper, no Glue overhead
+   → CREATE TABLE silver AS SELECT CAST(col AS INT) FROM bronze
+
+2. Real-time transformation (&lt; 1 second latency)
+   → Glue is batch (30s+ cold start)
+   → Use Lambda + custom code, or Kinesis Analytics
+
+3. Transformation requires external API calls per row
+   → Spark executors calling REST APIs = bottleneck
+   → Use Lambda (parallel by design) or Step Functions
+
+4. Tiny dataset (&lt; 10,000 rows)
+   → Glue minimum: 1 DPU × 10 min = $0.44
+   → Lambda processing 10K rows costs $0.0001
+   → Use Lambda for tiny transforms
+
+5. Transformation is a simple SQL query
+   → Athena can do SELECT, JOIN, GROUP BY on S3 data
+   → No Glue infrastructure needed
+   → Use Athena for ad-hoc or scheduled simple transforms</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│           GLUE TRANSFORM INTERNALS — HOW SPARK PROCESSES DATA                    │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  DYNAMICFRAME vs DATAFRAME — WHEN EACH IS USED:                                 │
+│  ═══════════════════════════════════════════════                                  │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐              │
+│  │                    DynamicFrame                                  │              │
+│  │  → Glue-specific wrapper around Spark DataFrame                 │              │
+│  │  → Handles schema inconsistencies (ChoiceType)                  │              │
+│  │  → Integrates with Job Bookmarks (Project 33)                   │              │
+│  │  → Integrates with Glue Catalog                                 │              │
+│  │  → Supports: Filter, Map, ApplyMapping, ResolveChoice           │              │
+│  │  → Does NOT support: join, groupBy, window, UDF                 │              │
+│  │  → Convert to DataFrame: dyf.toDF()                             │              │
+│  │  → Convert back: DynamicFrame.fromDF(df, glueContext, name)     │              │
+│  └─────────────────────────────────────────────────────────────────┘              │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐              │
+│  │                    DataFrame (PySpark)                           │              │
+│  │  → Standard Spark DataFrame                                     │              │
+│  │  → Full Spark SQL engine available                              │              │
+│  │  → Supports: ALL Spark operations                               │              │
+│  │  → join, groupBy, window, UDF, pivot, explode, etc.             │              │
+│  │  → Optimized by Catalyst query planner                          │              │
+│  │  → Executed by Tungsten engine (code generation)                │              │
+│  └─────────────────────────────────────────────────────────────────┘              │
+│                                                                                  │
+│  TYPICAL PATTERN:                                                                │
+│  DynamicFrame (read) → DataFrame (transform) → DynamicFrame (write)              │
+│                                                                                  │
+│  HOW JOIN WORKS INTERNALLY:                                                      │
+│  ═════════════════════════                                                       │
+│                                                                                  │
+│  orders_df.join(products_df, "product_id", "left")                               │
+│                                                                                  │
+│  Spark Catalyst optimizer chooses join strategy:                                  │
+│                                                                                  │
+│  Strategy 1: BROADCAST JOIN (for small tables)                                   │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │  products_df (50K rows, 2MB) → broadcast to ALL executors   │                 │
+│  │                                                             │                 │
+│  │  Executor 1: orders_partition_1 + [products copy] → join    │                 │
+│  │  Executor 2: orders_partition_2 + [products copy] → join    │                 │
+│  │  Executor 3: orders_partition_3 + [products copy] → join    │                 │
+│  │  ...                                                        │                 │
+│  │                                                             │                 │
+│  │  → NO shuffle of orders data                                │                 │
+│  │  → Products sent once to each executor (small cost)         │                 │
+│  │  → Fastest join strategy for small dimension tables          │                 │
+│  │  → Auto-triggered when table &lt; spark.sql.autoBroadcast      │                 │
+│  │    JoinThreshold (default: 10MB)                            │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  Strategy 2: SORT-MERGE JOIN (for large tables)                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │  Both tables shuffled by join key (product_id)              │                 │
+│  │                                                             │                 │
+│  │  Phase 1: SHUFFLE                                           │                 │
+│  │  → All rows with product_id hash=0 → partition 0            │                 │
+│  │  → All rows with product_id hash=1 → partition 1            │                 │
+│  │  → Network transfer between executors (expensive)           │                 │
+│  │                                                             │                 │
+│  │  Phase 2: SORT                                              │                 │
+│  │  → Each partition sorted by product_id                      │                 │
+│  │                                                             │                 │
+│  │  Phase 3: MERGE                                             │                 │
+│  │  → Sorted partitions merged in linear scan                  │                 │
+│  │                                                             │                 │
+│  │  → Used when BOTH tables are large                          │                 │
+│  │  → Expensive: full data shuffle across network              │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  HOW DEDUPLICATION WORKS:                                                        │
+│  ════════════════════════                                                        │
+│                                                                                  │
+│  Method A: dropDuplicates(["order_id"])                                           │
+│  → Hash-based: groups by key, keeps FIRST occurrence                             │
+│  → Non-deterministic which row is kept if multiple exist                         │
+│  → Fast but no control over which duplicate survives                             │
+│                                                                                  │
+│  Method B: Window + row_number (RECOMMENDED)                                     │
+│  → window = Window.partitionBy("order_id").orderBy(desc("updated_at"))           │
+│  → df.withColumn("rn", row_number().over(window)).filter("rn = 1")              │
+│  → Keeps the LATEST version of each duplicate                                    │
+│  → Deterministic, controllable, auditable                                        │
+│  → Requires shuffle + sort (more expensive than dropDuplicates)                  │
+│                                                                                  │
+│  HOW AGGREGATION WORKS:                                                          │
+│  ═════════════════════                                                           │
+│                                                                                  │
+│  df.groupBy("category", "month").agg(sum("revenue"), count("order_id"))          │
+│                                                                                  │
+│  Phase 1: PARTIAL AGGREGATE (per partition)                                      │
+│  → Each executor computes local sum/count for its data                           │
+│  → Reduces data volume before shuffle                                            │
+│                                                                                  │
+│  Phase 2: SHUFFLE (by group key)                                                 │
+│  → All rows with same (category, month) go to same partition                     │
+│                                                                                  │
+│  Phase 3: FINAL AGGREGATE                                                        │
+│  → Each partition computes final sum/count                                       │
+│  → Result: one row per (category, month) combination                             │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Join produces MORE rows than input — fan-out"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Duplicate keys in the dimension table
+→ orders has 1 row with product_id=P001
+→ products has 3 rows with product_id=P001 (duplicates)
+→ Join result: 3 rows for that order (1 × 3 = 3)
+→ Fix: DEDUPLICATE dimension tables BEFORE join
+→ Always check: df.count() before and after join
+
+PITFALL 2: "Job OOM — driver runs out of memory"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: collect() on large DataFrame
+→ Cause B: broadcast() on table &gt; 1GB
+→ Cause C: Too many cached DataFrames
+→ Fix A: Never collect() — use show(), head(), take()
+→ Fix B: Only broadcast tables &lt; 200MB
+→ Fix C: unpersist() DataFrames after use
+
+PITFALL 3: "Aggregation returns wrong numbers"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Duplicates in source data not removed before aggregation
+→ 3 copies of order_id=ORD001 → revenue counted 3x
+→ Fix: ALWAYS deduplicate before aggregate
+→ Verify: count(distinct order_id) == count(*)
+
+PITFALL 4: "filter('price &gt; 0') removes rows with NULL price"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: NULL &gt; 0 evaluates to NULL (not TRUE)
+→ filter() keeps only TRUE rows → NULLs dropped
+→ Fix: filter("price &gt; 0 OR price IS NULL") if you want to keep NULLs
+→ Or: fillna(0) before filtering
+
+PITFALL 5: "Join is extremely slow — 2 hours for 45M × 2M"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Both tables shuffled (sort-merge join)
+→ 45M rows × 20 columns shuffled across network = slow
+→ Fix: broadcast the smaller table
+→ from pyspark.sql.functions import broadcast
+→ orders_df.join(broadcast(products_df), "product_id")
+→ 50K products broadcasted = milliseconds, no shuffle
+
+PITFALL 6: "Window function for dedup runs out of memory"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Skewed data — one order_id has 1M duplicates
+→ All 1M rows go to same partition → executor OOM
+→ Fix: Pre-filter extreme duplicates first
+→ df.groupBy("order_id").count().filter("count &gt; 100") → investigate</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TRANSFORM PERFORMANCE AT SCALE:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌────────────────────┬──────────┬──────────────────┬──────────────────┐
+│ Operation          │ 1M rows  │ 45M rows         │ 500M rows        │
+├────────────────────┼──────────┼──────────────────┼──────────────────┤
+│ Filter             │ 2 sec    │ 15 sec           │ 2 min            │
+│ withColumn (calc)  │ 3 sec    │ 20 sec           │ 3 min            │
+│ dropDuplicates     │ 5 sec    │ 2 min (shuffle)  │ 15 min           │
+│ Window + row_num   │ 8 sec    │ 5 min (shuffle)  │ 30 min           │
+│ Broadcast join     │ 3 sec    │ 30 sec           │ 4 min            │
+│ Sort-merge join    │ 10 sec   │ 8 min            │ 45 min           │
+│ groupBy + agg      │ 5 sec    │ 3 min (shuffle)  │ 20 min           │
+└────────────────────┴──────────┴──────────────────┴──────────────────┘
+
+DPU RECOMMENDATIONS:
+→ Filter/Clean only: 5 DPUs
+→ Filter + Join (broadcast): 10 DPUs
+→ Filter + Dedup + Join + Aggregate: 15-20 DPUs
+→ 500M+ rows with complex joins: 30-40 DPUs
+
+MEMORY OPTIMIZATION:
+→ Cache only DataFrames used in multiple operations
+→ unpersist() immediately after last use
+→ Use G.2X workers (32 GB) for memory-intensive joins
+→ Partition output to control file sizes (Project 62)</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY TRANSFORMS ARE CORRECT:
+</span>
+1. ROW COUNT TRACKING
+   → Log count after EVERY transform step
+   → read: 45,000,000 → filter: 43,560,000 (3.2% removed)
+   → dedup: 43,100,000 (1.1% duplicates) → join: 43,100,000 (no fan-out ✅)
+   → If join count &gt; dedup count → fan-out problem → investigate
+
+2. SAMPLE COMPARISON
+   → Pick 10 random order_ids from source
+   → Trace through each transform step
+   → Verify final output matches expected values
+
+3. NULL COUNT TRACKING
+   → Before filter: count(where customer_id IS NULL) = 1,440,000
+   → After filter: count(where customer_id IS NULL) = 0 ✅
+
+4. AGGREGATE VALIDATION
+   → Manual calculation on small sample
+   → SELECT SUM(revenue) FROM orders WHERE category='Electronics' AND month='2025-01'
+   → Compare with silver summary table value
+
+5. SCHEMA VERIFICATION
+   → df.printSchema() at each stage
+   → Verify: column names, types, nullability match expectations</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(34)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Glue ETL Script — Full Silver Layer Transform</h3>
+
+<h3>Part 2: Create and Run the Silver Layer Job</h3>
+
+<h3>Part 3: Full Pipeline Orchestrator (Bronze → Silver → Redshift)</h3>
+
+<h3>Part 4: Glue DynamicFrame-Only Transform Reference</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ SILVER LAYER TRANSFORM — INTERNAL DATA FLOW                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  INPUT (Bronze — from Project 31):                                      │
+│  ├── orders:    45,000,000 rows (dirty, with dupes)                     │
+│  ├── customers:  2,000,000 rows                                         │
+│  └── products:      50,000 rows                                         │
+│                                                                         │
+│  PHASE 1 — CLEAN:                                                       │
+│  ├── orders:    45M → 43.1M (removed NULLs, invalid amounts)           │
+│  ├── customers:  2M →  2.0M (normalized emails, names)                  │
+│  └── products:  50K →   50K (normalized categories)                     │
+│                                                                         │
+│  PHASE 2 — DEDUP:                                                       │
+│  ├── orders:    43.1M → 42.8M (window dedup, keep latest)              │
+│  ├── customers:  2.0M →  1.98M                                          │
+│  └── products:    50K →    50K                                           │
+│                                                                         │
+│  PHASE 3 — JOIN:                                                        │
+│  └── order_details: 42.8M rows                                          │
+│      (orders × products × customers — LEFT JOIN, no fan-out)            │
+│      Added: product_name, category, customer_name, tier, revenue        │
+│                                                                         │
+│  PHASE 4 — AGGREGATE:                                                   │
+│  ├── daily_revenue_summary:     ~200 rows (category × tier × status)    │
+│  ├── monthly_category_summary:   ~96 rows (category × 12 months)        │
+│  └── customer_rfm:           ~1.98M rows (per customer)                 │
+│                                                                         │
+│  PHASE 5 — WRITE (Silver S3):                                           │
+│  ├── clean_orders/            (42.8M rows, 10 Parquet files)            │
+│  ├── clean_customers/         ( 1.98M rows, 2 files)                    │
+│  ├── clean_products/          (   50K rows, 1 file)                     │
+│  ├── order_details/           (42.8M rows, 10 files)                    │
+│  ├── daily_revenue_summary/   (  ~200 rows, 1 file)                     │
+│  ├── monthly_category_summary/(   ~96 rows, 1 file)                     │
+│  └── customer_rfm/            ( 1.98M rows, 2 files)                    │
+│                                                                         │
+│  PHASE 6 — CATALOG:                                                     │
+│  └── All 7 tables registered in silver_quickcart database               │
+│      → Queryable via Athena immediately                                 │
+│                                                                         │
+│  ESTIMATED TIME: 15-25 minutes                                          │
+│  ESTIMATED COST: 15 G.2X workers × 25 min = ~$5.50                     │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 3-STAGE PIPELINE (Project 34 full orchestration):                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  $ python 34_03_full_pipeline_with_silver.py                            │
+│                                                                         │
+│  Stage 1: MariaDB → Bronze  (~10 min, $0.73)  [Project 31]             │
+│  Stage 2: Bronze → Silver   (~25 min, $5.50)  [Project 34] ← NEW      │
+│  Stage 3: Silver → Redshift (~7 min, $0.73)   [Project 32]             │
+│                                                                         │
+│  Total: ~42 min, ~$6.96/day, ~$209/month                               │
+│                                                                         │
+│  vs. Previous (without silver):                                         │
+│  → Redshift loaded raw data, did joins on every query                   │
+│  → Dashboard response: 8-15 seconds                                     │
+│                                                                         │
+│  With silver layer:                                                     │
+│  → Redshift loads pre-joined, pre-aggregated data                       │
+│  → Dashboard response: 0.2-0.5 seconds                                  │
+│  → 40x faster dashboards for $209/month                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+S3 FINAL STRUCTURE:
+━━━━━━━━━━━━━━━━━━
+
+s3://quickcart-datalake-prod/
+├── bronze/                          ← Raw extracts (Project 31)
+│   └── mariadb/
+│       ├── orders/year=2025/month=01/day=15/*.parquet
+│       ├── customers/year=2025/month=01/day=15/*.parquet
+│       └── products/year=2025/month=01/day=15/*.parquet
+│
+├── silver/                          ← Clean, joined, aggregated (THIS PROJECT)
+│   ├── clean_orders/year=2025/month=01/day=15/*.parquet
+│   ├── clean_customers/year=2025/month=01/day=15/*.parquet
+│   ├── clean_products/year=2025/month=01/day=15/*.parquet
+│   ├── order_details/year=2025/month=01/day=15/*.parquet
+│   ├── daily_revenue_summary/year=2025/month=01/day=15/*.parquet
+│   ├── monthly_category_summary/year=2025/month=01/*.parquet
+│   └── customer_rfm/year=2025/month=01/day=15/*.parquet
+│
+├── gold/                            ← Business-ready (Project 44)
+│   └── (future — curated for specific business use cases)
+│
+├── scripts/glue/
+├── tmp/
+└── state/watermarks/</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Hybrid pattern: DynamicFrame for read/write, DataFrame for transforms
+→ Clean BEFORE join, dedup BEFORE join — reduce data volume early
+→ Window + row_number for deterministic deduplication (keep latest)
+→ broadcast() small tables to avoid expensive shuffle joins
+→ cache() DataFrames reused in multiple operations, unpersist() after
+→ LEFT join preserves all transactions even with missing dimensions
+→ Pre-aggregation in silver layer = 40x faster dashboard queries
+→ Column rename BEFORE join prevents ambiguous column names
+→ Always verify join count ≈ input count (detect fan-out)
+→ Write with mode("overwrite") + partitionBy = idempotent per partition
+→ Register all silver tables in Glue Catalog for Athena access
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 25: Glue ETL basics (DynamicFrame, Parquet)
+→ Project 26: Partitioned output (date-partitioned silver tables)
+→ Project 31: Bronze layer source (MariaDB → S3 extraction)
+→ Project 32: Redshift loading (now loads silver instead of bronze)
+→ Project 33: Incremental processing (bookmark/watermark for silver job)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 35: Chain Crawler → ETL → Crawler as orchestrated Workflow
+   (automate: crawl bronze → run silver transform → crawl silver)
+→ Project 44: Bronze → Silver → GOLD architecture (Medallion)
+   (gold layer = business-specific views of silver data)
+→ Project 45: Schema evolution — what if source adds/removes columns?
+   (silver transforms must handle changing schemas gracefully)
+→ Project 62: Small file problem from incremental silver writes
+   (each daily run creates new small Parquet files → compaction)
+→ Project 68: Data quality rules BEFORE loading to gold
+   (validate silver data meets quality thresholds)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a 3-layer pipeline:
+</span>→ Bronze: raw MariaDB extracts (Project 31)
+→ Silver: clean, joined, aggregated (Project 34)
+→ Redshift: serving layer for dashboards (Project 32)
+
+But the pipeline has 3 SEPARATE Glue jobs:
+→ Job 1: MariaDB → Bronze
+→ Job 2: Bronze → Silver
+→ Job 3: Silver → Redshift
+
+Currently orchestrated by a Python script (Project 34 Part 3)
+Problems:
+→ If Job 2 fails, someone must manually re-run
+→ No automatic retry
+→ No visual monitoring
+→ No conditional triggers (e.g., "only run Job 3 if Job 2 produced data")
+
+CTO: "Can we chain these into ONE automated workflow?"
+YOU: "Yes — Glue Workflows let us chain Crawlers and ETL Jobs
+      with triggers. If Job 1 succeeds, Job 2 auto-starts.
+      If Job 2 succeeds, Job 3 auto-starts. If any fails,
+      the workflow stops and alerts us."
+
+→ Project 35: "Chain Crawler → ETL → Crawler as One Orchestrated Workflow"
+→ Introduces: Glue Workflows, Triggers, Conditional Triggers,
+              Execution Graph, Workflow Monitoring</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-33.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 34 of 80</span>
+    <span class="nav-project-title">FILTER, CLEAN, JOIN, &amp; AGGREGATE INSIDE A GLUE JOB</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-35.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-35.html") window.location = "project-35.html";
+  if (e.key === 'ArrowLeft' && "project-33.html") window.location = "project-33.html";
+});
+</script>
+</body>
+</html>

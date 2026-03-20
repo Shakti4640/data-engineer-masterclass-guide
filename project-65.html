@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 65: FULL INCREMENTAL CDC — MARIADB → S3 → GLUE → REDSHIFT (DAILY — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:81%"></div></div>
+<div id="progress-label">81%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 65 of 80</div>
+  <div class="project-title">FULL INCREMENTAL CDC — MARIADB → S3 → GLUE → REDSHIFT (DAILY MERGE)</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag">MariaDB</span><span class="project-tag">Redshift</span><span class="project-tag">Glue</span><span class="project-tag phase">🔴 Phase 5: Very Hard</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — nightly ETL pipeline in production for 6 months
+</span>
+CURRENT STATE (Project 61 — Full Load):
+→ Glue job runs at 2:00 AM nightly
+→ Reads ALL rows from Account A's MariaDB
+→ Writes ALL rows to Account B's Redshift
+→ Strategy: TRUNCATE target → INSERT all rows
+→ Works but...
+
+GROWTH TRAJECTORY:
+┌──────────────┬────────────┬───────────┬───────────────┬──────────────────┐
+│ Month        │ Total Rows │ Daily New │ ETL Duration  │ Finish Time      │
+├──────────────┼────────────┼───────────┼───────────────┼──────────────────┤
+│ Month 1      │ 2M         │ 50K       │ 8 min         │ 2:08 AM ✅        │
+│ Month 3      │ 6M         │ 100K      │ 15 min        │ 2:15 AM ✅        │
+│ Month 6 NOW  │ 12M        │ 200K      │ 25 min        │ 2:25 AM ⚠️       │
+│ Month 12     │ 30M        │ 350K      │ 65 min        │ 3:05 AM ⚠️       │
+│ Month 18     │ 55M        │ 500K      │ 120 min       │ 4:00 AM ❌        │
+│ Month 24     │ 90M        │ 700K      │ 200 min       │ 5:20 AM ❌        │
+│ Month 36     │ 200M       │ 1M        │ 450 min       │ 9:30 AM ❌❌      │
+└──────────────┴────────────┴───────────┴───────────────┴──────────────────┘
+
+PROBLEMS:
+1. WASTE: 200K daily changes / 12M total rows = 1.7% change rate
+   → Processing 12M rows to capture 200K = 98.3% redundant work
+   → Glue DPU cost: $0.44/DPU-hr × 10 DPU × 0.42 hr = $1.85/night
+   → Only $0.03 worth of actual new data processed
+
+2. GROWING DURATION: Linear growth with table size
+   → At 200M rows: ETL finishes at 9:30 AM — AFTER analysts start
+   → Dashboard shows stale data until ETL completes
+   → Violates SLA: "fresh data by 8:00 AM"
+
+3. DOWNTIME: TRUNCATE + INSERT causes data gap
+   → TRUNCATE at 2:00 AM → table is EMPTY
+   → INSERT completes at 2:25 AM → table has data again
+   → During 25-minute window: dashboard shows 0 rows
+   → Any analyst working late sees broken dashboard
+
+4. NO HANDLING OF UPDATES/DELETES:
+   → Current: TRUNCATE + INSERT handles everything (brute force)
+   → But: can't track WHAT changed
+   → No audit trail: was this row inserted, updated, or deleted?
+   → No SCD (Slowly Changing Dimensions) capability
+
+5. MARIADB LOAD:
+   → Full table scan on 12M rows every night
+   → MariaDB CPU: 95% during ETL window
+   → OLTP transactions slow down during ETL
+   → Operations team complains: "Your ETL is killing our database"
+
+CTO: "This pipeline won't survive another 6 months. We need incremental
+      loading — only process what changed. No downtime. No waste.
+      And I want to know: was this row new, updated, or deleted?"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand CDC (Change Data Capture) fundamentals
+</span>
+  WHAT IS CDC?
+  → Technique to identify and capture ONLY the data that CHANGED
+  → Changed = Inserted, Updated, or Deleted since last extraction
+  → Process delta (changed rows) instead of full table
+
+  CDC METHODS:
+  ┌──────────────────────────┬──────────┬────────────────────────────────────┐
+  │ Method                   │ Accuracy │ How It Works                       │
+  ├──────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Timestamp-based (chosen) │ High     │ WHERE updated_at &gt; last_watermark  │
+  │                          │          │ Requires audit columns on source   │
+  │                          │          │ Misses hard deletes                │
+  ├──────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Binlog-based (DMS)       │ Highest  │ Read MariaDB binary log            │
+  │                          │          │ Captures ALL changes including     │
+  │                          │          │ deletes, zero source impact        │
+  │                          │          │ Requires DMS replication instance  │
+  ├──────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Trigger-based            │ Highest  │ DB trigger logs changes to table   │
+  │                          │          │ High overhead on OLTP performance  │
+  │                          │          │ Not recommended for production     │
+  ├──────────────────────────┼──────────┼────────────────────────────────────┤
+  │ Full diff                │ Highest  │ Compare today's full extract with  │
+  │                          │          │ yesterday's → compute diff         │
+  │                          │          │ Expensive: reads full table twice  │
+  └──────────────────────────┴──────────┴────────────────────────────────────┘
+
+Step 2: Choose timestamp-based CDC
+
+  WHY TIMESTAMP-BASED:
+  → QuickCart's MariaDB tables already have:
+    - created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    - updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  → No additional infrastructure (no DMS replication instance)
+  → Glue can handle with simple WHERE clause
+  → Catches: INSERTs (created_at &gt; watermark) and UPDATEs (updated_at &gt; watermark)
+  → Does NOT catch: hard DELETEs (row disappears — no timestamp to query)
+
+  HANDLING DELETES:
+  → Option A: Soft deletes — add is_deleted flag + deleted_at timestamp
+    → Application sets is_deleted = TRUE instead of DELETE
+    → CDC captures this as an UPDATE (updated_at changes)
+    → RECOMMENDED for data warehousing
+  → Option B: Periodic full diff — weekly full extract → compare → find deletions
+    → Expensive but catches hard deletes
+    → Run weekly as supplement to daily CDC
+  → Option C: Binlog CDC via DMS — captures DELETE events
+    → Best accuracy but adds infrastructure (Project 79)
+
+  DECISION: 
+  → Daily: Timestamp-based CDC (INSERTs + UPDATEs)
+  → Soft deletes on source tables (application change)
+  → Weekly: Full diff reconciliation (catch edge cases)
+
+Step 3: Design the MERGE pattern
+
+  CURRENT (Full Load):
+  ┌─────────────────────────────────────────────────────────┐
+  │ TRUNCATE target_table;                                  │
+  │ INSERT INTO target_table SELECT * FROM source_table;    │
+  │                                                         │
+  │ DOWNTIME: entire TRUNCATE → INSERT window               │
+  │ COST: reads ALL rows every time                         │
+  └─────────────────────────────────────────────────────────┘
+
+  NEW (Incremental CDC + Merge):
+  ┌─────────────────────────────────────────────────────────┐
+  │ 1. Extract ONLY changed rows (WHERE updated_at &gt; mark) │
+  │ 2. Load into STAGING table                              │
+  │ 3. MERGE staging into target:                           │
+  │    - If key exists in staging AND target: UPDATE         │
+  │    - If key exists in staging NOT target: INSERT         │
+  │    - If staging row has is_deleted=true: mark as deleted │
+  │ 4. Update watermark to current timestamp                │
+  │                                                         │
+  │ ZERO DOWNTIME: target table always has data              │
+  │ COST: reads only 200K rows instead of 12M               │
+  └─────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ARCHITECTURE:
+</span>
+  ACCOUNT A (Operations)                    ACCOUNT B (Analytics)
+  ┌─────────────────────────┐               ┌──────────────────────────────────┐
+  │ MariaDB                 │               │                                  │
+  │ ┌─────────────────────┐ │  VPC Peering  │  S3 Data Lake                    │
+  │ │ orders              │ │◄─────────────►│  ┌────────────────────────────┐  │
+  │ │ - order_id (PK)     │ │               │  │ CDC Landing Zone           │  │
+  │ │ - customer_id       │ │               │  │ s3://lake/cdc/orders/      │  │
+  │ │ - total_amount      │ │               │  │   batch_2025-01-15/        │  │
+  │ │ - status            │ │               │  │     delta.parquet          │  │
+  │ │ - created_at ★      │ │               │  └──────────┬─────────────────┘  │
+  │ │ - updated_at ★      │ │               │             │                    │
+  │ │ - is_deleted ★      │ │               │             ▼                    │
+  │ └─────────────────────┘ │               │  ┌────────────────────────────┐  │
+  │                         │               │  │ Glue ETL Job               │  │
+  │ ★ = CDC columns         │               │  │ 1. Read delta from S3      │  │
+  │                         │               │  │ 2. Transform + validate    │  │
+  │                         │               │  │ 3. Load to Redshift staging│  │
+  │                         │               │  │ 4. Execute MERGE SQL       │  │
+  │                         │               │  │ 5. Update watermark        │  │
+  │                         │               │  └──────────┬─────────────────┘  │
+  │                         │               │             │                    │
+  │                         │               │             ▼                    │
+  │                         │               │  ┌────────────────────────────┐  │
+  │                         │               │  │ Redshift                   │  │
+  │                         │               │  │ ┌──────────────────────┐   │  │
+  │                         │               │  │ │ stg_orders (staging) │   │  │
+  │                         │               │  │ │ → temp, delta rows   │   │  │
+  │                         │               │  │ └──────────┬───────────┘   │  │
+  │                         │               │  │            │ MERGE         │  │
+  │                         │               │  │            ▼               │  │
+  │                         │               │  │ ┌──────────────────────┐   │  │
+  │                         │               │  │ │ orders (target)      │   │  │
+  │                         │               │  │ │ → always has data    │   │  │
+  │                         │               │  │ │ → zero downtime      │   │  │
+  │                         │               │  │ └──────────────────────┘   │  │
+  │                         │               │  │                           │  │
+  │                         │               │  │ ┌──────────────────────┐   │  │
+  │                         │               │  │ │ cdc_watermarks       │   │  │
+  │                         │               │  │ │ → tracks last_value  │   │  │
+  │                         │               │  │ │   per table          │   │  │
+  │                         │               │  │ └──────────────────────┘   │  │
+  │                         │               │  └───────────────────────────┘  │
+  └─────────────────────────┘               └──────────────────────────────────┘
+
+FLOW:
+  2:00 AM → Read watermark for 'orders' → last_value = '2025-01-14 02:00:00'
+  2:01 AM → Query MariaDB: WHERE updated_at &gt; '2025-01-14 02:00:00'
+            → Returns 200K rows (delta)
+  2:03 AM → Write delta to S3 as Parquet (CDC landing zone)
+  2:04 AM → Load delta into Redshift staging table (stg_orders)
+  2:05 AM → Execute MERGE: staging → target
+            → 150K new rows INSERTed
+            → 45K existing rows UPDATEd
+            → 5K rows marked as soft-deleted
+  2:06 AM → Update watermark to '2025-01-15 02:00:00'
+  2:06 AM → DONE — 6 minutes instead of 25 minutes</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue JDBC + Watermark + Redshift MERGE ✅ (CHOSEN)
+</span>→ Glue reads delta via JDBC WHERE clause
+→ Writes delta to S3 (audit trail)
+→ Loads to Redshift staging table
+→ Redshift stored procedure executes MERGE
+→ Watermark tracked in Redshift table
+→ Full control, transparent, auditable
+
+Option B: Glue Job Bookmarks (Project 33)
+→ Glue tracks processed files automatically
+→ BUT: bookmarks track FILES not database rows
+→ For JDBC source: bookmark tracks by timestamp column
+→ Less control over watermark management
+→ Risk: bookmark corruption → data loss or reprocessing
+
+Option C: AWS DMS (Database Migration Service)
+→ Continuous CDC via MariaDB binlog
+→ Captures ALL changes including hard DELETEs
+→ Writes to S3 in near-real-time
+→ BUT: requires DMS replication instance ($0.018/hr+)
+→ More infrastructure to manage
+→ Best for: continuous replication, not nightly batch
+
+Option D: Glue + Delta Lake / Apache Iceberg
+→ Open table format with built-in MERGE support
+→ Handles CDC natively with ACID transactions
+→ BUT: adds complexity (Iceberg/Delta setup)
+→ Best for: when you need time-travel, schema evolution
+→ Covered conceptually in advanced projects
+
+DECISION: Option A — maximum control and transparency
+→ Explicit watermark management (debuggable)
+→ Delta persisted in S3 (audit trail)
+→ Redshift MERGE (transactional, zero downtime)
+→ No additional infrastructure beyond existing Glue + Redshift</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. ADD audit columns to MariaDB source tables
+</span>   → created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   → updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+   → is_deleted BOOLEAN DEFAULT FALSE
+   → These MUST exist before CDC works
+
+2. CREATE indexes on updated_at in MariaDB
+   → Without index: WHERE updated_at &gt; X → full table scan on MariaDB
+   → With index: range scan → reads only changed rows
+   → CREATE INDEX idx_orders_updated_at ON orders(updated_at);
+   → CRITICAL for MariaDB performance during extraction
+
+3. USE staging table pattern in Redshift
+   → Never merge directly from Glue to target
+   → Load delta → staging → MERGE to target
+   → Staging table is temporary (CREATE TEMP TABLE or TRUNCATE after)
+   → Isolates loading errors from target table
+
+4. PERSIST delta to S3 before loading to Redshift
+   → S3 path: s3://lake/cdc/orders/batch_YYYYMMDD_HHMMSS/
+   → Serves as: audit trail, replay capability, debugging
+   → If Redshift MERGE fails: can replay from S3
+   → If need to rebuild: replay all deltas in order
+
+5. TRACK watermarks in a dedicated Redshift table
+   → Table: cdc_watermarks (table_name, last_extracted_at, last_run_id)
+   → Updated ONLY after successful MERGE
+   → If job fails mid-way: watermark stays at previous value
+   → Next run re-extracts same delta → idempotent
+
+6. USE Redshift stored procedure for MERGE
+   → Encapsulates: staging load → delete+insert → stats update
+   → Transaction: all-or-nothing (COMMIT or ROLLBACK)
+   → Already covered conceptually in Project 49
+
+7. VALIDATE row counts at every step
+   → MariaDB delta count → S3 file row count → staging count → target delta
+   → If any mismatch: alert and investigate before proceeding
+   → Prevents silent data loss
+
+8. HANDLE late-arriving data
+   → Watermark = last_extracted_at, not last_order_date
+   → Some rows may have updated_at slightly before watermark
+   → SAFETY MARGIN: subtract 5 minutes from watermark
+   → WHERE updated_at &gt; (watermark - INTERVAL 5 MINUTE)
+   → MERGE handles duplicates gracefully (UPDATE existing row = no harm)
+
+9. RUN weekly full reconciliation
+   → Every Sunday: full extract + compare with Redshift
+   → Detect: hard deletes, missed updates, data drift
+   → Alert if delta &gt; 0.1% of total rows</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use updated_at without an INDEX
+</span>   → MariaDB: WHERE updated_at &gt; X without index = FULL TABLE SCAN
+   → 12M row full scan = defeats purpose of CDC
+   → MariaDB CPU: 95% instead of 5%
+   → ALWAYS create index before enabling CDC
+
+2. DO NOT update watermark BEFORE merge completes
+   → If merge fails after watermark update: delta is LOST
+   → Next run starts from new watermark → skips failed delta
+   → ALWAYS: merge first → validate → THEN update watermark
+
+3. DO NOT merge directly into target without staging
+   → Direct merge from Glue DynamicFrame → Redshift target
+   → If transformation error: corrupted data in target
+   → No rollback capability
+   → ALWAYS: Glue → S3 → staging → MERGE → target
+
+4. DO NOT trust updated_at alone for deletes
+   → Hard DELETE removes the row entirely — no updated_at to query
+   → Timestamp CDC misses hard deletes by design
+   → Solution: soft deletes (is_deleted flag) + weekly reconciliation
+
+5. DO NOT set watermark safety margin to 0
+   → Clock skew between MariaDB and Glue: possible 1-2 seconds
+   → Transaction commit timing: row visible after commit
+   → 0 margin: may miss rows committed during extraction
+   → 5-minute margin: safe overlap, MERGE handles duplicates
+
+6. DO NOT skip S3 persistence of deltas
+   → "Just load directly to Redshift staging — faster"
+   → If Redshift is down: delta is lost
+   → No replay capability
+   → No audit trail for compliance
+   → S3 write adds ~30 seconds — worth it for reliability
+
+7. DO NOT run CDC and full load simultaneously
+   → Full load truncates target → CDC delta references deleted rows
+   → Race condition: unpredictable state
+   → Use mutex: only one ETL pattern runs at a time
+
+8. DO NOT ignore timezone differences
+   → MariaDB updated_at: in server timezone (e.g., UTC)
+   → Glue watermark: stored as string or timestamp
+   → If mismatch: watermark comparison wrong → miss or duplicate rows
+   → ALWAYS: use UTC everywhere, store timezone-aware timestamps</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────┬──────────────────────┬──────────────────────────────────────┐
+</span>│ Scenario                            │ Use                  │ Why                                  │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ &lt; 1M rows total, changes &lt; 10K/day  │ Full load            │ Simple, fast enough, no complexity   │
+│                                     │ (Project 61 pattern) │                                      │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ 1M-100M rows, change rate &lt; 5%      │ Timestamp CDC        │ Fast extraction, simple WHERE clause │
+│ Source has audit columns             │ (THIS project)       │ Handles inserts + updates            │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Any size, need hard delete capture   │ Binlog CDC (DMS)     │ Reads transaction log — captures ALL │
+│ Need near-real-time replication      │                      │ Including DELETE events               │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Need ACID transactions on S3 lake    │ Delta Lake / Iceberg │ MERGE support, time-travel, schema   │
+│ Complex merge with schema evolution  │                      │ evolution, snapshot isolation         │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Source has no audit columns          │ Full diff            │ Extract full → compare → compute     │
+│ Can't modify source schema           │                      │ delta. Expensive but universal        │
+├─────────────────────────────────────┼──────────────────────┼──────────────────────────────────────┤
+│ Streaming data (&lt; 1 min latency)     │ Kinesis + Lambda     │ Real-time CDC, event-driven          │
+│                                     │ (Project 72)         │                                      │
+└─────────────────────────────────────┴──────────────────────┴──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE TIMESTAMP-BASED CDC</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Source tables have NO audit columns and you CAN'T add them
+</span>   → No updated_at = no way to identify changes
+   → Use: full diff or binlog CDC (DMS)
+
+2. Hard deletes are critical to capture in real-time
+   → Timestamp CDC misses DELETE statements
+   → Use: binlog CDC (DMS) or soft-delete pattern
+
+3. Source has bulk UPDATE operations that touch millions of rows
+   → Monthly batch: UPDATE orders SET status='archived' WHERE order_date &lt; '2024-01-01'
+   → 5M rows get updated_at refreshed → CDC treats all as "changed"
+   → Delta becomes nearly as large as full table
+   → Use: filter by change TYPE, or switch to full load for that batch
+
+4. Sub-minute latency required
+   → Timestamp CDC = batch (runs on schedule)
+   → Minimum practical interval: 5 minutes
+   → For real-time: use DMS CDC or Kinesis streaming
+
+5. Multiple writers update same row within CDC interval
+   → Row updated 10 times between CDC runs
+   → CDC captures only the FINAL state (latest updated_at)
+   → If you need ALL intermediate states: use binlog CDC</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────────────────────────────────────────────────────┐
+</span>│                    CDC MERGE — INTERNAL MECHANICS                             │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  PHASE 1: WATERMARK RETRIEVAL                                                 │
+│  ─────────────────────────────                                                │
+│                                                                               │
+│  SELECT last_extracted_at FROM cdc_watermarks                                 │
+│  WHERE table_name = 'orders';                                                 │
+│  → Returns: '2025-01-14 02:00:00'                                             │
+│                                                                               │
+│  SAFETY MARGIN applied:                                                       │
+│  effective_watermark = '2025-01-14 02:00:00' - INTERVAL '5 MINUTE'            │
+│                      = '2025-01-14 01:55:00'                                  │
+│                                                                               │
+│  WHY SAFETY MARGIN:                                                           │
+│  → Transaction T1: starts at 01:59:58, sets updated_at = 01:59:58            │
+│  → Transaction T1: commits at 02:00:03                                        │
+│  → Without margin: watermark = 02:00:00 → misses T1 (01:59:58 &lt; 02:00:00)   │
+│  → With 5-min margin: watermark = 01:55:00 → captures T1 ✅                  │
+│  → MERGE handles duplicate: if row already in target → UPDATE (no harm)       │
+│                                                                               │
+│  PHASE 2: DELTA EXTRACTION                                                    │
+│  ─────────────────────────                                                    │
+│                                                                               │
+│  Glue JDBC query to MariaDB:                                                  │
+│  SELECT order_id, customer_id, product_id, quantity, unit_price,              │
+│         total_amount, status, order_date, created_at, updated_at,             │
+│         is_deleted                                                            │
+│  FROM orders                                                                  │
+│  WHERE updated_at &gt; '2025-01-14 01:55:00'                                     │
+│                                                                               │
+│  MariaDB execution:                                                           │
+│  → Uses index on updated_at → range scan                                      │
+│  → Reads only B-tree pages for matching rows                                  │
+│  → Returns ~200K rows (instead of 12M)                                        │
+│  → MariaDB CPU: 5% (instead of 95% for full scan)                            │
+│                                                                               │
+│  WHAT'S IN THE DELTA:                                                         │
+│  ┌─────────────────────────────────────────────────────────┐                  │
+│  │ 150,000 rows: created_at &gt; watermark (NEW inserts)     │                  │
+│  │  45,000 rows: updated_at &gt; watermark, created_at &lt;     │                  │
+│  │               watermark (EXISTING rows that were        │                  │
+│  │               UPDATEd — status change, amount change)   │                  │
+│  │   5,000 rows: is_deleted = TRUE, updated_at &gt; watermark│                  │
+│  │               (SOFT DELETEs — marked for deletion)      │                  │
+│  │               These rows still exist in MariaDB with    │                  │
+│  │               is_deleted flag set by application        │                  │
+│  └─────────────────────────────────────────────────────────┘                  │
+│                                                                               │
+│  PHASE 3: S3 PERSISTENCE                                                      │
+│  ────────────────────────                                                     │
+│                                                                               │
+│  Delta written to S3 as Parquet:                                              │
+│  s3://lake/cdc/orders/batch_20250115_020100/delta.parquet                     │
+│                                                                               │
+│  WHY PERSIST TO S3:                                                           │
+│  → Audit trail: "what did we extract on Jan 15?"                              │
+│  → Replay: if Redshift merge fails → re-run from S3                          │
+│  → Debugging: inspect delta to understand data issues                         │
+│  → Data lake: CDC deltas feed Bronze layer (Project 44)                       │
+│  → Recovery: rebuild Redshift from S3 deltas if needed                        │
+│                                                                               │
+│  PHASE 4: STAGING TABLE LOAD                                                  │
+│  ────────────────────────────                                                 │
+│                                                                               │
+│  Redshift staging table: stg_orders                                           │
+│  → TRUNCATE stg_orders; (clean from previous run)                             │
+│  → COPY stg_orders FROM 's3://lake/cdc/orders/batch_...'                     │
+│    IAM_ROLE '...' FORMAT AS PARQUET;                                          │
+│  → 200K rows loaded into staging in ~10 seconds                               │
+│                                                                               │
+│  WHY STAGING (not direct merge from Glue):                                    │
+│  → COPY is the fastest way to load into Redshift                              │
+│  → Staging table can be validated before merging                              │
+│  → MERGE runs entirely within Redshift (fast, transactional)                  │
+│  → If staging has issues: target untouched                                    │
+│                                                                               │
+│  PHASE 5: THE MERGE                                                           │
+│  ──────────────────                                                           │
+│                                                                               │
+│  Redshift does NOT have native MERGE statement (as of early versions)         │
+│  Instead: DELETE + INSERT pattern (equivalent, transactional)                 │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────┐              │
+│  │ BEGIN TRANSACTION;                                          │              │
+│  │                                                              │              │
+│  │ -- Step 1: DELETE rows in target that exist in staging      │              │
+│  │ DELETE FROM orders                                           │              │
+│  │ WHERE order_id IN (SELECT order_id FROM stg_orders);         │              │
+│  │ -- Removes: existing rows that will be updated              │              │
+│  │ -- Also removes: rows that are being soft-deleted           │              │
+│  │ -- Rows NOT in staging: untouched ✅                        │              │
+│  │                                                              │              │
+│  │ -- Step 2: INSERT all staging rows into target              │              │
+│  │ INSERT INTO orders                                           │              │
+│  │ SELECT * FROM stg_orders                                     │              │
+│  │ WHERE is_deleted = FALSE;                                    │              │
+│  │ -- New rows: inserted (didn't exist before DELETE)          │              │
+│  │ -- Updated rows: inserted with new values                   │              │
+│  │ -- Deleted rows: NOT inserted (is_deleted = TRUE)           │              │
+│  │ -- Net effect: UPSERT + soft delete handling                │              │
+│  │                                                              │              │
+│  │ -- Step 3: Update watermark                                 │              │
+│  │ UPDATE cdc_watermarks                                        │              │
+│  │ SET last_extracted_at = '2025-01-15 02:01:00',               │              │
+│  │     last_run_id = 'jr_20250115_020100',                      │              │
+│  │     rows_processed = 200000,                                 │              │
+│  │     rows_inserted = 150000,                                  │              │
+│  │     rows_updated = 45000,                                    │              │
+│  │     rows_deleted = 5000                                      │              │
+│  │ WHERE table_name = 'orders';                                 │              │
+│  │                                                              │              │
+│  │ COMMIT;                                                      │              │
+│  │ -- ALL changes atomic: if any step fails → ROLLBACK         │              │
+│  │ -- Target table is NEVER in inconsistent state              │              │
+│  └─────────────────────────────────────────────────────────────┘              │
+│                                                                               │
+│  WHY DELETE + INSERT (not UPDATE):                                             │
+│  → Redshift is COLUMNAR — UPDATE is expensive                                 │
+│  → UPDATE in Redshift internally: marks old row deleted + inserts new row     │
+│  → DELETE + INSERT does the same thing explicitly                             │
+│  → Cleaner, faster, and easier to reason about                                │
+│  → Also: COPY into staging + DELETE+INSERT is parallelized by Redshift        │
+│                                                                               │
+│  ZERO DOWNTIME EXPLAINED:                                                     │
+│  → During DELETE+INSERT: Redshift uses MVCC (Multi-Version Concurrency)       │
+│  → Concurrent readers see SNAPSHOT of data at transaction start               │
+│  → DELETE marks rows as invisible to future transactions                      │
+│  → INSERT adds new rows visible after COMMIT                                  │
+│  → Reader during merge: sees pre-merge data (consistent)                      │
+│  → Reader after merge: sees post-merge data (consistent)                      │
+│  → NO moment where table appears empty or partially updated                   │
+│                                                                               │
+│  PHASE 6: POST-MERGE MAINTENANCE                                              │
+│  ───────────────────────────────                                              │
+│                                                                               │
+│  → ANALYZE orders; — update table statistics for query optimizer               │
+│  → VACUUM DELETE ONLY orders; — reclaim space from deleted rows               │
+│  → TRUNCATE stg_orders; — clean staging for next run                          │
+│  → Refresh Materialized Views (Project 63)                                    │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "CDC extracted 0 rows but MariaDB has new data"
+</span>→ Cause: Watermark is in the FUTURE (timezone mismatch)
+→ Glue stores watermark as UTC, MariaDB updated_at is in local time
+→ WHERE updated_at &gt; '2025-01-15 07:00:00' (UTC) but MariaDB is EST (02:00)
+→ 07:00 UTC &gt; all EST timestamps → 0 rows returned
+→ Fix: ALWAYS use UTC on both sides
+→ Or: CONVERT_TZ(updated_at, 'US/Eastern', 'UTC') in query
+
+PITFALL 2: "MERGE succeeded but row counts don't match source"
+→ Cause: Safety margin overlap causes duplicate extraction
+→ Same rows extracted in consecutive runs
+→ DELETE+INSERT handles this: deletes existing → reinserts → net zero
+→ This is EXPECTED — not a bug
+→ Validation: compare target COUNT with source COUNT, not delta counts
+
+PITFALL 3: "Some updated rows were missed"
+→ Cause: Transaction committed AFTER extraction started
+→ Extraction at 02:00:00, transaction commits at 02:00:01
+→ updated_at = 02:00:01 &gt; watermark (02:00:00) BUT row wasn't visible during query
+→ Fix: safety margin of 5 minutes catches most cases
+→ For guaranteed capture: use binlog CDC (DMS)
+
+PITFALL 4: "DELETE+INSERT is slow on 200K rows"
+→ Cause: order_id not set as distribution key or sort key
+→ DELETE WHERE order_id IN (...) scans all nodes
+→ Fix: DISTSTYLE KEY(order_id) and SORTKEY(order_id) on target table
+→ DELETE becomes single-node operation per key
+
+PITFALL 5: "Staging table COPY fails — Parquet schema mismatch"
+→ Cause: MariaDB column added/renamed but staging table DDL unchanged
+→ Glue extracts new column → writes to Parquet → COPY expects old schema
+→ Fix: Glue applies ResolveChoice (Project 45) + staging DDL migration
+→ Include staging DDL in CI/CD (Project 76)
+
+PITFALL 6: "Watermark updated but merge actually failed"
+→ Cause: Watermark UPDATE is OUTSIDE the transaction
+→ If merge transaction commits but watermark update fails: OK (re-run captures same delta)
+→ If watermark updates but merge fails: LOST DATA
+→ Fix: watermark update INSIDE the same transaction as merge
+→ COMMIT covers both merge and watermark atomically
+
+PITFALL 7: "Weekly reconciliation finds 50K missing rows"
+→ Cause: Hard deletes on MariaDB (application uses DELETE not soft delete)
+→ Rows deleted from source but still in Redshift target
+→ Fix: weekly full diff identifies rows in target NOT in source → mark as deleted
+→ Long-term: migrate application to soft deletes
+
+PITFALL 8: "Glue job bookmark conflicts with manual watermark"
+→ Cause: Using BOTH Glue bookmarks AND manual watermark table
+→ Bookmark tracks its own state → conflicts with your watermark
+→ Fix: use ONE mechanism — manual watermark gives more control
+→ Disable Glue bookmarks: --job-bookmark-option = job-bookmark-disable
+
+PITFALL 9: "CDC delta grows to 5M rows unexpectedly"
+→ Cause: Bulk UPDATE on source (e.g., price recalculation touching all products)
+→ All 5M rows get new updated_at → all appear as "changed"
+→ CDC processes 5M instead of usual 200K
+→ Fix: detect anomalous delta size → alert → switch to full load for this run
+→ Threshold: if delta &gt; 20% of total rows → full load is more efficient
+
+PITFALL 10: "Redshift VACUUM takes 2 hours after merge"
+→ Cause: DELETE+INSERT creates "ghost rows" in Redshift storage
+→ VACUUM reclaims space but rewrites affected blocks
+→ After 200K deletes: significant VACUUM work
+→ Fix: VACUUM DELETE ONLY (faster than full VACUUM)
+→ Or: schedule VACUUM separately (not blocking ETL)
+→ Or: use Redshift automatic VACUUM (enabled by default)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CDC vs FULL LOAD — PERFORMANCE COMPARISON:
+</span>
+┌──────────────────┬─────────────────────────┬────────────────────────────────┐
+│ Total Rows       │ Full Load Duration      │ CDC Duration (200K delta)      │
+├──────────────────┼─────────────────────────┼────────────────────────────────┤
+│ 12M              │ 25 min                  │ 6 min (4.2x faster)            │
+│ 30M              │ 65 min                  │ 6 min (10.8x faster)           │
+│ 90M              │ 200 min                 │ 7 min (28.6x faster)           │
+│ 200M             │ 450 min                 │ 8 min (56.3x faster)           │
+│ 500M             │ 1125 min (18.75 hrs!)   │ 10 min (112.5x faster)         │
+└──────────────────┴─────────────────────────┴────────────────────────────────┘
+
+KEY INSIGHT: Full load scales with TOTAL rows
+             CDC scales with CHANGED rows (constant if change rate stable)
+
+MARIADB SOURCE IMPACT:
+→ Full load: SELECT * FROM orders (12M rows) → 95% CPU for 20 min
+→ CDC: SELECT * FROM orders WHERE updated_at &gt; X (200K rows) → 5% CPU for 2 min
+→ At 200M rows: full load would cripple MariaDB for hours
+→ CDC remains gentle regardless of total table size
+
+GLUE DPU SCALING:
+→ Full load 12M: 10 DPUs × 25 min = $1.85/run
+→ CDC 200K: 3 DPUs × 6 min = $0.13/run
+→ Monthly savings: ($1.85 - $0.13) × 30 = $51.60/month per table
+→ 10 tables: $516/month saved
+
+REDSHIFT MERGE SCALING:
+→ 200K delta → 200K DELETE + 195K INSERT: ~15 seconds
+→ 500K delta → 500K DELETE + 475K INSERT: ~30 seconds
+→ 2M delta → 2M DELETE + 1.9M INSERT: ~90 seconds
+→ At &gt; 5M delta: consider batch processing (split into chunks)
+
+WATERMARK MANAGEMENT SCALING:
+→ 3 tables: simple — one watermark table row per source
+→ 50 tables: moderate — parameterized job with table config
+→ 200 tables: consider metadata-driven framework
+→ Each table can have different CDC frequency (hourly, daily, weekly)
+
+STORAGE SCALING (S3 CDC deltas):
+→ 200K rows × 500 bytes avg = ~100 MB/day per table
+→ 30 days retention: 3 GB per table
+→ 10 tables × 3 GB = 30 GB → $0.69/month (S3 Standard)
+→ After 90 days: lifecycle to Glacier ($0.004/GB) → $0.12/month
+→ Deltas are cheap insurance for replay capability</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY CDC IS WORKING CORRECTLY:
+</span>
+CHECK 1: Watermark progression
+→ SELECT * FROM cdc_watermarks ORDER BY last_extracted_at DESC;
+→ Watermark should advance daily
+→ If stuck: extraction failing silently
+
+CHECK 2: Delta size trending
+→ Track: rows_processed per run over time
+→ Normal: ~200K/day (stable growth)
+→ Anomaly: sudden spike to 5M → bulk update on source
+→ Anomaly: sudden drop to 0 → watermark issue or source freeze
+
+CHECK 3: Source vs Target reconciliation
+→ Weekly: SELECT COUNT(*) FROM mariadb.orders vs SELECT COUNT(*) FROM redshift.orders
+→ Allow for soft deletes: Redshift may have fewer (is_deleted filtered)
+→ Delta &gt; 0.1%: investigate
+
+CHECK 4: Merge operation audit
+→ cdc_watermarks table tracks: rows_inserted, rows_updated, rows_deleted
+→ Sum over month: total changes processed
+→ Compare with source change volume
+
+CHECK 5: S3 delta file inspection
+→ aws s3 ls s3://lake/cdc/orders/ → list all batch directories
+→ Each batch: check file size (should be ~100 MB for 200K rows)
+→ Missing batch: job failed that day
+
+CHECK 6: Data freshness
+→ SELECT MAX(updated_at) FROM redshift.orders;
+→ Should be within last 24 hours + ETL window
+→ If stale: CDC job not running or failing
+
+MONITORING DASHBOARD:
+→ Panel 1: Watermark timeline (daily progression)
+→ Panel 2: Delta size per run (rows extracted)
+→ Panel 3: Merge breakdown (inserts/updates/deletes)
+→ Panel 4: CDC duration trend (should be flat, not growing)
+→ Panel 5: Source-target row count comparison
+→ Panel 6: MariaDB CPU during CDC window (should be low)</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(65)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>PART 1: MariaDB Source Preparation (Account A)</h3>
+
+<h3>PART 2: Redshift Target Setup (Account B)</h3>
+
+<h3>PART 3: The CDC Glue ETL Job</h3>
+
+<hr>
+<h3>PART 4: Deploy the CDC Glue Job</h3>
+
+<hr>
+<h3>PART 5: Weekly Reconciliation Script</h3>
+
+<hr>
+<h3>PART 6: Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># EXECUTION ORDER</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- ONE-TIME SETUP ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Account A: Add CDC columns and indexes to MariaDB</span><span>
+</span>python 65_01_prepare_mariadb_for_cdc.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Account B: Create Redshift staging tables + watermark + stored procedure</span><span>
+</span>python 65_02_setup_redshift_cdc_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Account B: Deploy and schedule CDC Glue job</span><span>
+</span>python 65_04_deploy_cdc_job.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- FIRST RUN (bootstrapping) ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># First CDC run: watermark = 2024-01-01 → extracts ALL rows (like full load)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># This is expected — subsequent runs will be incremental</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- DAILY AUTOMATED FLOW ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:00 AM → CDC Glue job starts</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:01 AM → Read watermark from Redshift (e.g., '2025-01-14 02:00:00')</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:01 AM → Extract delta from MariaDB (WHERE updated_at &gt; watermark - 5min)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:03 AM → Write delta to S3 (audit trail)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:04 AM → Load delta to Redshift staging</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:05 AM → Execute MERGE (DELETE+INSERT within transaction)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:06 AM → Update watermark, validate, DONE</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:07 AM → Refresh MVs (Project 63)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2:08 AM → SNS notification</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- WEEKLY RECONCILIATION ---</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Sunday 3:00 AM → Full load job (Project 61) runs</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Sunday 3:30 AM → Reconciliation script compares source vs target</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Sunday 3:31 AM → Alert if drift &gt; 0.1%</span></code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BEFORE vs AFTER COMPARISON:
+</span>
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     FULL LOAD (Project 61)                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Strategy: TRUNCATE target → INSERT ALL rows                             │
+│ Rows processed: 12,000,000 (entire table)                               │
+│ Duration: 25 minutes                                                    │
+│ DPUs: 10 × G.1X                                                        │
+│ Cost per run: $1.85                                                     │
+│ MariaDB CPU: 95% for 20 minutes                                        │
+│ Downtime: 25 minutes (table empty during load)                          │
+│ Scalability: LINEAR with total rows (gets worse every month)            │
+│ At 200M rows: 450 minutes = 7.5 hours                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                     CDC MERGE (Project 65)                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Strategy: Extract delta → Stage → MERGE (DELETE+INSERT)                 │
+│ Rows processed: 200,000 (only changes)                                  │
+│ Duration: 6 minutes                                                     │
+│ DPUs: 3 × G.1X                                                         │
+│ Cost per run: $0.13                                                     │
+│ MariaDB CPU: 5% for 2 minutes                                          │
+│ Downtime: ZERO (MVCC — readers unaffected)                              │
+│ Scalability: CONSTANT with total rows (scales with change rate)         │
+│ At 200M rows: still ~8 minutes (delta stays ~200K-1M)                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                     IMPROVEMENT                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Speed: 25 min → 6 min (4.2x faster now, 56x at 200M rows)              │
+│ Cost: $1.85 → $0.13 per run (93% reduction)                            │
+│ Monthly cost: $55.50 → $3.90 (saving $51.60/month per table)           │
+│ MariaDB impact: 95% CPU → 5% CPU (operations team happy)               │
+│ Downtime: 25 min → 0 min (analysts never see stale data)               │
+│ Audit trail: full delta history in S3 (replay capability)               │
+│ Change tracking: INSERT/UPDATE/DELETE classified per row                 │
+└─────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ CDC extracts ONLY changed rows — scales with change rate, not table size
+→ Timestamp-based CDC requires: updated_at column + INDEX on it
+→ Safety margin (5 min) prevents missing rows due to transaction timing
+→ DELETE+INSERT pattern in Redshift = equivalent to MERGE, better for columnar
+→ Staging table isolates loading errors from target table
+→ Watermark updated INSIDE transaction = atomic (no data loss on failure)
+→ S3 delta persistence = audit trail + replay capability + Bronze layer feed
+→ Soft deletes (is_deleted flag) required — timestamp CDC misses hard DELETEs
+→ Weekly full reconciliation catches edge cases (hard deletes, clock drift)
+→ Zero downtime: Redshift MVCC ensures readers see consistent data during merge
+→ Cost reduction: 93% less per run + MariaDB CPU freed from 95% to 5%
+→ Scalability: at 200M rows, CDC still runs in ~8 min vs 450 min for full load
+
+CONNECTIONS:
+━━━━━━━━━━━
+→ BACKWARD:
+  → Project 33: Glue Bookmarks — alternative to manual watermarks (less control)
+  → Project 39: Dist/Sort keys — CRITICAL for MERGE performance (DELETE by PK)
+  → Project 42: CDC pattern introduced — now fully implemented end-to-end
+  → Project 49: Stored procedures — MERGE logic encapsulated in sp_cdc_merge
+  → Project 61: Full load — replaced for daily runs, kept for weekly reconciliation
+  → Project 62: Smart coalesce — applied to CDC delta writes
+  → Project 63: MV refresh — triggered after CDC merge completes
+
+→ FORWARD:
+  → Project 66: Event-driven architecture — trigger CDC on data arrival, not schedule
+  → Project 68: Data quality rules — validate CDC deltas before merge
+  → Project 72: Streaming CDC — Kinesis for sub-minute latency
+  → Project 79: Full migration — CDC pattern applied to on-prem → AWS migration</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CDC pipeline is running efficiently. 6 minutes instead of 25.
+</span>Zero downtime. 93% cost reduction.
+
+THEN: The platform team reviews the architecture:
+
+→ Current: cron-based scheduling (Glue triggers at fixed times)
+→ Problem 1: File arrives at S3 at 1:45 AM → ETL runs at 2:00 AM
+   → 15 minutes of unnecessary wait
+→ Problem 2: File arrives late (2:30 AM) → ETL already ran at 2:00 AM
+   → File missed entirely until next day
+→ Problem 3: Multiple data sources arrive at different times
+   → All wait for the latest source → bottleneck
+→ Problem 4: Manual Glue Workflow triggers are rigid
+   → Can't dynamically parallelize based on what arrived
+
+PLATFORM LEAD: "Stop running on fixed schedules. 
+                React to events. When data arrives → process it.
+                When processing completes → trigger next step.
+                No waiting. No missing. No waste."
+
+→ Project 66: "Replace Cron + Glue Workflow with Event-Driven Architecture"
+→ Introduces: EventBridge Rules → S3 Event Notification → Step Functions
+             → Dynamic Parallelism → Event-Driven Pipeline Orchestration</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-64.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 65 of 80</span>
+    <span class="nav-project-title">FULL INCREMENTAL CDC — MARIADB → S3 → GLUE → REDSHIFT (DAILY MERGE)</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-66.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-66.html") window.location = "project-66.html";
+  if (e.key === 'ArrowLeft' && "project-64.html") window.location = "project-64.html";
+});
+</script>
+</body>
+</html>

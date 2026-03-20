@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 33: ONLY PROCESS NEW FILES — DON&#x27;T RE-PROCESS OLD ONES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:41%"></div></div>
+<div id="progress-label">41%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 33 of 80</div>
+  <div class="project-title">ONLY PROCESS NEW FILES — DON&#x27;T RE-PROCESS OLD ONES</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Pipeline running for 3 months
+</span>Current State (after Projects 31, 32):
+→ Nightly pipeline: MariaDB → S3 Parquet → Redshift
+→ S3 bronze layer accumulates daily partitions:
+   bronze/mariadb/orders/year=2025/month=01/day=01/
+   bronze/mariadb/orders/year=2025/month=01/day=02/
+   ...
+   bronze/mariadb/orders/year=2025/month=03/day=31/  (90 partitions)
+
+→ ALSO: A second pipeline exists that processes RAW CSV uploads
+   from partner companies:
+   raw/partner_feeds/partner_A/feed_20250101.csv
+   raw/partner_feeds/partner_A/feed_20250102.csv
+   ...
+   raw/partner_feeds/partner_A/feed_20250331.csv  (90 files)
+
+THE PROBLEM:
+→ Pipeline A (Parquet transform job from Project 25):
+   - Reads ALL CSV files from raw/ every run
+   - Converts to Parquet, writes to bronze/
+   - Day 1: processes 1 file → 2 minutes
+   - Day 90: processes 90 files → 45 minutes
+   - Day 365: processes 365 files → 3+ hours
+   - COST: 10 DPUs × 3 hours = $13.20/day (was $0.73 on Day 1)
+
+→ Pipeline B (Silver layer aggregation):
+   - Reads ALL Parquet from bronze/ every run
+   - Aggregates into silver/ layer
+   - Same exponential growth problem
+
+→ Data engineer says: "90% of our Glue compute cost is 
+   RE-PROCESSING files we already processed yesterday.
+   Only 1 new file arrives each day.
+   We need Glue to REMEMBER what it already processed."
+
+→ CTO looks at the $400/month Glue bill (was $22 in Month 1):
+   "Fix this. Yesterday's files haven't changed. Don't touch them."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the ROOT problem
+</span>→ Glue jobs are STATELESS by default
+→ Each run starts fresh — no memory of previous runs
+→ "Read from S3 path" means "read ALL files at that path"
+→ As files accumulate, each run reads more and more
+
+Step 2: Understand the SOLUTIONS landscape
+→ Solution A: Glue Job Bookmarks (built-in)
+→ Solution B: Custom watermark tracking (manual)
+→ Solution C: S3 event-driven processing (per-file trigger)
+→ Solution D: Partition-based filtering (date-aware reads)
+→ Each has trade-offs — we'll implement ALL four
+
+Step 3: Understand WHEN each solution fits
+→ Job Bookmarks: best for S3 source, automatic, zero code
+→ Custom watermark: best for JDBC source, flexible, more control
+→ Event-driven: best for real-time, file-at-a-time processing
+→ Partition filtering: best for date-partitioned data, explicit
+
+Step 4: Understand the dependencies
+→ S3 data accumulating over time (Projects 1, 19, 20, 31)
+→ Glue ETL jobs processing S3 data (Projects 25, 31, 32)
+→ Parquet partitioning understood (Projects 25, 26)
+→ Glue job parameters understood (Projects 31, 32)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>FOUR APPROACHES — EACH FOR DIFFERENT SCENARIOS:
+</span>
+┌───────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  APPROACH 1: GLUE JOB BOOKMARKS (Built-in)                           │
+│  ──────────────────────────────────────────                           │
+│  → Glue tracks which S3 files it already processed                    │
+│  → Next run automatically skips processed files                       │
+│  → Zero custom code — just enable a flag                              │
+│  → Works with: S3 sources, JDBC sources                              │
+│                                                                       │
+│  APPROACH 2: CUSTOM WATERMARK TABLE (DynamoDB/S3)                     │
+│  ─────────────────────────────────────────────────                    │
+│  → You track last processed timestamp/file in DynamoDB or S3          │
+│  → Job reads watermark → filters source → updates watermark           │
+│  → Full control, works with any source                                │
+│  → Best for JDBC sources with timestamp columns                       │
+│                                                                       │
+│  APPROACH 3: DATE-PARTITION FILTERING (Explicit)                      │
+│  ───────────────────────────────────────────────                      │
+│  → Pass extraction_date as parameter (already doing in Projects 31,32)│
+│  → Job reads ONLY that date's partition                               │
+│  → Simplest, most predictable                                         │
+│  → Requires external scheduler to pass correct date                   │
+│                                                                       │
+│  APPROACH 4: S3 EVENT-DRIVEN (Per-file trigger)                       │
+│  ──────────────────────────────────────────────                       │
+│  → S3 event notification triggers processing per file                 │
+│  → Already covered conceptually in Projects 17, 18, 28               │
+│  → Will be formalized in Project 41 (EventBridge → Step Functions)    │
+│                                                                       │
+│  THIS PROJECT FOCUSES ON: Approaches 1, 2, and 3                     │
+│  (Approach 4 is covered in Projects 41, 55)                           │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Just enable Job Bookmarks flag
+</span>→ Change: --job-bookmark-option from "job-bookmark-disable" to "job-bookmark-enable"
+→ Glue automatically tracks processed files
+→ Pros: zero code change, built-in
+→ Cons: opaque — hard to debug, can't customize filter logic
+
+Option B: Build custom watermark with DynamoDB
+→ Store: {job_name, last_processed_timestamp, last_file_path}
+→ Each run: read watermark → filter source → update watermark
+→ Pros: full visibility, queryable state, flexible
+→ Cons: more code, another AWS service to manage
+
+Option C: Build custom watermark with S3 marker file
+→ Store: s3://bucket/state/{job_name}/watermark.json
+→ Same logic as Option B but uses S3 instead of DynamoDB
+→ Pros: no extra service, simple JSON file
+→ Cons: not atomic (race condition if two runs overlap)
+
+Option D: Combine Approaches — Belt and Suspenders
+→ Use Job Bookmarks for S3 sources (automatic)
+→ Use custom watermark for JDBC sources (Project 42 CDC)
+→ Use date partition for Redshift loads (explicit, predictable)
+
+DECISION: Option D — Combined approach
+→ Each mechanism for its best use case
+→ Most robust in production
+→ Interview demonstrates understanding of ALL patterns</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Enable Job Bookmarks for S3-to-S3 transform jobs
+</span>   → Set --job-bookmark-option = "job-bookmark-enable"
+   → Use transformation_ctx parameter in EVERY read and write call
+   → transformation_ctx is HOW bookmarks track state per source
+
+2. Use transformation_ctx CONSISTENTLY
+   → Every create_dynamic_frame call MUST have unique transformation_ctx
+   → Bookmark stores: {transformation_ctx → last_processed_file}
+   → If you change transformation_ctx, bookmark resets → reprocesses everything
+
+3. Test bookmark behavior BEFORE production
+   → Run 1: processes files A, B, C → bookmark saves state
+   → Run 2: add files D, E → should process ONLY D, E
+   → Run 3: no new files → should process NOTHING (0 rows)
+   → Verify all three scenarios
+
+4. Implement bookmark RESET capability
+   → Sometimes you NEED to reprocess everything (schema change, bug fix)
+   → API: glue.reset_job_bookmark(JobName="...")
+   → After reset, next run processes ALL files from scratch
+
+5. Use custom watermark for JDBC sources
+   → Job Bookmarks with JDBC track by primary key column
+   → Works but is less flexible than custom watermark
+   → Custom watermark lets you filter by updated_at timestamp
+
+6. Log bookmark behavior in CloudWatch
+   → Print: "Bookmark enabled — processing only new files"
+   → Print: "Files processed this run: N"
+   → Print: "Rows processed this run: N"
+   → Essential for debugging "why did it process 0 rows?"
+
+7. Set job concurrency to 1 for bookmarked jobs
+   → Two concurrent runs with same bookmark = corruption
+   → One finishes, updates bookmark → other finishes, overwrites bookmark
+   → Result: some files skipped permanently</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT enable bookmarks without transformation_ctx
+</span>   → Bookmark REQUIRES transformation_ctx to track state
+   → Without it: bookmark does nothing — all files reprocessed every time
+   → This is the #1 "bookmark isn't working" complaint
+
+2. DO NOT change transformation_ctx between runs
+   → Run 1: ctx="read_source" → bookmark stores state for "read_source"
+   → Run 2: ctx="read_src" → different key → bookmark has no state → full reprocess
+   → NEVER rename transformation_ctx after first production run
+
+3. DO NOT use bookmarks with overwrite mode on output
+   → Bookmark tracks INPUT files processed
+   → If output mode is "overwrite", each run replaces ALL output
+   → Result: output only contains data from NEW files, old data gone
+   → Use "append" mode or partition-based writes with bookmarks
+
+4. DO NOT run bookmarked jobs concurrently
+   → Already explained in "Should Do" #7
+   → Set MaxConcurrentRuns=1 on the job
+
+5. DO NOT assume bookmarks work with DataFrame API
+   → Bookmarks ONLY work with DynamicFrame API
+   → spark.read.parquet() → NO bookmark tracking
+   → glueContext.create_dynamic_frame.from_options() → YES bookmark tracking
+   → If you convert to DataFrame for transforms, that's fine
+   → But the READ must be via DynamicFrame
+
+6. DO NOT forget to handle bookmark FAILURES
+   → If job fails AFTER reading but BEFORE committing
+   → Bookmark is NOT updated → next run reprocesses same files
+   → This is GOOD — at-least-once semantics
+   → But your downstream must handle duplicates (idempotent writes)
+
+7. DO NOT use bookmarks for JDBC sources with no monotonic key
+   → JDBC bookmark tracks by primary key or timestamp column
+   → If table has no auto-increment or updated_at → bookmark can't track
+   → Use custom watermark instead</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────┬──────────────────┬───────────────────────────────────────┐
+</span>│ Scenario                     │ Use              │ Why                                   │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ S3 → S3 transform job       │ Job Bookmarks    │ Built-in, tracks by file path +       │
+│ (new files accumulate daily) │                  │ modification timestamp, zero code      │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ JDBC source with auto-       │ Job Bookmarks    │ Tracks by primary key column          │
+│ increment primary key        │ (JDBC mode)      │ Reads WHERE id &gt; last_bookmark        │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ JDBC source with updated_at  │ Custom Watermark │ More flexible than bookmark           │
+│ timestamp column             │                  │ Handles updates + inserts             │
+│                              │                  │ (Project 42 CDC pattern)              │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Date-partitioned Parquet     │ Partition Filter  │ Most explicit and predictable         │
+│ (daily partitions in S3)     │ (pass date param)│ Already doing in Projects 31, 32      │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Real-time file processing    │ S3 Event →       │ Process each file as it arrives       │
+│ (process within minutes of   │ Lambda/Step Fn   │ No accumulation, no bookmarks needed  │
+│ file arrival)                │ (Project 41)     │                                       │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Reprocess everything (fix    │ Reset Bookmark   │ API call: reset_job_bookmark()        │
+│ bug, schema change)          │ + Full Run       │ Next run processes all files           │
+├──────────────────────────────┼──────────────────┼───────────────────────────────────────┤
+│ Multiple sources in one job  │ Multiple         │ Each source has its own ctx            │
+│                              │ transformation_  │ Bookmark tracks each independently     │
+│                              │ ctx values       │                                       │
+└──────────────────────────────┴──────────────────┴───────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE JOB BOOKMARKS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Source files are MODIFIED in place (not append-only)
+</span>   → Bookmark tracks: "I processed file X with timestamp T"
+   → If file X is overwritten with new content but same name
+   → Bookmark may skip it (depends on timestamp change)
+   → Use: custom watermark with content hash, or event-driven
+
+2. You need exactly-once processing guarantees
+   → Bookmarks provide AT-LEAST-ONCE (may reprocess on failure)
+   → If downstream can't handle duplicates, bookmarks alone aren't enough
+   → Use: bookmarks + idempotent writes (upsert pattern from Project 32)
+
+3. Job processes multiple INDEPENDENT data flows
+   → Job reads from 5 different S3 prefixes
+   → Bookmark tracks all or nothing — can't reset one source independently
+   → Use: separate jobs per source, each with own bookmark
+
+4. You're using spark.read (DataFrame API) not DynamicFrame
+   → Bookmarks ONLY work with Glue DynamicFrame API
+   → If your job uses pure Spark: implement custom watermark
+
+5. Data arrives out of order
+   → File from January arrives in March (late data)
+   → Bookmark has already moved past January
+   → Late file may be skipped
+   → Use: event-driven processing (triggers on file arrival regardless of date)
+
+6. Job writes to multiple destinations
+   → Bookmark commits ONCE at job.commit()
+   → If write to destination A succeeds but B fails
+   → Bookmark still commits → A's data reprocessed on retry
+   → Use: separate jobs per destination</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│              GLUE JOB BOOKMARKS — INTERNAL MECHANICS                             │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  WHAT IS A JOB BOOKMARK?                                                         │
+│  ═══════════════════════                                                         │
+│  → A persistent STATE stored by Glue service per job                             │
+│  → Survives across job runs (stored in Glue's internal database)                 │
+│  → Tracks: which input data was already processed                                │
+│  → Keyed by: transformation_ctx (your label for each read operation)             │
+│                                                                                  │
+│  BOOKMARK STATE STRUCTURE (for S3 source):                                       │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │ {                                                           │                 │
+│  │   "job_name": "quickcart-csv-to-parquet",                   │                 │
+│  │   "run_id": "jr_abc123",                                    │                 │
+│  │   "transformation_ctx": "read_partner_csvs",                │                 │
+│  │   "bookmark_state": {                                       │                 │
+│  │     "s3://bucket/raw/partner_feeds/": {                     │                 │
+│  │       "last_processed_files": [                             │                 │
+│  │         {                                                   │                 │
+│  │           "path": "feed_20250101.csv",                      │                 │
+│  │           "timestamp": "2025-01-01T06:00:00Z",              │                 │
+│  │           "size": 52428800                                  │                 │
+│  │         },                                                  │                 │
+│  │         {                                                   │                 │
+│  │           "path": "feed_20250102.csv",                      │                 │
+│  │           "timestamp": "2025-01-02T06:00:00Z",              │                 │
+│  │           "size": 51234567                                  │                 │
+│  │         }                                                   │                 │
+│  │       ],                                                    │                 │
+│  │       "high_watermark_timestamp": "2025-01-02T06:00:00Z"   │                 │
+│  │     }                                                       │                 │
+│  │   }                                                         │                 │
+│  │ }                                                           │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  HOW S3 BOOKMARKS WORK — STEP BY STEP:                                           │
+│  ═══════════════════════════════════════                                          │
+│                                                                                  │
+│  RUN 1 (First ever run — no existing bookmark):                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │                                                             │                 │
+│  │  S3 Path: s3://bucket/raw/partner_feeds/                    │                 │
+│  │  Files:   feed_20250101.csv (T1)                            │                 │
+│  │           feed_20250102.csv (T2)                             │                 │
+│  │           feed_20250103.csv (T3)                             │                 │
+│  │                                                             │                 │
+│  │  Bookmark state: EMPTY (no previous run)                    │                 │
+│  │  → Glue reads ALL 3 files                                   │                 │
+│  │  → Processes 3 files → writes output                        │                 │
+│  │  → job.commit() saves bookmark:                             │                 │
+│  │    high_watermark = T3 (latest timestamp)                   │                 │
+│  │    processed_files = [feed_01, feed_02, feed_03]            │                 │
+│  │                                                             │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  RUN 2 (Next day — 1 new file arrived):                                          │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │                                                             │                 │
+│  │  S3 Path: s3://bucket/raw/partner_feeds/                    │                 │
+│  │  Files:   feed_20250101.csv (T1)  ← already processed      │                 │
+│  │           feed_20250102.csv (T2)  ← already processed       │                 │
+│  │           feed_20250103.csv (T3)  ← already processed       │                 │
+│  │           feed_20250104.csv (T4)  ← NEW                     │                 │
+│  │                                                             │                 │
+│  │  Bookmark state: high_watermark = T3                        │                 │
+│  │  → Glue lists all files in path                             │                 │
+│  │  → Filters: timestamp &gt; T3                                  │                 │
+│  │  → Only feed_20250104.csv matches                           │                 │
+│  │  → Reads ONLY 1 file instead of 4                           │                 │
+│  │  → Processes → writes output                                │                 │
+│  │  → job.commit() updates bookmark:                           │                 │
+│  │    high_watermark = T4                                      │                 │
+│  │                                                             │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  RUN 3 (No new files):                                                           │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │                                                             │                 │
+│  │  Bookmark state: high_watermark = T4                        │                 │
+│  │  → Glue lists files → all have timestamp ≤ T4              │                 │
+│  │  → No files pass filter                                     │                 │
+│  │  → DynamicFrame has 0 rows                                  │                 │
+│  │  → Job completes quickly (nothing to process)               │                 │
+│  │  → Bookmark unchanged                                       │                 │
+│  │                                                             │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  BOOKMARK COMMIT LIFECYCLE:                                                      │
+│  ══════════════════════════                                                      │
+│                                                                                  │
+│  ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐                │
+│  │ Job      │     │ Read     │     │ Process  │     │ job.     │                │
+│  │ Starts   │────►│ (filters │────►│ &amp; Write  │────►│ commit() │                │
+│  │          │     │ by       │     │          │     │          │                │
+│  │ Load     │     │ bookmark)│     │          │     │ Bookmark │                │
+│  │ bookmark │     │          │     │          │     │ SAVED    │                │
+│  └──────────┘     └──────────┘     └──────────┘     └──────────┘                │
+│       │                                                   │                      │
+│       │           IF JOB FAILS HERE ──────►               │                      │
+│       │           Bookmark NOT updated                    │                      │
+│       │           Next run reprocesses same files          │                      │
+│       │           = AT-LEAST-ONCE semantics                │                      │
+│       │                                                   │                      │
+│       └───── Bookmark only saved on successful commit ────┘                      │
+│                                                                                  │
+│  HOW JDBC BOOKMARKS WORK (different from S3):                                    │
+│  ═════════════════════════════════════════════                                    │
+│                                                                                  │
+│  → Glue tracks by PRIMARY KEY or specified column                                │
+│  → Bookmark stores: "last processed primary_key value = 45000000"                │
+│  → Next run: SELECT * FROM table WHERE id &gt; 45000000                             │
+│  → Only reads NEW rows (with higher IDs)                                         │
+│                                                                                  │
+│  LIMITATION:                                                                     │
+│  → Only works with monotonically increasing columns                              │
+│  → Does NOT detect UPDATES to existing rows                                      │
+│  → For updates: use custom watermark with updated_at (Project 42)                │
+│                                                                                  │
+│  BOOKMARK STORAGE:                                                               │
+│  → Stored in Glue's internal DynamoDB table (managed by AWS)                     │
+│  → You cannot read/modify it directly                                            │
+│  → Only operations: enable, disable, reset, pause                                │
+│  → API: get_job_bookmark(), reset_job_bookmark()                                 │
+│                                                                                  │
+│  BOOKMARK RESET:                                                                 │
+│  → glue.reset_job_bookmark(JobName="job-name")                                   │
+│  → Clears ALL bookmark state for this job                                        │
+│  → Next run processes EVERYTHING from scratch                                    │
+│  → Use when: schema changed, bug fix, data correction                            │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Bookmark enabled but job still processes ALL files"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause #1: Missing transformation_ctx in create_dynamic_frame call
+→ Cause #2: Using spark.read.parquet() instead of DynamicFrame API
+→ Cause #3: Job parameter set to "job-bookmark-disable" (typo or default)
+→ Fix: Verify ALL three:
+   a) --job-bookmark-option = "job-bookmark-enable"
+   b) transformation_ctx="unique_name" in every read
+   c) job.commit() at end of script
+
+PITFALL 2: "Second run processes 0 files — but new files exist"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: New files have timestamps OLDER than bookmark watermark
+→ Example: file was created yesterday but uploaded today
+→ S3 last_modified shows yesterday → bookmark thinks it's old
+→ Fix: Ensure file upload timestamps are monotonically increasing
+→ OR: Use event-driven approach instead of bookmark
+
+PITFALL 3: "Job runs concurrently — bookmark gets corrupted"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Two job runs overlap
+→ Run A reads files 1-10, Run B reads files 1-10 (same bookmark)
+→ Run A commits → bookmark = file 10
+→ Run B commits → bookmark = file 10
+→ File 11 arrives between A and B → may be skipped
+→ Fix: Set MaxConcurrentRuns=1 in job definition
+
+PITFALL 4: "Bookmark works for S3 reads but not for JDBC reads"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: JDBC bookmark requires specific column configuration
+→ Must specify: jobBookmarkKeys = [column_name] in connection options
+→ Column must be monotonically increasing (auto_increment, timestamp)
+→ Without jobBookmarkKeys: entire table re-read every run
+
+PITFALL 5: "After resetting bookmark, job takes 3 hours"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Expected behavior — reset means "reprocess everything"
+→ If you have 365 days of files, full reprocess is expensive
+→ Fix: instead of reset, manually set a custom watermark
+→ OR: move old files to archive prefix, reset, then only new prefix exists
+
+PITFALL 6: "Output has duplicates after job retry"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Job failed after writing output but before job.commit()
+→ Bookmark not updated → next run reprocesses same files
+→ Output written AGAIN → duplicates
+→ Fix: Make writes idempotent:
+   a) Write to date-partitioned path → overwrite partition on retry
+   b) Use staging + merge pattern (Project 32) for Redshift
+   c) Use CTAS with IF NOT EXISTS for Athena tables</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>BOOKMARK PERFORMANCE:
+</span>━━━━━━━━━━━━━━━━━━━━
+→ Bookmark check is an S3 LIST + filter operation
+→ LIST returns 1000 objects per page
+→ 10,000 files = 10 LIST calls before filtering
+→ 100,000 files = 100 LIST calls → several seconds overhead
+→ 1,000,000 files = bookmark overhead becomes significant
+
+MITIGATION FOR LARGE FILE COUNTS:
+→ Organize files by date prefix:
+   raw/partner_feeds/year=2025/month=01/feed_01.csv
+→ Bookmark filters within the listed prefix
+→ Fewer files to list = faster bookmark check
+
+COST COMPARISON (90 files accumulated):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌──────────────────────┬───────────────┬──────────────┬──────────────┐
+│ Approach             │ Files Read    │ DPU-Minutes  │ Cost/Run     │
+├──────────────────────┼───────────────┼──────────────┼──────────────┤
+│ No bookmark (all)    │ 90            │ 45 min       │ $3.30        │
+│ Bookmark (new only)  │ 1             │ 3 min        │ $0.73*       │
+│ Date filter (today)  │ 1             │ 3 min        │ $0.73*       │
+│ Event-driven (Lambda)│ 1             │ N/A          │ $0.0001      │
+└──────────────────────┴───────────────┴──────────────┴──────────────┘
+* $0.73 is Glue minimum (1 DPU × 10 min minimum billing)
+
+ANNUAL COST AT 365 FILES:
+→ No bookmark: $3.30 → $13.20 → $50+ per run (growing)
+→ With bookmark: $0.73/run constant
+→ Annual savings: $5,000+ by Year 2
+
+CUSTOM WATERMARK vs BOOKMARK AT SCALE:
+→ Bookmark: managed by Glue, no extra infrastructure
+→ Watermark: needs DynamoDB table (~$1/month) or S3 file
+→ At 10+ jobs: watermark management becomes overhead
+→ At 100+ jobs: consider centralized watermark service</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY BOOKMARKS ARE WORKING:
+</span>
+1. CLOUDWATCH LOGS — Check row counts per run
+   → Run 1: "Rows processed: 300,000" (3 files × 100K)
+   → Run 2: "Rows processed: 100,000" (1 new file)
+   → Run 3: "Rows processed: 0" (no new files)
+   → If Run 2 shows 400,000 → bookmark NOT working
+
+2. GLUE CONSOLE — Check Job Bookmark state
+   → Glue → Jobs → Select Job → Job Bookmark tab
+   → Shows: last run ID, bookmark state, timestamp
+   → If state is empty: bookmark never committed
+
+3. API — Get bookmark programmatically
+   → glue.get_job_bookmark(JobName="job-name")
+   → Returns bookmark state object
+   → Check: JobBookmarkEntry.RunId matches last successful run
+
+4. S3 OUTPUT — Check output file timestamps
+   → Each run should produce files with current timestamp
+   → If old timestamps appear: job reprocessed old data
+   → ls -la on output prefix shows when files were written
+
+5. COST — Check Glue job billing
+   → CloudWatch → Glue → DPU-seconds per run
+   → With bookmark: DPU-seconds should be roughly constant
+   → Without: DPU-seconds grows linearly with data volume
+
+6. CUSTOM WATERMARK — Check watermark file/record
+   → DynamoDB: scan watermark table → see last_processed value
+   → S3: read watermark.json → see last_processed_timestamp
+   → Compare with source data: are we caught up?</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(33)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Glue Job with Bookmarks Enabled (S3 CSV → Parquet)</h3>
+
+<h3>Part 2: Custom Watermark with DynamoDB</h3>
+
+<h3>Part 3: Custom Watermark with S3 Marker File (Simpler Alternative)</h3>
+
+<h3>Part 4: Create DynamoDB Watermark Table + Infrastructure</h3>
+
+<h3>Part 5: Monitoring Dashboard — Watermark Health Check</h3>
+
+<h3>Part 6: Bookmark Reset and Reprocessing Utility</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE SETUP AND EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ $ python 33_04_setup_watermark_infrastructure.py                        │
+│ → Creates DynamoDB watermark table                                      │
+│ → Updates Glue IAM Role with DynamoDB permissions                       │
+│ → Creates S3 watermark state directory                                  │
+│ → Enables bookmarks on S3-source Glue jobs                              │
+│ → Sets MaxConcurrentRuns=1 on bookmarked jobs                           │
+│                                                                         │
+│ Upload Glue scripts:                                                    │
+│ $ aws s3 cp 33_01_glue_bookmarked_csv_to_parquet.py \                   │
+│     s3://quickcart-datalake-prod/scripts/glue/                          │
+│ $ aws s3 cp 33_02_custom_watermark_dynamodb.py \                        │
+│     s3://quickcart-datalake-prod/scripts/glue/                          │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ DAILY EXECUTION (automatic — jobs already scheduled)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ APPROACH 1 — Glue Job Bookmarks (S3 → S3 jobs):                        │
+│ → Job runs nightly                                                      │
+│ → Bookmark auto-filters to new files only                               │
+│ → Day 1: 3 files → Day 90: still 1 file per run                        │
+│                                                                         │
+│ APPROACH 2 — Custom Watermark (JDBC → S3 jobs):                         │
+│ → Job reads watermark from DynamoDB                                     │
+│ → Queries MariaDB: WHERE updated_at &gt; watermark                         │
+│ → Updates watermark after successful write                              │
+│                                                                         │
+│ APPROACH 3 — Date Partition (S3 → Redshift jobs):                       │
+│ → Already using --extraction_date parameter (Projects 31, 32)           │
+│ → Most explicit — scheduler passes today's date                         │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ MONITORING (weekly or on-demand)                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ $ python 33_05_watermark_health_check.py                                │
+│ → Shows all watermark states                                            │
+│ → Flags stale watermarks (&gt;26h without update)                          │
+│ → Shows cost comparison vs full reprocess                               │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ REPROCESSING (when needed)                                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Reset bookmark (reprocess all files):                                   │
+│ $ python 33_06_reset_and_reprocess.py reset-bookmark my-job             │
+│                                                                         │
+│ Reset watermark to specific date:                                       │
+│ $ python 33_06_reset_and_reprocess.py set-date my-job orders 2025-01-10 │
+│                                                                         │
+│ Nuclear reset (everything from scratch):                                │
+│ $ python 33_06_reset_and_reprocess.py reset-all my-job                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+DECISION MATRIX — WHICH APPROACH FOR WHICH JOB:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌────────────────────────────────────┬────────────────┬──────────────────┐
+│ Job                                │ Approach       │ Reason           │
+├────────────────────────────────────┼────────────────┼──────────────────┤
+│ CSV → Parquet (Project 25)         │ Job Bookmarks  │ S3 source,       │
+│                                    │                │ append-only files│
+├────────────────────────────────────┼────────────────┼──────────────────┤
+│ MariaDB → S3 (Project 31)         │ Custom         │ JDBC source,     │
+│                                    │ Watermark      │ need to detect   │
+│                                    │ (DynamoDB)     │ updates          │
+├────────────────────────────────────┼────────────────┼──────────────────┤
+│ S3 → Redshift (Project 32)        │ Date Partition │ Already param-   │
+│                                    │ Filter         │ driven, explicit │
+├────────────────────────────────────┼────────────────┼──────────────────┤
+│ Partner feeds → Bronze (new)       │ Job Bookmarks  │ S3 source, files │
+│                                    │                │ arrive randomly  │
+├────────────────────────────────────┼────────────────┼──────────────────┤
+│ CDC extraction (Project 42)        │ Custom         │ Needs updated_at │
+│                                    │ Watermark      │ tracking         │
+└────────────────────────────────────┴────────────────┴──────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Stateless jobs re-process everything — costs grow linearly with data
+→ Three approaches to incremental: Bookmarks, Watermarks, Partition Filters
+→ Job Bookmarks: zero-code, tracks by S3 file timestamp, needs transformation_ctx
+→ Custom Watermark: full control, visible state, works with any source
+→ Partition Filter: most explicit, scheduler passes date parameter
+→ Bookmark ONLY commits on job.commit() — failure = retry same files
+→ Bookmarks need DynamicFrame API — spark.read() bypasses bookmarks
+→ MaxConcurrentRuns=1 is MANDATORY for bookmarked jobs
+→ APPEND mode required for output — OVERWRITE destroys previous data
+→ Watermark update must happen AFTER successful write (never before)
+→ Reset capability is essential — schema changes require full reprocess
+→ Cost impact: 10x-100x savings as data accumulates over months
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 25: Glue ETL (the job we're making incremental)
+→ Project 31: MariaDB extraction (JDBC source — custom watermark)
+→ Project 32: Redshift loading (date partition approach)
+→ Project 26: Partitioned Parquet (bookmark writes to partitions)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 34: Complex transforms INSIDE the incremental pipeline
+   (now that we only process new data, what transforms do we apply?)
+→ Project 42: Full CDC pattern — detect inserts AND updates from MariaDB
+   (custom watermark on updated_at + merge logic in Redshift)
+→ Project 55: Step Functions orchestration — chain bookmark jobs
+   (Job A bookmarked → Job B bookmarked → notification)
+→ Project 62: Small file problem — incremental writes create many tiny files
+   (each run writes 1-2 small Parquet files → compaction needed)
+→ Project 65: Full CDC merge into Redshift using staging pattern
+   (combines Projects 33 + 42 + 32 into production CDC pipeline)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has incremental processing:
+</span>→ S3 jobs use Job Bookmarks (auto-track new files)
+→ JDBC jobs use Custom Watermarks (track by updated_at)
+→ Redshift loads use Date Partition (explicit date parameter)
+→ Costs dropped from $400/month to $45/month
+
+THEN: The analytics team says:
+"The raw data landing in bronze/ is messy.
+ Some partner feeds have:
+ - NULL customer_ids that should be filtered out
+ - Duplicate order_ids within the same file
+ - product_name needs to be joined with our product catalog
+ - Revenue needs to be calculated (quantity × price)
+ 
+ We need a TRANSFORM LAYER that cleans, filters, joins,
+ and aggregates BEFORE the data reaches silver/."
+
+CTO: "Can Glue do all that in one job?"
+YOU: "Yes — DynamicFrame supports Filter, Map, Join, 
+      Relationalize, and custom PySpark transforms.
+      We'll build a proper silver-layer transformation."
+
+→ Project 34: "Filter, Clean, Join, &amp; Aggregate Inside a Glue Job"
+→ Introduces: DynamicFrame Transforms — Filter, Join, Map, 
+              Relationalize, ApplyMapping, Custom PySpark</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="17" ========== -->
+<div class="chat-message" data-index="17"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-32.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 33 of 80</span>
+    <span class="nav-project-title">ONLY PROCESS NEW FILES — DON&#x27;T RE-PROCESS OLD ONES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-34.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-34.html") window.location = "project-34.html";
+  if (e.key === 'ArrowLeft' && "project-32.html") window.location = "project-32.html";
+});
+</script>
+</body>
+</html>

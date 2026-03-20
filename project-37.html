@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 37: CREATE REUSABLE ATHENA VIEWS FOR BUSINESS REPORTING — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:46%"></div></div>
+<div id="progress-label">46%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 37 of 80</div>
+  <div class="project-title">CREATE REUSABLE ATHENA VIEWS FOR BUSINESS REPORTING</div>
+  <div class="project-tags"><span class="project-tag">Athena</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Analyst self-service expanding
+</span>Current State (after Projects 31-36):
+→ Bronze → Silver → Gold pipeline automated (Glue Workflow)
+→ Gold tables handle 80% of analyst queries (Project 36)
+→ 8 analysts actively querying Athena daily
+→ 3 new junior analysts joining next week
+
+THE PROBLEMS:
+━━━━━━━━━━━━━
+
+Problem 1 — SQL DUPLICATION:
+→ Every analyst writes the same JOINs repeatedly:
+   SELECT o.*, c.customer_name, c.tier, p.product_name, p.category
+   FROM silver_quickcart.order_details o
+   LEFT JOIN silver_quickcart.clean_customers c ON o.customer_id = c.customer_id
+   LEFT JOIN silver_quickcart.clean_products p ON o.product_id = p.product_id
+   WHERE o.status = 'completed'
+→ 8 analysts × 5 times/day = 40 copies of the same 15-line query
+→ If schema changes → must update 40 saved queries across 8 people
+
+Problem 2 — JUNIOR ANALYST ONBOARDING:
+→ New analysts don't know the schema
+→ Don't know which tables to join
+→ Don't know filter conventions (status = 'completed' vs 'complete')
+→ Spend 2 weeks learning table relationships before being productive
+→ Manager: "Can we give them simple table names that just work?"
+
+Problem 3 — QUERY INCONSISTENCY:
+→ Analyst A calculates revenue as: SUM(quantity * unit_price)
+→ Analyst B calculates revenue as: SUM(total_amount)
+→ Analyst C calculates revenue as: SUM(revenue) WHERE status != 'cancelled'
+→ Three different numbers for "total revenue" in three reports
+→ CEO: "Why does every report show a different revenue number?"
+
+Problem 4 — NO COST GUARDRAILS:
+→ Junior analyst runs: SELECT * FROM silver_quickcart.order_details
+→ Scans 15 GB → costs $0.075
+→ Meant to add LIMIT 10 but forgot
+→ Runs it 20 times debugging → $1.50 wasted
+→ No per-query or per-analyst cost limits
+
+Problem 5 — SAVED QUERIES SCATTERED:
+→ Each analyst has saved queries in local text files
+→ No shared query library
+→ No version control on SQL
+→ When analyst leaves → their queries disappear
+
+→ Data engineer: "We need VIEWS for standardized access,
+   NAMED QUERIES for a shared library,
+   and WORKGROUPS for cost control."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the THREE tools Athena provides
+</span>→ VIEWS: Virtual tables defined by SQL — no data stored
+→ NAMED QUERIES: Saved SQL templates — shared query library
+→ WORKGROUPS: Query execution environments — cost/access control
+
+Step 2: Design the view layer
+→ Business views: hide complexity, standardize calculations
+→ Security views: restrict columns/rows per team
+→ Convenience views: common joins pre-defined
+
+Step 3: Design the workgroup strategy
+→ Per-team workgroups with cost limits
+→ Shared workgroup for gold tables (cheap queries)
+→ Restricted workgroup for silver tables (expensive queries)
+
+Step 4: Dependencies from previous projects
+→ Project 16: Athena basics
+→ Project 24: Athena querying Glue Catalog
+→ Project 26: Partitioned Parquet
+→ Project 34: Silver layer tables (source for views)
+→ Project 36: Gold layer CTAS (views complement CTAS)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  ANALYST EXPERIENCE (BEFORE):                                            │
+│  ┌──────────┐     ┌────────────────────────────────┐                     │
+│  │ Analyst   │────►│ 15-line JOIN query             │ → 15 GB scan       │
+│  │           │     │ silver.order_details           │ → $0.075           │
+│  │           │     │ JOIN silver.clean_customers    │ → 12 seconds       │
+│  │           │     │ JOIN silver.clean_products     │                     │
+│  │           │     │ WHERE status = ???             │                     │
+│  └──────────┘     └────────────────────────────────┘                     │
+│                                                                          │
+│  ANALYST EXPERIENCE (AFTER):                                             │
+│  ┌──────────┐     ┌────────────────────────────────┐                     │
+│  │ Analyst   │────►│ SELECT * FROM                  │ → Same scan        │
+│  │           │     │ views.completed_order_details  │ → Same cost        │
+│  │           │     │ WHERE category = 'Electronics' │ → But SIMPLE       │
+│  │           │     │ LIMIT 100                      │ → CONSISTENT       │
+│  └──────────┘     └────────────────────────────────┘ → GOVERNED         │
+│                                                                          │
+│  LAYERS:                                                                 │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │ VIEWS LAYER (virtual — no storage)                                 │  │
+│  │ ┌──────────────────┐ ┌──────────────────┐ ┌────────────────────┐  │  │
+│  │ │ completed_order   │ │ revenue_metrics  │ │ customer_360       │  │  │
+│  │ │ _details          │ │                  │ │                    │  │  │
+│  │ │ (JOIN + filter)   │ │ (standard calc)  │ │ (full profile)     │  │  │
+│  │ └────────┬─────────┘ └────────┬─────────┘ └────────┬───────────┘  │  │
+│  │          │                    │                     │              │  │
+│  │          ▼                    ▼                     ▼              │  │
+│  │ ┌─────────────────────────────────────────────────────────────┐   │  │
+│  │ │ SILVER / GOLD TABLES (actual data in S3)                    │   │  │
+│  │ │ order_details │ clean_customers │ clean_products │ rfm      │   │  │
+│  │ └─────────────────────────────────────────────────────────────┘   │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  WORKGROUPS:                                                             │
+│  ┌────────────────────┐ ┌────────────────────┐ ┌──────────────────┐     │
+│  │ wg-revenue-team    │ │ wg-marketing-team  │ │ wg-junior-analysts│    │
+│  │ Limit: 50 GB/query │ │ Limit: 50 GB/query │ │ Limit: 1 GB/query│    │
+│  │ Budget: $100/month │ │ Budget: $80/month  │ │ Budget: $20/month│    │
+│  └────────────────────┘ └────────────────────┘ └──────────────────┘     │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Athena Views only
+</span>→ Virtual tables with standardized SQL
+→ Pros: simple, immediate, no storage cost
+→ Cons: still scans full data on each query
+
+Option B: Views + Named Queries
+→ Views for standard access + saved query library
+→ Pros: reusable templates, shared across team
+→ Cons: no cost control
+
+Option C: Views + Named Queries + Workgroups (RECOMMENDED)
+→ Full governance: access, consistency, cost control
+→ Views: standardize calculations and joins
+→ Named Queries: shared library of common analyses
+→ Workgroups: per-team cost limits and result locations
+→ Pros: complete solution for analyst self-service
+→ Cons: more setup, but worth it at scale
+
+Option D: Views pointing to Gold tables (hybrid)
+→ Views on gold tables = virtually free queries
+→ Views on silver tables = full scan cost
+→ Strategy: gold views for frequent queries, silver views for ad-hoc
+→ BEST: combine with Option C
+
+DECISION: Options C + D combined
+→ Views on gold tables (frequent, cheap)
+→ Views on silver tables (ad-hoc, governed by workgroup limits)
+→ Named queries for common analysis patterns
+→ Workgroups for per-team cost control</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a dedicated "views" database in Glue Catalog
+</span>   → Database: reporting_views
+   → All views live here — analysts know where to look
+   → Separate from silver/gold data databases
+
+2. Standardize business metric calculations in views
+   → revenue = SUM(revenue) WHERE status = 'completed'
+   → active_customers = COUNT(DISTINCT customer_id) WHERE last_order &lt; 90 days
+   → Define ONCE in view → all analysts get same number
+
+3. Create layered views
+   → Base views: simple JOINs (order_details + customers + products)
+   → Metric views: standardized aggregations built ON base views
+   → Security views: column/row restrictions per team
+
+4. Name views descriptively
+   → v_completed_order_details (not "view1")
+   → v_monthly_revenue_by_category (not "rev_cat")
+   → Prefix with "v_" to distinguish from tables
+
+5. Point frequent views at GOLD tables
+   → v_revenue_summary → reads gold_quickcart.revenue_by_category_month
+   → Scans 3 KB instead of 15 GB
+   → Effectively free for analysts
+
+6. Create one workgroup per team
+   → Revenue team: wg-revenue (50 GB/query limit)
+   → Junior analysts: wg-junior (1 GB/query limit, enforced)
+   → Each workgroup has its own result location in S3
+
+7. Document views with COMMENT in DDL
+   → CREATE VIEW v_name COMMENT 'Description of what this view provides'
+   → Analysts can see comments in Glue Catalog / Athena Console
+
+8. Use Named Queries for analysis templates
+   → "Top N products by revenue" — parameterized
+   → "Customer cohort analysis" — reusable
+   → Stored in Athena, accessible by all team members</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT create views that join 5+ large tables
+</span>   → Each additional JOIN multiplies scan volume
+   → View with 5 JOINs on silver tables → 50+ GB scan per query
+   → Pre-join in silver layer (Project 34) → view reads pre-joined table
+
+2. DO NOT rely on views for performance
+   → Views are VIRTUAL — SQL is re-executed every time
+   → A view on 15 GB silver table scans 15 GB every query
+   → For performance: use CTAS (Project 36) not views
+   → Views = consistency + convenience, NOT performance
+
+3. DO NOT create views with SELECT *
+   → SELECT * from underlying table includes ALL columns
+   → If table adds columns → view automatically exposes them
+   → May expose sensitive columns unintentionally
+   → Always list columns explicitly in view definition
+
+4. DO NOT skip workgroup cost limits for junior analysts
+   → One accidental SELECT * FROM order_details (no LIMIT) = $0.075
+   → Junior running 200 queries/day exploring = $15/day
+   → Set 1 GB/query limit → max cost per query = $0.005
+   → Save $300/month from accidental full scans
+
+5. DO NOT create views in the same database as tables
+   → Mixing views and tables in silver_quickcart → confusion
+   → "Is this a view or a table?" → analysts don't know
+   → Separate database: reporting_views for views only
+
+6. DO NOT use views to bypass security
+   → View runs with CALLER's permissions, not creator's
+   → If analyst can't access underlying table → view fails too
+   → For row-level security: use Lake Formation (Project 74)
+
+7. DO NOT create 100 views for every possible query
+   → View explosion → nobody knows which to use
+   → Create 10-15 well-designed views covering 90% of needs
+   → Named queries cover the remaining 10%</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────┬──────────────────┬──────────────────────────────────┐
+</span>│ Scenario                             │ Use              │ Why                              │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Standardize a calculation across     │ Athena VIEW      │ Single source of truth for       │
+│ all analysts (e.g., revenue def)     │                  │ business metrics                 │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Pre-compute for performance +        │ CTAS (Project 36)│ Materializes data, queries are   │
+│ cost savings                         │                  │ instant and nearly free           │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Save a reusable SQL template         │ Named Query      │ Parameterizable, shared library  │
+│ for the team                         │                  │ visible in Athena Console        │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Control query costs per team         │ Workgroup        │ Per-query scan limits, budgets   │
+│                                      │                  │ separate result locations         │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Hide complex JOINs from analysts     │ VIEW on silver   │ Analyst sees simple table name   │
+│                                      │ pre-joined table │ reads from already-joined data   │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Restrict columns visible to a team   │ VIEW with        │ Only expose needed columns       │
+│                                      │ explicit SELECT  │ (not full security — use LF)     │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Provide always-fresh data            │ VIEW             │ No stale data — queries live      │
+│ (not acceptable to be 1 day old)     │                  │ source on every execution        │
+├──────────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Provide instant response (&lt; 1s)      │ CTAS + VIEW      │ CTAS materializes, VIEW wraps   │
+│ with standardized calculation        │ on gold table    │ gold table with standard calc    │
+└──────────────────────────────────────┴──────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ATHENA VIEWS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Need sub-second query response on large data
+</span>   → Views re-execute SQL every time → same scan as raw query
+   → Use: CTAS (Project 36) or Redshift Materialized Views (Project 63)
+
+2. Need row-level security (user A sees rows X, user B sees rows Y)
+   → Athena views run with caller's permissions
+   → Cannot enforce different row filters per user via views alone
+   → Use: Lake Formation with cell-level security (Project 74)
+
+3. Need to share query results across services (not just Athena)
+   → Views only exist in Athena context
+   → Lambda, Glue, Redshift cannot query Athena views directly
+   → Use: CTAS to create actual tables other services can read
+
+4. Source data changes schema frequently
+   → View with explicit column list breaks when column removed
+   → Must update view DDL every time source schema changes
+   → Use: Schema evolution handling in Glue (Project 45)
+
+5. View would scan &gt; 100 GB per execution
+   → Each analyst query costs &gt; $0.50
+   → Even with workgroup limits, this is expensive
+   → Materialize with CTAS instead</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│              ATHENA VIEWS, NAMED QUERIES, WORKGROUPS — INTERNALS                 │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ATHENA VIEWS — HOW THEY WORK:                                                   │
+│  ═════════════════════════════                                                   │
+│                                                                                  │
+│  CREATE OR REPLACE VIEW reporting_views.v_completed_orders AS                    │
+│  SELECT order_id, customer_id, revenue                                           │
+│  FROM silver_quickcart.order_details                                             │
+│  WHERE status = 'completed';                                                     │
+│                                                                                  │
+│  WHAT HAPPENS:                                                                   │
+│  1. Athena validates SQL against Glue Catalog schemas                            │
+│  2. View DEFINITION stored in Glue Catalog as table metadata:                    │
+│     → TableType: "VIRTUAL_VIEW"                                                  │
+│     → ViewOriginalText: the SQL                                                  │
+│     → ViewExpandedText: fully qualified SQL                                      │
+│  3. NO data is stored, NO S3 files created                                       │
+│  4. View appears as a "table" in Glue Catalog                                    │
+│                                                                                  │
+│  WHEN ANALYST QUERIES THE VIEW:                                                  │
+│  SELECT * FROM reporting_views.v_completed_orders WHERE revenue &gt; 100            │
+│                                                                                  │
+│  1. Athena reads view definition from Glue Catalog                               │
+│  2. Expands view SQL inline:                                                     │
+│     SELECT * FROM (                                                              │
+│       SELECT order_id, customer_id, revenue                                      │
+│       FROM silver_quickcart.order_details                                        │
+│       WHERE status = 'completed'                                                 │
+│     ) WHERE revenue &gt; 100                                                        │
+│  3. Optimizes combined query (predicate pushdown)                                │
+│  4. Executes against actual S3 data                                              │
+│  5. Scans same volume as if analyst wrote the full query                         │
+│                                                                                  │
+│  KEY INSIGHT: Views are COMPILE-TIME substitution, not runtime caching           │
+│  → Zero performance benefit over writing the SQL directly                        │
+│  → Value is: consistency, convenience, governance                                │
+│                                                                                  │
+│  PREDICATE PUSHDOWN THROUGH VIEWS:                                               │
+│  ═════════════════════════════════                                                │
+│                                                                                  │
+│  View: WHERE status = 'completed'                                                │
+│  Query: WHERE revenue &gt; 100 AND year = '2025'                                    │
+│                                                                                  │
+│  Athena combines: WHERE status = 'completed'                                     │
+│                    AND revenue &gt; 100                                              │
+│                    AND year = '2025'                                              │
+│                                                                                  │
+│  → year = '2025' pushes down to partition pruning                                │
+│  → Only scans 2025 partitions (not all years)                                    │
+│  → View filter + query filter BOTH applied                                       │
+│                                                                                  │
+│  WORKGROUPS — HOW THEY WORK:                                                     │
+│  ════════════════════════════                                                    │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │ Workgroup: "wg-junior-analysts"                             │                 │
+│  │                                                             │                 │
+│  │ Configuration:                                              │                 │
+│  │ ├── BytesScannedCutoffPerQuery: 1 GB (1073741824)           │                 │
+│  │ │   → Any query scanning &gt; 1 GB is CANCELLED               │                 │
+│  │ │   → Analyst sees: "Query cancelled: data scan exceeded"   │                 │
+│  │ │   → Prevents accidental full-table scans                  │                 │
+│  │ │                                                           │                 │
+│  │ ├── ResultConfiguration:                                    │                 │
+│  │ │   ├── OutputLocation: s3://bucket/athena-results/junior/  │                 │
+│  │ │   └── EncryptionConfiguration: SSE_S3                     │                 │
+│  │ │   → Each workgroup has separate result folder              │                 │
+│  │ │   → Results don't mix across teams                        │                 │
+│  │ │                                                           │                 │
+│  │ ├── EnforceWorkGroupConfiguration: true                     │                 │
+│  │ │   → Analysts CANNOT override settings                     │                 │
+│  │ │   → Even if they specify different output location         │                 │
+│  │ │   → Workgroup settings ALWAYS win                         │                 │
+│  │ │                                                           │                 │
+│  │ └── PublishCloudWatchMetricsEnabled: true                   │                 │
+│  │     → Query metrics per workgroup in CloudWatch             │                 │
+│  │     → Monitor: bytes scanned, query count, errors           │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  NAMED QUERIES — HOW THEY WORK:                                                  │
+│  ═══════════════════════════════                                                 │
+│                                                                                  │
+│  → Saved SQL stored in Athena service (not Glue Catalog)                         │
+│  → Each Named Query has: Name, Description, Database, QueryString                │
+│  → Visible in Athena Console under "Saved queries"                               │
+│  → Can be shared across all users in the account                                 │
+│  → NOT parameterized natively — but conventions work:                            │
+│    → Use {{PLACEHOLDER}} in SQL → analyst replaces before running                │
+│  → API: create_named_query(), list_named_queries()                               │
+│                                                                                  │
+│  VIEW vs NAMED QUERY vs CTAS:                                                    │
+│  ═════════════════════════════                                                   │
+│  ┌─────────────────┬────────────┬──────────────┬─────────────────┐               │
+│  │                 │ View       │ Named Query  │ CTAS            │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Stored where    │ Glue       │ Athena       │ Glue Catalog    │               │
+│  │                 │ Catalog    │ Service      │ + S3 data       │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Data stored?    │ No         │ No           │ Yes (S3)        │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Always fresh?   │ Yes        │ Yes (re-run) │ No (snapshot)   │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Performance?    │ Same as    │ Same as      │ Fast (small     │               │
+│  │                 │ raw query  │ raw query    │ pre-computed)   │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Queryable as    │ Yes        │ No (must     │ Yes             │               │
+│  │ table?          │            │ copy-paste)  │                 │               │
+│  ├─────────────────┼────────────┼──────────────┼─────────────────┤               │
+│  │ Best for        │ Standard   │ Templates,   │ Performance,    │               │
+│  │                 │ definitions│ ad-hoc       │ cost savings    │               │
+│  └─────────────────┴────────────┴──────────────┴─────────────────┘               │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "View query is slow — thought views were fast"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Views don't store data — they re-execute SQL every time
+→ View on 15 GB silver table = 15 GB scan every query
+→ Fix: Point view at GOLD table (3 KB) instead of silver (15 GB)
+→ Or: Accept the cost for always-fresh data
+
+PITFALL 2: "View breaks after source table schema changed"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: View references column that was renamed/removed
+→ Error: "Column 'old_name' not found in table"
+→ Fix: CREATE OR REPLACE VIEW with updated column list
+→ Prevention: use stable column aliases in views
+→ Project 45 covers schema evolution in depth
+
+PITFALL 3: "Workgroup limit blocks legitimate large queries"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: BytesScannedCutoffPerQuery too restrictive
+→ Analyst needs to scan 5 GB but limit is 1 GB
+→ Fix A: Increase limit for that workgroup
+→ Fix B: Create gold table for that specific query
+→ Fix C: Create separate "power-user" workgroup with higher limits
+
+PITFALL 4: "Named query shows in Console but analyst can't find it"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Named queries are per-workgroup
+→ Analyst is in wg-junior but query was created in wg-revenue
+→ Fix: Create named queries in the workgroup where analysts work
+→ Or: Create in "primary" workgroup (shared)
+
+PITFALL 5: "View on partitioned table doesn't benefit from partition pruning"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: View doesn't include partition column in output
+→ Analyst can't filter on partition column → full scan
+→ Fix: ALWAYS include partition columns in view SELECT
+→ Even if analyst doesn't need them — they enable pruning
+
+PITFALL 6: "CREATE VIEW fails: views cannot be created on views"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Actually: Athena DOES support views on views (up to a depth)
+→ Real cause: circular view reference (view A references view B references view A)
+→ Fix: Keep view hierarchy shallow (max 2 levels deep)
+→ Base views → metric views → STOP (don't add more layers)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>VIEW PERFORMANCE AT SCALE:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Views themselves have ZERO performance overhead
+→ Performance = performance of the underlying query
+→ View on gold table (3 KB): 0.3s regardless of analyst count
+→ View on silver table (15 GB): 12s regardless of analyst count
+→ 100 analysts querying same view = 100 separate scans
+→ No caching between users (each query is independent)
+
+WORKGROUP SCALING:
+→ Max workgroups per account: 1000
+→ Max concurrent queries per workgroup: configurable (default 25)
+→ Max concurrent queries per account: 25 (default, can increase to 200+)
+→ For 50 analysts: 3-5 workgroups sufficient
+
+NAMED QUERY LIMITS:
+→ Max named queries per workgroup: unlimited (practically)
+→ Max query string length: 262,144 bytes (~256 KB of SQL)
+→ For 100+ templates: organize by naming convention
+
+COST CONTROL AT SCALE:
+━━━━━━━━━━━━━━━━━━━━━━
+┌──────────────────────┬──────────────┬──────────────┬──────────────┐
+│ Team                 │ Scan Limit   │ Monthly Cap  │ Analysts     │
+├──────────────────────┼──────────────┼──────────────┼──────────────┤
+│ Revenue (senior)     │ 50 GB/query  │ $200/month   │ 3            │
+│ Marketing            │ 50 GB/query  │ $150/month   │ 3            │
+│ Operations           │ 20 GB/query  │ $100/month   │ 2            │
+│ Junior analysts      │ 1 GB/query   │ $30/month    │ 5            │
+│ Data engineering      │ 100 GB/query │ $500/month   │ 3            │
+└──────────────────────┴──────────────┴──────────────┴──────────────┘
+→ Total monthly budget: $980
+→ Without limits: easily $2000+ from accidental scans</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(37)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Create Views</h3>
+
+<h3>Part 2: Create Workgroups with Cost Controls</h3>
+
+<h3>Part 3: Create Named Queries (Shared Query Library)</h3>
+
+<h3>Part 4: Analyst Onboarding Guide Generator</h3>
+
+<h3>Part 5: View Health Check and Monitoring</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE SETUP AND EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. Create views:                                                        │
+│    $ python 37_01_create_views.py                                       │
+│    → Creates 12 views in reporting_views database                       │
+│    → 4 base views (silver-backed)                                       │
+│    → 4 gold-backed views (virtually free)                               │
+│    → 2 metric views (standardized calculations)                         │
+│    → 2 security views (column-restricted)                               │
+│                                                                         │
+│ 2. Create workgroups:                                                   │
+│    $ python 37_02_create_workgroups.py                                  │
+│    → Creates 6 workgroups with cost limits                              │
+│    → Junior analysts: 1 GB limit (max $0.005/query)                     │
+│    → Senior analysts: 50 GB limit                                       │
+│    → Data engineering: 100 GB limit                                     │
+│                                                                         │
+│ 3. Create named query library:                                          │
+│    $ python 37_03_create_named_queries.py                               │
+│    → Creates 10+ saved queries in Athena                                │
+│    → Revenue, Customer, Operations, Data Quality categories             │
+│                                                                         │
+│ 4. Generate onboarding guide:                                           │
+│    $ python 37_04_analyst_onboarding.py export                          │
+│    → Uploads guide to S3 for sharing with new analysts                  │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ WEEKLY MAINTENANCE                                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ $ python 37_05_view_health_check.py                                     │
+│ → Tests all views, reports broken ones                                  │
+│ → Shows workgroup status                                                │
+│ → Run after any schema changes or pipeline updates                      │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ANALYST DAILY WORKFLOW                                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Step 1: Open Athena Console                                             │
+│ Step 2: Select workgroup (top-right dropdown)                           │
+│ Step 3: Select database: reporting_views                                │
+│ Step 4: Browse views in left panel OR use "Saved queries" tab           │
+│ Step 5: Write query using views                                         │
+│                                                                         │
+│ Example analyst session:                                                │
+│ ┌─────────────────────────────────────────────────────────────┐         │
+│ │ SELECT category, SUM(total_revenue) AS revenue              │         │
+│ │ FROM reporting_views.v_revenue_summary                      │         │
+│ │ WHERE year = '2025'                                         │         │
+│ │ GROUP BY category                                           │         │
+│ │ ORDER BY revenue DESC                                       │         │
+│ │                                                             │         │
+│ │ → Scans: 3 KB (gold-backed) → Cost: $0.00005               │         │
+│ │ → Time: 0.4 seconds                                        │         │
+│ │ → Result: 8 rows (one per category)                         │         │
+│ └─────────────────────────────────────────────────────────────┘         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+VIEW HIERARCHY:
+━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ ANALYST LAYER (reporting_views database)                            │
+│                                                                     │
+│ GOLD-BACKED VIEWS (virtually free):                                 │
+│ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────┐ │
+│ │ v_revenue_summary│ │ v_customer_      │ │ v_product_leaderboard│ │
+│ │ (3 KB scan)      │ │ segments (1 KB)  │ │ (50 KB scan)         │ │
+│ └────────┬─────────┘ └────────┬─────────┘ └────────┬─────────────┘ │
+│          │                    │                     │               │
+│          ▼                    ▼                     ▼               │
+│ ┌──────────────────────────────────────────────────────────────┐   │
+│ │ GOLD TABLES (gold_quickcart — materialized by CTAS)          │   │
+│ │ revenue_by_category_month │ customer_segments │ product_perf  │   │
+│ └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│ SILVER-BACKED VIEWS (moderate cost):                                │
+│ ┌──────────────────────┐ ┌────────────────┐ ┌──────────────────┐  │
+│ │ v_completed_order_   │ │ v_customer_360 │ │ v_orders_no_pii  │  │
+│ │ details (15 GB scan) │ │ (2 GB scan)    │ │ (15 GB scan)     │  │
+│ └────────┬─────────────┘ └────────┬───────┘ └────────┬─────────┘  │
+│          │                        │                   │            │
+│          ▼                        ▼                   ▼            │
+│ ┌──────────────────────────────────────────────────────────────┐   │
+│ │ SILVER TABLES (silver_quickcart — cleaned, joined)           │   │
+│ │ order_details │ clean_customers │ clean_products │ rfm       │   │
+│ └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│ METRIC VIEWS (standard calculations):                               │
+│ ┌──────────────────────────┐ ┌──────────────────────────┐         │
+│ │ v_standard_revenue_      │ │ v_customer_health        │         │
+│ │ metrics (THE revenue     │ │ (active/at-risk/churned  │         │
+│ │ definition for company)  │ │ definitions)             │         │
+│ └──────────────────────────┘ └──────────────────────────┘         │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Views are VIRTUAL — no data stored, SQL re-executed every query
+→ Views provide: consistency, convenience, governance — NOT performance
+→ Gold-backed views combine CTAS performance with view standardization
+→ Workgroups enforce per-team cost limits (BytesScannedCutoffPerQuery)
+→ EnforceWorkGroupConfiguration=true prevents analysts from overriding
+→ Named queries create a shared SQL library visible in Athena Console
+→ Always include partition columns in views for partition pruning
+→ List columns explicitly — never SELECT * in view definitions
+→ 12 well-designed views cover 90% of analyst needs
+→ Security views restrict columns but NOT true security (use Lake Formation)
+→ View health checks catch broken views after schema changes
+→ Onboarding guide reduces new analyst ramp-up from 2 weeks to 2 days
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 16: Athena basics (first query)
+→ Project 24: Athena on Glue Catalog (querying silver tables)
+→ Project 34: Silver layer (source for silver-backed views)
+→ Project 36: Gold CTAS (source for gold-backed views)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 38: Redshift Spectrum — query these same views FROM Redshift
+   (Redshift reads Glue Catalog → can access gold tables via Spectrum)
+→ Project 44: Medallion Architecture — views formalize the gold layer
+   (bronze/silver/gold + views = complete self-service data platform)
+→ Project 46: Athena Federated Query — views that query MariaDB live
+   (extend views beyond S3 to include live database data)
+→ Project 74: Lake Formation — replace security views with real
+   column-level and row-level security across accounts</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a complete analyst self-service platform:
+</span>→ Bronze → Silver → Gold pipeline (automated nightly)
+→ 12 standardized views in reporting_views database
+→ Gold-backed views for frequent queries (virtually free)
+→ Silver-backed views for ad-hoc analysis (governed by workgroups)
+→ Named query library for common analyses
+→ Workgroups with per-team cost limits
+
+BUT: The BI team says:
+"Our Tableau dashboards connect to REDSHIFT, not Athena.
+ Redshift has the silver data (loaded in Project 32),
+ but we also want to query the GOLD tables in S3
+ without loading them into Redshift.
+ 
+ Loading 5 gold tables into Redshift = wasted storage.
+ They're only 100 KB total. Can Redshift just
+ READ them directly from S3?"
+
+CTO: "That's Redshift Spectrum — query S3 data from Redshift
+      using the same Glue Catalog we already have."
+
+→ Project 38: "Query S3 Data Lake from Redshift Without Loading It"
+→ Introduces: Redshift Spectrum, External Schema, Glue Catalog Link,
+              Partition Pushdown, Mixed Queries (local + external)</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="33" ========== -->
+<div class="chat-message" data-index="33"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-36.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 37 of 80</span>
+    <span class="nav-project-title">CREATE REUSABLE ATHENA VIEWS FOR BUSINESS REPORTING</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-38.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-38.html") window.location = "project-38.html";
+  if (e.key === 'ArrowLeft' && "project-36.html") window.location = "project-36.html";
+});
+</script>
+</body>
+</html>

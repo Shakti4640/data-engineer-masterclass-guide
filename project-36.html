@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 36: MATERIALIZE HEAVY ATHENA QUERIES INTO OPTIMIZED TABLES — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:45%"></div></div>
+<div id="progress-label">45%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 36 of 80</div>
+  <div class="project-title">MATERIALIZE HEAVY ATHENA QUERIES INTO OPTIMIZED TABLES</div>
+  <div class="project-tags"><span class="project-tag">Athena</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Analysts actively using the data platform
+</span>Current State (after Projects 31-35):
+→ Nightly pipeline: MariaDB → Bronze → Silver → Redshift (automated)
+→ Silver layer in S3 queried via Athena (Project 24)
+→ 7 silver tables registered in Glue Catalog (Project 35)
+→ Analysts run ad-hoc queries on Athena daily
+
+THE COST EXPLOSION:
+━━━━━━━━━━━━━━━━━━
+
+Analyst A (Revenue team):
+→ Query: "Revenue by category by month for 2025"
+→ Scans: silver/order_details/ → 15 GB Parquet
+→ Cost: $0.075 per query ($5/TB × 15 GB)
+→ Runs: 20 times/day → $1.50/day → $45/month
+
+Analyst B (Marketing team):
+→ Query: "Customer segments with RFM scores"
+→ Scans: silver/customer_rfm/ + silver/order_details/ JOIN
+→ Scans: 18 GB total
+→ Cost: $0.09 per query
+→ Runs: 15 times/day → $1.35/day → $40.50/month
+
+Analyst C (Operations team):
+→ Query: "Daily order volume by status by city"
+→ Scans: silver/order_details/ → 15 GB
+→ Cost: $0.075 per query
+→ Runs: 10 times/day → $0.75/day → $22.50/month
+
+TOTAL ATHENA COST: $108/month — just for 3 analysts, 3 queries
+→ As team grows to 15 analysts → $540/month on Athena scans
+→ Each query takes 8-15 seconds → analysts frustrated waiting
+
+THE ROOT CAUSE:
+→ Every query scans the FULL order_details table (15 GB)
+→ Even though the RESULT is only 200-2000 rows
+→ Same computation repeated 45 times/day
+→ Paying $5/TB to re-compute the same answer every time
+
+→ Data engineer: "We should PRE-COMPUTE these results once/day
+   into small Parquet tables. Analysts query the small tables instead."
+
+→ CTO: "How much would that save?"
+→ You: "Pre-computed table: 200 rows × 10 columns = 0.002 GB.
+   Query cost: $0.00001. Savings: 99.99%."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Identify materialization candidates
+</span>→ Queries that: run frequently + scan large data + produce small results
+→ Revenue summary: 45M rows → 200 rows (perfect candidate)
+→ Customer RFM: already pre-aggregated in silver (Project 34)
+→ Daily operations: 45M rows → 3000 rows (good candidate)
+
+Step 2: Understand materialization options
+→ Option A: Athena CTAS (CREATE TABLE AS SELECT)
+→ Option B: Athena INSERT INTO (append to existing table)
+→ Option C: Glue ETL (already doing this in Project 34)
+→ Option D: Athena Views (no materialization — just saved SQL)
+→ Each serves different purpose
+
+Step 3: Understand the output format choices
+→ Parquet: columnar, compressed, best for analytical queries
+→ ORC: similar to Parquet, preferred by some Hive ecosystems
+→ JSON: human-readable but large
+→ CSV: universal but no types, no compression
+→ Parquet with Snappy compression = best default
+
+Step 4: Understand partitioning and bucketing
+→ Partitioning: split data by column values into directories
+→ Bucketing: hash-distribute within partitions into fixed number of files
+→ Both reduce scan volume for filtered queries
+
+Step 5: Dependencies from previous projects
+→ Project 16: Athena basics (first query)
+→ Project 24: Athena on Glue Catalog
+→ Project 26: Partitioned queries (partition pruning)
+→ Project 34: Silver layer tables (source for materialization)
+→ Project 35: Workflow (schedule materialization after silver refresh)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  BEFORE (every analyst query):                                      │
+│  ┌──────────┐     ┌─────────────────────┐     ┌──────────┐         │
+│  │ Analyst   │────►│ Athena scans 15 GB  │────►│ 200 rows │         │
+│  │ Query     │     │ order_details       │     │ result   │         │
+│  │           │     │ Cost: $0.075        │     │          │         │
+│  │ × 45/day  │     │ Time: 12 seconds    │     │          │         │
+│  └──────────┘     └─────────────────────┘     └──────────┘         │
+│                                                                     │
+│  AFTER (materialized):                                              │
+│  ┌──────────┐     ┌─────────────────────┐     ┌──────────┐         │
+│  │ CTAS runs│────►│ Athena scans 15 GB  │────►│ gold/    │  ONCE   │
+│  │ ONCE/day │     │ order_details       │     │ revenue  │  /DAY   │
+│  │          │     │ Cost: $0.075        │     │ summary  │         │
+│  └──────────┘     │ Time: 12 seconds    │     │ 0.002 GB │         │
+│                    └─────────────────────┘     └────┬─────┘         │
+│                                                     │               │
+│  ┌──────────┐     ┌─────────────────────┐          │               │
+│  │ Analyst   │────►│ Athena scans 0.002 │◄─────────┘               │
+│  │ Query     │     │ GB (tiny table)    │                           │
+│  │           │     │ Cost: $0.00001     │                           │
+│  │ × 45/day  │     │ Time: 0.5 seconds  │                           │
+│  └──────────┘     └─────────────────────┘                           │
+│                                                                     │
+│  DAILY COST COMPARISON:                                             │
+│  Before: 45 queries × $0.075 = $3.375/day                          │
+│  After:  1 CTAS × $0.075 + 45 queries × $0.00001 = $0.075/day     │
+│  Savings: 97.8%                                                     │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Athena CTAS (CREATE TABLE AS SELECT)
+</span>→ Creates NEW table from query results
+→ Output: Parquet/ORC in S3, registered in Glue Catalog
+→ Pros: single SQL statement, automatic catalog registration
+→ Cons: creates NEW table each time — must DROP old one first
+→ Best for: daily full-refresh materialized tables
+
+Option B: Athena INSERT INTO
+→ Appends query results to EXISTING table
+→ Pros: incremental — add today's data without replacing yesterday
+→ Cons: requires table to exist already, no dedup
+→ Best for: event logs, append-only data
+
+Option C: Athena Views (no materialization)
+→ Saved SQL — no data copied
+→ Pros: always fresh, zero storage cost
+→ Cons: still scans full data on every query — no performance gain
+→ Best for: convenience, not performance
+→ Covered in Project 37
+
+Option D: Glue ETL (already doing this)
+→ Project 34 already creates daily_revenue_summary in silver/
+→ But: not all analyst queries map to existing silver tables
+→ Adding every ad-hoc query to Glue job is overkill
+→ Best for: complex transforms, not simple aggregations
+
+Option E: Redshift Materialized Views (Project 63)
+→ Auto-refreshed views inside Redshift
+→ Best when data already in Redshift
+→ Different use case — covered later
+
+DECISION: Options A + B + C combined
+→ CTAS for daily-refresh materialized tables (this project)
+→ INSERT INTO for append-only historical tracking
+→ Views for convenience aliases (Project 37)
+→ Each serves different need</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Create a "gold" layer in S3 for materialized tables
+</span>   → s3://bucket/gold/revenue_by_category_month/
+   → s3://bucket/gold/daily_operations_summary/
+   → Separate from silver — gold = business-ready, optimized
+   → This completes the Medallion architecture (Project 44 formalizes)
+
+2. Use CTAS with explicit format and compression
+   → FORMAT = 'PARQUET'
+   → write_compression = 'SNAPPY'
+   → Don't rely on defaults — be explicit
+
+3. Partition CTAS output by commonly filtered columns
+   → Revenue summary: partition by year
+   → Daily operations: partition by order_date
+   → Partition pruning reduces scan further
+
+4. Use bucketing for join-heavy tables
+   → Bucket by customer_id if downstream queries join on customer_id
+   → Athena reads only relevant buckets for filtered queries
+   → Bucket count: 8-32 (power of 2, not too many)
+
+5. Implement DROP-then-CTAS pattern for daily refresh
+   → Step 1: DROP TABLE IF EXISTS gold.revenue_summary
+   → Step 2: CTAS to recreate with fresh data
+   → Step 3: MSCK REPAIR TABLE (if partitioned)
+   → Atomic from analyst perspective — brief gap during refresh
+
+6. Schedule CTAS after silver layer refresh (via workflow)
+   → Add to Glue Workflow (Project 35) as final step
+   → OR: Run as scheduled Athena query via boto3
+
+7. Set Athena workgroup with cost controls
+   → Per-query data scan limit: 10 GB
+   → Prevents accidental full-table scans on large tables
+   → Covered in Project 37 for workgroup details
+
+8. Register gold tables in separate Catalog database
+   → Database: gold_quickcart
+   → Analysts query: gold_quickcart.revenue_summary
+   → Clear separation: bronze (raw), silver (clean), gold (business)</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use CTAS without DROP first
+</span>   → CTAS fails if table already exists (no "IF NOT EXISTS" for CTAS)
+   → Error: "Table already exists"
+   → Always DROP TABLE IF EXISTS before CTAS
+
+2. DO NOT use CTAS output location that overlaps with source
+   → Source: s3://bucket/silver/order_details/
+   → CTAS output: s3://bucket/silver/order_details_summary/
+   → If CTAS writes to silver/ prefix → Crawler picks it up → confusion
+   → Use separate prefix: s3://bucket/gold/
+
+3. DO NOT materialize tables that change intra-day
+   → CTAS creates point-in-time snapshot
+   → If silver data updates at 10 AM and 2 PM → gold is stale after 10 AM
+   → Only materialize data that refreshes once/day (our nightly pipeline)
+
+4. DO NOT create too many materialized tables
+   → Each CTAS costs one full scan of source data
+   → 20 materialized tables × $0.075 each = $1.50/day just for CTAS
+   → Only materialize: high-frequency + high-scan queries
+   → Rule of thumb: materialize if query runs &gt; 5 times/day
+
+5. DO NOT forget to clean up old S3 data after DROP TABLE
+   → DROP TABLE removes Catalog entry but NOT S3 data
+   → For EXTERNAL tables: S3 files remain → orphaned data
+   → For CTAS-created tables: S3 files ARE deleted (Athena manages them)
+   → Verify: CTAS tables have 'EXTERNAL' = 'FALSE' in properties
+
+6. DO NOT skip ANALYZE on CTAS output
+   → Athena uses table statistics for query optimization
+   → CTAS tables may lack accurate statistics
+   → Run: ANALYZE gold.revenue_summary after CTAS
+
+7. DO NOT use CTAS for tables &gt; 100 GB output
+   → CTAS has a 100-partition limit per statement
+   → For very large outputs: use Glue ETL instead
+   → CTAS is designed for summary/aggregate tables, not full copies</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────┬─────────────────┬──────────────────────────────────┐
+</span>│ Scenario                            │ Use             │ Why                              │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Pre-compute aggregate for repeated  │ Athena CTAS     │ Single SQL, auto-registers in    │
+│ analyst queries (daily refresh)     │ (this project)  │ Catalog, outputs optimized       │
+│                                     │                 │ Parquet                          │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Append daily results to historical  │ Athena INSERT   │ Adds to existing table without   │
+│ tracking table                      │ INTO            │ replacing                        │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Convenience alias for complex SQL   │ Athena View     │ No data copy, always fresh       │
+│ (no performance need)               │ (Project 37)    │ Zero storage cost                │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Complex multi-table transform with  │ Glue ETL        │ Full Spark power, handles        │
+│ cleaning/dedup/custom logic         │ (Project 34)    │ schema issues, bookmarks         │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Convert CSV to Parquet (format only)│ Athena CTAS     │ Simpler than Glue for format     │
+│                                     │                 │ conversion only                  │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Auto-refresh query results inside   │ Redshift        │ Native to Redshift, auto-refresh │
+│ Redshift                            │ Materialized    │ (Project 63)                     │
+│                                     │ Views           │                                  │
+├─────────────────────────────────────┼─────────────────┼──────────────────────────────────┤
+│ Query result &gt; 100 partitions       │ Glue ETL        │ CTAS has 100-partition limit     │
+│ or &gt; 100 GB output                  │                 │ Glue handles unlimited            │
+└─────────────────────────────────────┴─────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE ATHENA CTAS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Source data changes multiple times per day
+</span>   → CTAS is a snapshot — stale within hours
+   → Use: Redshift Materialized Views (auto-refresh)
+   → Or: Athena Views (always fresh, but slower)
+
+2. Output table needs &gt; 100 partitions
+   → CTAS hard limit: 100 partitions per statement
+   → Workaround: multiple CTAS with WHERE filters
+   → Better: Glue ETL for large partitioned outputs
+
+3. Need incremental append (not full replace)
+   → CTAS creates new table — replaces entirely
+   → Use: INSERT INTO for appending
+   → Or: Glue with append mode
+
+4. Complex transform logic (cleaning, dedup, UDFs)
+   → Athena SQL is powerful but limited vs Spark
+   → No UDFs, no procedural logic, no variables
+   → Use: Glue ETL for complex transforms
+
+5. Output table must be ACID-compliant
+   → CTAS creates standard Parquet — no transactions
+   → Use: Athena ACID tables (Apache Iceberg) for transactional needs
+   → Or: Lake Formation Governed Tables
+
+6. Query scans &lt; 1 GB already
+   → Materializing saves $0.005 per query (negligible)
+   → Storage cost of materialized table may exceed query savings
+   → Only materialize when scan &gt; 5 GB AND frequency &gt; 5/day</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│              ATHENA CTAS — INTERNAL MECHANICS                                    │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  WHAT HAPPENS WHEN YOU RUN CTAS:                                                 │
+│  ═══════════════════════════════                                                 │
+│                                                                                  │
+│  SQL:                                                                            │
+│  CREATE TABLE gold.revenue_summary                                               │
+│  WITH (                                                                          │
+│    format = 'PARQUET',                                                           │
+│    write_compression = 'SNAPPY',                                                 │
+│    external_location = 's3://bucket/gold/revenue_summary/',                      │
+│    partitioned_by = ARRAY['year']                                                │
+│  )                                                                               │
+│  AS SELECT category, month, year, SUM(revenue) as total_revenue                  │
+│  FROM silver_quickcart.order_details                                             │
+│  GROUP BY category, month, year;                                                 │
+│                                                                                  │
+│  STEP 1: QUERY PLANNING                                                          │
+│  ───────────────────────                                                         │
+│  → Athena parses SQL, validates against Glue Catalog                             │
+│  → Identifies source table: silver_quickcart.order_details                       │
+│  → Reads table metadata from Glue Catalog:                                       │
+│    - S3 location, format, partitions, schema                                     │
+│  → Plans execution: which S3 files to read, how to aggregate                     │
+│  → Estimates data scan volume for billing                                        │
+│                                                                                  │
+│  STEP 2: DATA SCANNING (Presto/Trino engine)                                    │
+│  ────────────────────────────────────────────                                    │
+│  → Athena's distributed engine reads Parquet files from S3                       │
+│  → Parquet columnar format: reads ONLY columns in SELECT                         │
+│  → If source is partitioned: reads ONLY matching partitions                      │
+│  → Each worker reads a subset of files in parallel                               │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │  S3: silver/order_details/                                  │                 │
+│  │  ├── year=2025/month=01/day=01/part-00000.parquet           │                 │
+│  │  ├── year=2025/month=01/day=01/part-00001.parquet           │                 │
+│  │  ├── year=2025/month=01/day=02/part-00000.parquet           │                 │
+│  │  └── ... (hundreds of files)                                │                 │
+│  │                                                             │                 │
+│  │  Athena Worker 1: reads files 1-50    → partial aggregate   │                 │
+│  │  Athena Worker 2: reads files 51-100  → partial aggregate   │                 │
+│  │  Athena Worker 3: reads files 101-150 → partial aggregate   │                 │
+│  │  ...                                                        │                 │
+│  │  Coordinator: merges partial aggregates → final result      │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  STEP 3: RESULT WRITING (CTAS-specific)                                          │
+│  ──────────────────────────────────────                                          │
+│  → Instead of returning results to client (normal SELECT)                        │
+│  → CTAS writes results to S3 as Parquet files                                    │
+│  → Output location: external_location parameter                                  │
+│  → Files organized by partition columns:                                         │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                 │
+│  │  S3: gold/revenue_summary/                                  │                 │
+│  │  ├── year=2024/                                             │                 │
+│  │  │   └── 20250115_abc123_00000.snappy.parquet  (2 KB)       │                 │
+│  │  └── year=2025/                                             │                 │
+│  │      └── 20250115_def456_00000.snappy.parquet  (1.5 KB)     │                 │
+│  │                                                             │                 │
+│  │  Total output: ~3.5 KB (vs 15 GB source)                   │                 │
+│  └─────────────────────────────────────────────────────────────┘                 │
+│                                                                                  │
+│  STEP 4: CATALOG REGISTRATION                                                    │
+│  ────────────────────────────                                                    │
+│  → Athena creates table in Glue Catalog:                                         │
+│    Database: gold                                                                │
+│    Table: revenue_summary                                                        │
+│    Location: s3://bucket/gold/revenue_summary/                                   │
+│    Format: Parquet                                                               │
+│    Partitions: year=2024, year=2025                                              │
+│    Schema: category STRING, month STRING, total_revenue DOUBLE                   │
+│  → Table is IMMEDIATELY queryable                                                │
+│                                                                                  │
+│  BILLING:                                                                        │
+│  ════════                                                                        │
+│  → Charged for DATA SCANNED (source table), not output size                      │
+│  → Our CTAS scans 15 GB → cost = $0.075                                          │
+│  → Output size (3.5 KB) is irrelevant to cost                                    │
+│  → Subsequent queries on gold table scan 3.5 KB → cost ≈ $0                     │
+│  → Minimum charge per query: 10 MB ($0.00005)                                    │
+│                                                                                  │
+│  CTAS vs EXTERNAL TABLE:                                                         │
+│  ═══════════════════════                                                         │
+│  → CTAS without external_location: Athena manages S3 location                    │
+│    - Location: s3://athena-results-bucket/tables/{query_id}/                     │
+│    - DROP TABLE deletes S3 data                                                  │
+│    - Table property: 'EXTERNAL' = 'FALSE'                                        │
+│                                                                                  │
+│  → CTAS with external_location: YOU manage S3 location                           │
+│    - Location: wherever you specify                                              │
+│    - DROP TABLE does NOT delete S3 data (it's external)                          │
+│    - Table property: 'EXTERNAL' = 'TRUE'                                         │
+│    - Must clean up S3 manually                                                   │
+│                                                                                  │
+│  → WE USE external_location for control over S3 path                             │
+│  → This means: we must DELETE S3 data before re-running CTAS                     │
+│                                                                                  │
+│  CTAS LIMITS:                                                                    │
+│  ════════════                                                                    │
+│  → Max 100 partitions per CTAS statement                                         │
+│  → Query timeout: 30 minutes (default, configurable)                             │
+│  → Output file count: determined by Athena (not controllable)                    │
+│  → Max concurrent queries per account: 25 (default)                              │
+│  → Max query result size: no limit for CTAS (unlike SELECT: 2 GB)               │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "CTAS fails: Table already exists"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CTAS does not support IF NOT EXISTS
+→ If table exists from yesterday's run → error
+→ Fix: Always DROP TABLE IF EXISTS before CTAS
+→ Note: Must also delete S3 data if using external_location
+
+PITFALL 2: "CTAS succeeds but table has 0 rows"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Source table partitions not registered in Catalog
+→ Athena reads Catalog → no partitions → no data
+→ Fix: Run MSCK REPAIR TABLE on source before CTAS
+→ Or: Ensure Crawler ran (Project 35 workflow includes this)
+
+PITFALL 3: "Partitioned CTAS fails: too many partitions"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CTAS limit is 100 partitions per statement
+→ Partitioning by day for 365 days → 365 partitions → fails
+→ Fix: Partition by year or month instead of day
+→ Or: Use INSERT INTO with date filter for incremental
+
+PITFALL 4: "CTAS output has 500 tiny files"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Athena parallelism creates one file per worker
+→ For small result sets: many empty or tiny files
+→ Fix: Use bucketed_by to control file count
+→ Or: Accept it — for small tables, file count doesn't matter
+
+PITFALL 5: "Gold table shows stale data"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CTAS didn't re-run after silver refresh
+→ Silver updated at 2:47 AM → CTAS ran at 2:00 AM (before silver)
+→ Fix: Schedule CTAS AFTER silver layer completes
+→ Add to workflow (Project 35) or schedule separately
+
+PITFALL 6: "DROP TABLE deletes my S3 data"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: CTAS without external_location creates MANAGED table
+→ Managed table: DROP deletes both Catalog entry AND S3 data
+→ This is EXPECTED for CTAS-managed tables
+→ For external_location CTAS: DROP only removes Catalog entry
+→ Know the difference — check table type before DROP</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>MATERIALIZATION COST MODEL:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌────────────────────────────┬────────────┬────────────┬──────────────┐
+│ Approach                   │ CTAS Cost  │ Query Cost │ Monthly Total│
+│                            │ (1/day)    │ (45/day)   │ (30 days)    │
+├────────────────────────────┼────────────┼────────────┼──────────────┤
+│ No materialization         │ $0         │ $3.375/day │ $101.25      │
+│ (scan 15 GB × 45/day)     │            │            │              │
+├────────────────────────────┼────────────┼────────────┼──────────────┤
+│ CTAS materialization       │ $0.075/day │ $0.002/day │ $2.31        │
+│ (scan 15 GB once,          │            │            │              │
+│  then scan 3.5 KB × 45)   │            │            │              │
+├────────────────────────────┼────────────┼────────────┼──────────────┤
+│ Savings                    │            │            │ $98.94       │
+│                            │            │            │ (97.7%)      │
+└────────────────────────────┴────────────┴────────────┴──────────────┘
+
+WHEN MATERIALIZATION BREAKS EVEN:
+→ CTAS cost: $0.075 (one-time daily scan)
+→ Each query on gold table: ~$0.00005 (10 MB minimum)
+→ Each query on silver table: $0.075 (15 GB scan)
+→ Break-even: 1 CTAS scan / $0.075 per query = after 1 query
+→ After just 1 query: materialization has paid for itself
+
+STORAGE COST OF GOLD TABLES:
+→ revenue_summary: ~3.5 KB → $0.000 per month
+→ daily_operations: ~50 KB → $0.000 per month
+→ customer_segments: ~500 KB → $0.000 per month
+→ Total gold storage: &lt; $0.01/month
+→ Storage is irrelevant for summary tables
+
+SCALING TO MORE MATERIALIZED TABLES:
+→ 5 CTAS queries/day × $0.075 = $0.375/day → $11.25/month
+→ vs. 5 queries × 45 runs × $0.075 = $16.875/day → $506/month
+→ ROI: 45x cost reduction
+
+CTAS PERFORMANCE:
+→ 15 GB source → CTAS takes 12-20 seconds
+→ 100 GB source → CTAS takes 60-90 seconds
+→ 1 TB source → CTAS takes 5-10 minutes
+→ All billed at $5/TB scanned</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY MATERIALIZED TABLES:
+</span>
+1. ROW COUNT MATCH
+   → CTAS result count should match direct query count
+   → SELECT COUNT(*) FROM gold.revenue_summary
+   → vs: SELECT COUNT(DISTINCT category || month || year)
+         FROM silver_quickcart.order_details
+
+2. VALUE MATCH
+   → Pick 3 random (category, month) combinations
+   → Query gold table → get total_revenue
+   → Query silver table → SUM(revenue) WHERE category=X AND month=Y
+   → Must match exactly
+
+3. FRESHNESS CHECK
+   → Query gold table metadata:
+     SELECT "$path" FROM gold.revenue_summary LIMIT 1
+   → Check S3 file timestamp matches today's CTAS run
+
+4. PARTITION CHECK
+   → SHOW PARTITIONS gold.revenue_summary
+   → Should show expected partitions (year=2024, year=2025)
+
+5. COST VERIFICATION
+   → Check Athena query history for CTAS query
+   → Verify: data scanned matches expected source size
+   → Check subsequent analyst queries: data scanned should be tiny</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(36)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Athena CTAS Executor (Core Engine)</h3>
+
+<h3>Part 2: Add CTAS to Glue Workflow</h3>
+
+<h3>Part 3: Analyst Query Examples (Gold Layer Usage)</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. Add CTAS to pipeline:                                                │
+│    $ python 36_02_add_ctas_to_workflow.py                               │
+│    → Uploads Python Shell script to S3                                  │
+│    → Creates Glue Python Shell job                                      │
+│    → Adds conditional trigger to workflow                               │
+│    → Activates trigger                                                  │
+│                                                                         │
+│ 2. Test standalone:                                                     │
+│    $ python 36_01_athena_ctas_executor.py materialize 2025-01-15        │
+│    → Runs all CTAS queries                                              │
+│    → Verifies output                                                    │
+│                                                                         │
+│ 3. Verify cost savings:                                                 │
+│    $ python 36_03_analyst_query_examples.py                             │
+│    → Compares silver vs gold query performance                          │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ DAILY AUTOMATIC EXECUTION (via Workflow — Project 35)                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  02:00  → Job 1: MariaDB → Bronze (Project 31)                         │
+│  02:11  → Crawler A: Crawl bronze/ (Project 35)                        │
+│  02:13  → Job 2: Bronze → Silver (Project 34)                          │
+│  02:38  → Crawler B: Crawl silver/ (Project 35)                        │
+│  02:40  → Job 3: Silver → Redshift (Project 32)                        │
+│  02:47  → Job 4: Gold CTAS (THIS PROJECT) ← NEW STEP                  │
+│  02:50  ✅ WORKFLOW COMPLETED (6 steps)                                 │
+│                                                                         │
+│  CTAS execution time: ~3 minutes                                        │
+│  CTAS cost: ~$0.25 (Athena scans + Python Shell)                       │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ANALYST USAGE (after 02:50 AM daily)                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Instead of:                                                            │
+│    SELECT ... FROM silver_quickcart.order_details  → 15 GB scan, $0.075│
+│                                                                         │
+│  Analysts query:                                                        │
+│    SELECT ... FROM gold_quickcart.revenue_by_category_month → 3 KB scan│
+│    SELECT ... FROM gold_quickcart.customer_segments_summary → 1 KB scan│
+│    SELECT ... FROM gold_quickcart.product_performance → 50 KB scan     │
+│    SELECT ... FROM gold_quickcart.daily_conversion_metrics → 5 KB scan │
+│                                                                         │
+│  Cost per analyst query: ~$0.00005 (10 MB minimum charge)              │
+│  Speed: 0.3-0.8 seconds (vs 8-15 seconds on silver)                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+UPDATED S3 STRUCTURE:
+━━━━━━━━━━━━━━━━━━━━
+
+s3://quickcart-datalake-prod/
+├── bronze/                              ← Raw extracts (Project 31)
+│   └── mariadb/
+│       ├── orders/...
+│       ├── customers/...
+│       └── products/...
+│
+├── silver/                              ← Clean + joined (Project 34)
+│   ├── clean_orders/...
+│   ├── order_details/...
+│   ├── daily_revenue_summary/...
+│   ├── customer_rfm/...
+│   └── ...
+│
+├── gold/                                ← Materialized summaries (THIS PROJECT)
+│   ├── revenue_by_category_month/
+│   │   ├── year=2024/*.parquet          (2 KB)
+│   │   └── year=2025/*.parquet          (1.5 KB)
+│   ├── customer_segments_summary/
+│   │   └── *.parquet                    (1 KB)
+│   ├── product_performance/
+│   │   └── *.parquet                    (50 KB)
+│   └── daily_conversion_metrics/
+│       ├── snapshot_date=2025-01-01/    (0.5 KB)
+│       ├── snapshot_date=2025-01-02/    (0.5 KB)
+│       └── ...                          (grows daily)
+│
+├── scripts/glue/
+├── tmp/
+└── state/watermarks/
+
+
+UPDATED WORKFLOW GRAPH:
+━━━━━━━━━━━━━━━━━━━━━━
+
+    ⏰ trigger-start (cron 0 2 * * ? *)
+    │
+    ▼
+    🟢 JOB 1: quickcart-mariadb-to-s3-parquet
+    │
+    ▼
+    🕷️ CRAWLER A: crawl-bronze-mariadb
+    │
+    ▼
+    🟢 JOB 2: quickcart-silver-layer-transforms
+    │
+    ▼
+    🕷️ CRAWLER B: crawl-silver-quickcart
+    │
+    ▼
+    🟢 JOB 3: quickcart-s3-to-redshift
+    │
+    ▼
+    🐍 JOB 4: quickcart-gold-layer-ctas  ← NEW (Python Shell)
+    
+    Total: 4 Jobs + 2 Crawlers = 6 steps
+    Time: ~50 minutes
+    Cost: ~$7.35/day → ~$220.50/month
+    (includes: Glue DPUs + Athena scans)</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ CTAS materializes query results as optimized Parquet tables in S3
+→ Analysts query small gold tables instead of scanning large silver tables
+→ Cost reduction: 92-98% on analyst query costs
+→ Speed improvement: 15-40x faster queries (0.3s vs 12s)
+→ CTAS requires DROP + DELETE S3 before re-creation (no IF NOT EXISTS)
+→ external_location gives you control over S3 path but requires manual cleanup
+→ INSERT INTO pattern for append-only historical tracking (daily snapshots)
+→ Python Shell jobs are perfect for lightweight CTAS orchestration ($0.022/run)
+→ CTAS limit: 100 partitions per statement — use Glue for larger outputs
+→ Gold layer completes the Medallion architecture: Bronze → Silver → Gold
+→ Only materialize queries with: high frequency + high scan + small output
+→ Break-even: after just 1 query, materialization has paid for itself
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 16: Athena basics (first query)
+→ Project 24: Athena on Glue Catalog (querying silver tables)
+→ Project 26: Partitioned Parquet (partition pruning concept)
+→ Project 34: Silver layer (source data for CTAS)
+→ Project 35: Glue Workflow (CTAS added as final step)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 37: Athena Views — saved SQL for convenience
+   (views complement CTAS: views for simple aliases, CTAS for performance)
+→ Project 38: Redshift Spectrum — query gold tables FROM Redshift
+   (Redshift queries gold S3 tables via Spectrum without loading)
+→ Project 44: Medallion Architecture formalized
+   (bronze/silver/gold — now complete, Project 44 documents patterns)
+→ Project 63: Redshift Materialized Views — auto-refresh inside Redshift
+   (alternative to CTAS when data already lives in Redshift)
+→ Project 69: Cost optimization — CTAS is a key cost reduction tool
+   (part of comprehensive cost optimization strategy)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a complete 3-layer data platform:
+</span>→ Bronze: raw MariaDB extracts (Project 31)
+→ Silver: clean, joined, aggregated (Project 34)
+→ Gold: materialized summaries for analysts (Project 36)
+
+Analysts love the gold tables — fast and cheap.
+But they still need ad-hoc flexibility.
+
+THEN: An analyst says:
+"The gold tables cover 80% of my queries.
+ But sometimes I need a slightly different cut:
+ - Revenue by category for JUST Q1 2025
+ - Customer segments for JUST the 'premium' tier
+ 
+ I don't want to create a new gold table for every variation.
+ Can I just save my SQL as a reusable 'template' that
+ queries the silver data on-demand?"
+
+CTO: "That's what Athena Views do.
+      No materialization — just saved SQL.
+      Always fresh, zero storage cost."
+
+→ Project 37: "Create Reusable Athena Views for Business Reporting"
+→ Introduces: Athena Views, Named Queries, Parameterized Workgroups,
+              View vs CTAS trade-offs, Cost Controls</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="29" ========== -->
+<div class="chat-message" data-index="29"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-35.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 36 of 80</span>
+    <span class="nav-project-title">MATERIALIZE HEAVY ATHENA QUERIES INTO OPTIMIZED TABLES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-37.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-37.html") window.location = "project-37.html";
+  if (e.key === 'ArrowLeft' && "project-35.html") window.location = "project-35.html";
+});
+</script>
+</body>
+</html>

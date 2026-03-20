@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 11: MODEL THE FIRST FACT &amp; DIMENSION TABLES IN REDSHIFT — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:14%"></div></div>
+<div id="progress-label">14%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 11 of 80</div>
+  <div class="project-title">MODEL THE FIRST FACT &amp; DIMENSION TABLES IN REDSHIFT</div>
+  <div class="project-tags"><span class="project-tag">Redshift</span><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Redshift cluster running (Project 10)
+</span>Situation:
+→ Basic analytics schema exists with fact_orders, dim_customers, dim_products
+→ Queries are fast — BUT the data modeling is NAIVE
+→ Problems emerging:
+
+PROBLEM 1 — ANALYST (Marketing):
+"A customer was 'silver' tier when they placed an order in January.
+ They upgraded to 'gold' in March. When I query January orders 
+ joined with dim_customers, it shows them as 'gold' — WRONG.
+ I need to know what tier they were AT THE TIME of the order."
+
+PROBLEM 2 — DATA ENGINEER:
+"Project 10 used multi-row INSERT to load data. That was for demo only.
+ Production needs COPY from S3. Our table structure must be 
+ COPY-compatible — proper data types, no AUTO_INCREMENT quirks,
+ flat CSV-friendly columns."
+
+PROBLEM 3 — BI DEVELOPER:
+"Dashboard queries join fact_orders → fact_order_items → dim_products
+ every single time. That's 3 JOINs for every chart. Can we 
+ PRE-JOIN some of this into a wider fact table?"
+
+PROBLEM 4 — DBA (You):
+"I need to PROVE our distribution keys aren't skewed.
+ I need to PROVE our sort keys are actually eliminating blocks.
+ I need to PROVE our column encodings are optimal.
+ The CTO wants numbers, not assumptions."
+
+PROBLEM 5 — CTO:
+"We're about to connect Glue (Project 31) and build CDC pipelines
+ (Project 42, 65). The warehouse schema must be DESIGNED for 
+ incremental loads — staging tables, merge patterns, audit columns.
+ Get this right BEFORE we build the pipelines."
+
+CORE CHALLENGE:
+→ Project 10 gave us a WORKING schema
+→ This project makes it a PROFESSIONAL data warehouse model
+→ Every design decision here affects Projects 21, 32, 38, 39, 42, 65</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Data Warehouse Modeling Fundamentals
+</span>
+  STAR SCHEMA (what we have from Project 10):
+  
+                    dim_dates
+                       │
+                       │
+  dim_customers ──── fact_orders ──── dim_products
+                       │
+                       │
+                  fact_order_items
+
+  → Central FACT tables: measurable events (orders, items)
+  → Surrounding DIMENSION tables: descriptive context (who, what, when)
+  → JOINs always go: fact → dimension (never dimension → dimension)
+
+Step 2: Identify what needs improvement
+  → Dimension tables: handle CHANGES over time (SCD)
+  → Fact tables: optimize for COPY loading from S3
+  → Pre-joined tables: denormalized wide fact for common queries
+  → Staging tables: landing zone for incremental loads
+  → Aggregate tables: pre-computed summaries for dashboards
+
+Step 3: Design for the ETL pipeline (future projects)
+  → COPY from S3 (Project 21): tables must accept flat CSV structure
+  → Glue writes to Redshift (Project 32): JDBC-compatible schema
+  → CDC merge (Project 65): staging + merge pattern
+  → Spectrum external tables (Project 38): compatible with Glue Catalog
+
+Step 4: Validate physical design
+  → Distribution: prove data is evenly spread across slices
+  → Sort keys: prove zone maps are eliminating blocks
+  → Encoding: prove compression is optimal
+  → These validations become routine in Project 39</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>ENHANCED WAREHOUSE ARCHITECTURE:
+</span>
+  quickcart_dw
+  │
+  ├── analytics schema (serving layer — analysts query here)
+  │    ├── dim_customers_scd2      ← SCD Type 2 (tracks history)
+  │    ├── dim_customers_current   ← VIEW: latest version only
+  │    ├── dim_products            ← SCD Type 1 (overwrite — from Project 10)
+  │    ├── dim_dates               ← Static (from Project 10)
+  │    ├── fact_orders             ← Redesigned for COPY loading
+  │    ├── fact_order_items        ← Redesigned for COPY loading
+  │    └── fact_orders_wide        ← Denormalized (pre-joined)
+  │
+  ├── staging schema (ETL landing zone — only ETL writes here)
+  │    ├── stg_customers           ← Raw from S3 COPY
+  │    ├── stg_products            ← Raw from S3 COPY
+  │    ├── stg_orders              ← Raw from S3 COPY
+  │    └── stg_order_items         ← Raw from S3 COPY
+  │
+  ├── audit schema (pipeline tracking)
+  │    ├── etl_job_log             ← Pipeline execution history
+  │    └── etl_row_counts          ← Row count verification
+  │
+  └── agg schema (pre-computed aggregates for dashboards)
+       ├── agg_daily_revenue       ← Daily revenue by status
+       └── agg_monthly_category    ← Monthly revenue by category</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: SCD Type 1 (Overwrite) for all dimensions
+</span>→ Simply UPDATE the dimension row when source changes
+→ Pros: simple, small table, easy to query
+→ Cons: LOSE history — can't answer "what was tier in January?"
+→ Use for: product name changes, typo corrections
+
+Option B: SCD Type 2 (Versioned Rows) for key dimensions
+→ Create NEW row for each change, mark old row as expired
+→ Pros: FULL history — "customer was silver on Jan 15"
+→ Cons: table grows larger, JOINs need effective_date filter
+→ Use for: customer tier, address, any analytically important attribute
+
+Option C: SCD Type 3 (Previous Value Column)
+→ Add "previous_tier" column alongside "current_tier"
+→ Pros: simple schema, no extra rows
+→ Cons: only tracks ONE previous value, not full history
+→ Use for: rarely changes, only need last value
+
+Option D: SCD Type 6 (Hybrid: 1 + 2 + 3)
+→ Versioned rows (Type 2) + current value column (Type 3)
+→ Pros: full history + easy access to current value
+→ Cons: complex to maintain
+
+DECISION:
+→ dim_customers: SCD Type 2 (tier changes are analytically critical)
+→ dim_products: SCD Type 1 (product name/price changes just overwrite)
+→ dim_dates: Static (dates don't change)</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. SCD Type 2 columns on customer dimension:
+</span>   → surrogate_key (BIGINT): unique per VERSION of customer
+   → customer_id (VARCHAR): natural business key
+   → effective_from (DATE): when this version became active
+   → effective_to (DATE): when this version expired (9999-12-31 = current)
+   → is_current (BOOLEAN): TRUE for latest version
+   → These enable point-in-time JOINs with fact tables
+
+2. Design fact tables for COPY compatibility:
+   → All columns nullable except surrogate keys
+   → DATE columns as DATE type (not VARCHAR)
+   → DECIMAL for money (not FLOAT — same as MariaDB, Project 9)
+   → No IDENTITY/AUTO_INCREMENT — generate IDs in ETL
+   → Column order matches CSV column order (COPY positional mapping)
+
+3. Create staging tables as EXACT copies of fact/dim structure:
+   → No constraints (staging accepts raw data, validation happens after)
+   → DISTSTYLE EVEN (no optimization needed for temp data)
+   → No SORTKEY (data will be replaced each load)
+   → TRUNCATE before each load (idempotent)
+
+4. Create denormalized wide fact table:
+   → Pre-join fact_orders + dim_customers + dim_products
+   → Redundant storage BUT eliminates 3-way JOINs in 90% of queries
+   → Refresh nightly after ETL completes
+
+5. Add audit columns to EVERY table:
+   → etl_loaded_at: when this row was loaded by ETL
+   → etl_batch_id: which batch loaded this row
+   → source_system: where the data came from
+   → These are CRITICAL for debugging pipeline issues
+
+6. Create aggregate tables for dashboard performance:
+   → agg_daily_revenue: pre-computed daily summaries
+   → Dashboards query aggregates (milliseconds) instead of fact tables (seconds)
+   → Refresh on schedule or after each ETL run
+
+7. Use ENCODE AUTO for initial setup:
+   → Redshift automatically selects best encoding per column
+   → After data is loaded: validate with ANALYZE COMPRESSION
+   → Override only if ANALYZE suggests better encoding</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use IDENTITY columns in fact tables
+</span>   → COPY from S3 can't auto-generate IDENTITY values easily
+   → Generate surrogate keys in ETL (hash or sequence)
+   → Exception: staging tables where IDs don't matter
+
+2. DO NOT put SCD Type 2 on EVERY dimension
+   → Each SCD2 dimension grows with every change
+   → More rows = more storage, slower JOINs
+   → Only SCD2 for analytically significant attributes
+   → Product name typo fix: SCD Type 1 (overwrite)
+
+3. DO NOT JOIN fact table directly to SCD2 dimension on natural key alone
+   → fact.customer_id = dim.customer_id returns MULTIPLE rows
+     (one per version of the customer)
+   → MUST add: AND fact.order_date BETWEEN dim.effective_from AND dim.effective_to
+   → OR: store surrogate_key in fact table (preferred)
+
+4. DO NOT create aggregates that are too specific
+   → agg_daily_revenue_by_status_by_city_by_tier = too granular
+   → Might as well query the fact table
+   → Good aggregates: daily by 1-2 dimensions, monthly by 2-3 dimensions
+
+5. DO NOT forget to TRUNCATE staging tables before each load
+   → If you don't: previous batch data PLUS new batch = duplicates
+   → Always: TRUNCATE → COPY → VALIDATE → MERGE → TRUNCATE
+
+6. DO NOT use TEXT or VARCHAR(MAX) in Redshift
+   → Redshift allocates memory for full declared width during queries
+   → VARCHAR(65535) for a 20-char column = massive memory waste
+   → Always size to actual max + reasonable buffer
+
+7. DO NOT skip the surrogate key in SCD2 dimensions
+   → Natural key (customer_id) is NOT unique in SCD2
+   → Need surrogate_key (auto-incrementing BIGINT) as true PK
+   → Fact table stores surrogate_key for point-in-time accuracy</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌───────────────────────────────┬──────────────────┬──────────────────────────────────────────┐
+</span>│ Scenario                      │ Use              │ Why                                      │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Attribute changes are         │ SCD Type 1       │ Overwrite: simple, no history needed     │
+│ corrections/irrelevant        │ (Overwrite)      │ e.g., fix product name typo              │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Need "what was value at       │ SCD Type 2       │ Version rows: full history preserved     │
+│ time of event?"               │ (Versioned)      │ e.g., customer tier at order time        │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Only need previous + current  │ SCD Type 3       │ Extra column: previous_tier, current_tier│
+│ value                         │ (Column)         │ Simple but limited history depth         │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Dashboard needs &lt; 1s response │ Aggregate Table  │ Pre-computed: no fact table scan         │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ 90% of queries JOIN same      │ Wide Fact Table  │ Pre-joined: eliminates runtime JOINs     │
+│ 3 tables                      │ (Denormalized)   │ Trade-off: more storage, faster reads    │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Raw data landing from S3      │ Staging Table    │ No constraints, TRUNCATE+COPY pattern    │
+│                               │                  │ Validated before merge to target         │
+├───────────────────────────────┼──────────────────┼──────────────────────────────────────────┤
+│ Pipeline audit &amp; debugging    │ Audit Table      │ Track: what loaded, when, how many rows  │
+│                               │                  │ Essential for production operations      │
+└───────────────────────────────┴──────────────────┴──────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use SCD Type 2 for high-frequency changes
+</span>   → Product inventory changes every hour → SCD2 = millions of versions
+   → Use: snapshot fact table (daily inventory snapshot) instead
+   → Or: SCD Type 1 + separate inventory_history fact table
+
+2. DO NOT use wide fact tables for ad-hoc exploratory queries
+   → Wide tables are designed for KNOWN query patterns
+   → Ad-hoc queries may need columns not in the wide table
+   → Use: normalized star schema for exploration, wide for dashboards
+
+3. DO NOT use aggregate tables if underlying data changes intraday
+   → Aggregates are stale until refreshed
+   → If orders arrive every minute: aggregate is immediately outdated
+   → Use: materialized views (Project 63) with auto-refresh instead
+
+4. DO NOT use staging tables for long-term storage
+   → Staging = temporary landing zone
+   → TRUNCATE before each load
+   → Never query staging from BI tools — always query analytics schema
+
+5. DO NOT create separate schemas for each business domain (yet)
+   → At QuickCart's scale: one analytics schema is fine
+   → At enterprise scale: data mesh with domain schemas (Project 71)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│            SCD TYPE 2 — INTERNAL MECHANICS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  SCENARIO: Customer CUST-000001 upgrades from silver → gold                 │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  BEFORE (January — customer is silver):                                     │
+│                                                                             │
+│  dim_customers_scd2:                                                        │
+│  ┌──────────┬─────────────┬────────┬────────────┬────────────┬───────────┐ │
+│  │ sk       │ customer_id │ tier   │ eff_from   │ eff_to     │ is_current│ │
+│  ├──────────┼─────────────┼────────┼────────────┼────────────┼───────────┤ │
+│  │ 1        │ CUST-000001 │ silver │ 2024-06-15 │ 9999-12-31 │ TRUE      │ │
+│  └──────────┴─────────────┴────────┴────────────┴────────────┴───────────┘ │
+│                                                                             │
+│  fact_orders (January order):                                               │
+│  ┌──────────────┬──────────────┬─────────────┬────────────┐                │
+│  │ order_id     │ customer_sk  │ amount      │ order_date │                │
+│  ├──────────────┼──────────────┼─────────────┼────────────┤                │
+│  │ ORD-JAN-001  │ 1            │ 250.00      │ 2025-01-15 │                │
+│  └──────────────┴──────────────┴─────────────┴────────────┘                │
+│  → customer_sk = 1 points to the "silver" version                          │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  MARCH: Customer upgrades to gold                                           │
+│  ETL PROCESS:                                                               │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Step 1: EXPIRE the old row                                                 │
+│  UPDATE dim_customers_scd2                                                  │
+│  SET effective_to = '2025-03-01',                                           │
+│      is_current = FALSE                                                     │
+│  WHERE customer_id = 'CUST-000001'                                          │
+│    AND is_current = TRUE;                                                   │
+│                                                                             │
+│  Step 2: INSERT new version                                                 │
+│  INSERT INTO dim_customers_scd2                                             │
+│  VALUES (2, 'CUST-000001', 'gold', '2025-03-01', '9999-12-31', TRUE);     │
+│                                                                             │
+│  AFTER (March — customer now has TWO versions):                             │
+│                                                                             │
+│  dim_customers_scd2:                                                        │
+│  ┌──────────┬─────────────┬────────┬────────────┬────────────┬───────────┐ │
+│  │ sk       │ customer_id │ tier   │ eff_from   │ eff_to     │ is_current│ │
+│  ├──────────┼─────────────┼────────┼────────────┼────────────┼───────────┤ │
+│  │ 1        │ CUST-000001 │ silver │ 2024-06-15 │ 2025-03-01 │ FALSE     │ │
+│  │ 2        │ CUST-000001 │ gold   │ 2025-03-01 │ 9999-12-31 │ TRUE      │ │
+│  └──────────┴─────────────┴────────┴────────────┴────────────┴───────────┘ │
+│                                                                             │
+│  NEW ORDER IN APRIL:                                                        │
+│  ┌──────────────┬──────────────┬─────────────┬────────────┐                │
+│  │ order_id     │ customer_sk  │ amount      │ order_date │                │
+│  ├──────────────┼──────────────┼─────────────┼────────────┤                │
+│  │ ORD-APR-001  │ 2            │ 500.00      │ 2025-04-10 │                │
+│  └──────────────┴──────────────┴─────────────┴────────────┘                │
+│  → customer_sk = 2 points to the "gold" version                            │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  QUERY: "What tier was customer at time of each order?"                     │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  METHOD A: Using surrogate key (BEST — O(1) lookup):                        │
+│  SELECT f.order_id, f.order_date, d.tier                                    │
+│  FROM fact_orders f                                                         │
+│  JOIN dim_customers_scd2 d ON f.customer_sk = d.surrogate_key;              │
+│  → ORD-JAN-001 → sk=1 → silver ✅                                          │
+│  → ORD-APR-001 → sk=2 → gold ✅                                            │
+│                                                                             │
+│  METHOD B: Using date range (when sk not in fact — slower):                 │
+│  SELECT f.order_id, f.order_date, d.tier                                    │
+│  FROM fact_orders f                                                         │
+│  JOIN dim_customers_scd2 d                                                  │
+│    ON f.customer_id = d.customer_id                                         │
+│   AND f.order_date &gt;= d.effective_from                                      │
+│   AND f.order_date &lt; d.effective_to;                                        │
+│  → Works but range JOIN is more expensive than equality JOIN                │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  ZONE MAP MECHANICS — HOW SORT KEYS SAVE I/O                               │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  fact_orders sorted by (order_date, status):                                │
+│                                                                             │
+│  ┌────────────────────────────────────────────────────┐                     │
+│  │ 1 MB Block 1:                                      │                     │
+│  │   Zone Map: order_date [2024-01-01, 2024-03-15]    │                     │
+│  │   Zone Map: status [cancelled, shipped]             │                     │
+│  │   Data: 100,000 rows                               │                     │
+│  ├────────────────────────────────────────────────────┤                     │
+│  │ 1 MB Block 2:                                      │                     │
+│  │   Zone Map: order_date [2024-03-16, 2024-06-30]    │                     │
+│  │   Zone Map: status [cancelled, shipped]             │                     │
+│  │   Data: 100,000 rows                               │                     │
+│  ├────────────────────────────────────────────────────┤                     │
+│  │ 1 MB Block 3:                                      │                     │
+│  │   Zone Map: order_date [2024-07-01, 2024-09-30]    │                     │
+│  │   Data: 100,000 rows                               │                     │
+│  ├────────────────────────────────────────────────────┤                     │
+│  │ 1 MB Block 4:                                      │                     │
+│  │   Zone Map: order_date [2024-10-01, 2024-12-31]    │                     │
+│  │   Data: 100,000 rows                               │                     │
+│  └────────────────────────────────────────────────────┘                     │
+│                                                                             │
+│  Query: WHERE order_date BETWEEN '2024-07-01' AND '2024-09-30'             │
+│  → Block 1: max date 2024-03-15 &lt; 2024-07-01 → SKIP ✅                    │
+│  → Block 2: max date 2024-06-30 &lt; 2024-07-01 → SKIP ✅                    │
+│  → Block 3: overlaps range → READ ⚡                                       │
+│  → Block 4: min date 2024-10-01 &gt; 2024-09-30 → SKIP ✅                    │
+│  Result: only 1 of 4 blocks read = 75% I/O eliminated                     │
+│                                                                             │
+│  WITHOUT sort key: dates scattered randomly across all blocks              │
+│  → Every block might contain July dates → must read ALL blocks             │
+│  → Zone maps useless → 0% elimination                                     │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  ENCODING MECHANICS — HOW COMPRESSION WORKS                                 │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  RAW (no encoding):                                                         │
+│  status: "completed" "completed" "pending" "completed" "shipped"            │
+│  → 9+9+7+9+7 = 41 bytes for 5 values                                      │
+│                                                                             │
+│  BYTEDICT encoding (dictionary):                                            │
+│  Dictionary: {0="cancelled", 1="completed", 2="pending",                   │
+│               3="refunded", 4="shipped"}                                    │
+│  Data: 1, 1, 2, 1, 4                                                       │
+│  → 5 bytes for 5 values (1 byte per entry)                                 │
+│  → 8x compression for this column                                          │
+│                                                                             │
+│  AZ64 encoding (Amazon proprietary for numbers):                            │
+│  total_amount: 99.99, 100.50, 99.00, 101.25, 98.75                         │
+│  → Stores small deltas between consecutive values                          │
+│  → Values close together = tiny deltas = high compression                  │
+│  → Sorted data = even better compression (sort key synergy!)               │
+│                                                                             │
+│  ZSTD encoding (general purpose):                                           │
+│  → Facebook's compression algorithm                                         │
+│  → Good for strings with moderate repetition                               │
+│  → Used when BYTEDICT dictionary would be too large (&gt;256 entries)         │
+│                                                                             │
+│  LZO encoding (legacy):                                                     │
+│  → Fast decompression                                                       │
+│  → Moderate compression ratio                                               │
+│  → Being replaced by ZSTD in modern Redshift                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "SCD2 JOIN returns duplicate rows"
+</span>→ Cause: fact.customer_id = dim.customer_id without date range filter
+→ Customer has 3 versions → each fact row joins to ALL 3 versions
+→ Fix: use surrogate_key in fact table OR add date range condition
+
+PITFALL 2: "Wide fact table is out of sync with dimension tables"
+→ Cause: dimension updated but wide fact not refreshed
+→ Customer tier changed yesterday, wide table still shows old tier
+→ Fix: rebuild wide table AFTER dimension load completes
+→ Use Glue Workflow or Step Functions to enforce order (Project 35, 55)
+
+PITFALL 3: "ANALYZE COMPRESSION suggests different encoding but can't change"
+→ Cause: Redshift doesn't allow ALTER COLUMN ENCODE on existing data
+→ Fix: CREATE new table with correct encoding → INSERT INTO...SELECT → rename
+→ This is called "deep copy" — standard Redshift practice
+
+PITFALL 4: "Staging table has duplicates after COPY"
+→ Cause: COPY ran twice (retry after timeout) without TRUNCATE first
+→ Fix: ALWAYS TRUNCATE staging before COPY — make loads idempotent
+→ Pattern: BEGIN; TRUNCATE stg_orders; COPY stg_orders FROM ...; COMMIT;
+
+PITFALL 5: "Sort key on order_date not working — queries still scan everything"
+→ Cause: data loaded out of order (random dates in each COPY batch)
+→ Zone maps have overlapping ranges → can't eliminate blocks
+→ Fix: VACUUM SORT ONLY fact_orders; (re-sorts physical blocks)
+→ Check: SELECT unsorted FROM svv_table_info WHERE tablename = 'fact_orders';
+→ unsorted &gt; 20% = need VACUUM
+
+PITFALL 6: "Surrogate key collision in SCD2"
+→ Cause: using hash of (customer_id + effective_from) as SK
+→ Two changes on same day = same hash = collision
+→ Fix: use monotonically increasing sequence or include timestamp
+→ Or: generate SK as ROW_NUMBER() OVER (ORDER BY ...) during ETL
+
+PITFALL 7: "Aggregate table has different totals than fact table"
+→ Cause: aggregate computed before ETL finished, or rounding differences
+→ Fix: always rebuild aggregates AFTER fact table load completes
+→ Add verification query: compare agg SUM vs fact SUM</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SCD TYPE 2 GROWTH:
+</span>→ 500 customers × 1 change/year = 500 new rows/year
+→ After 5 years: 500 + (500 × 5) = 3,000 rows
+→ Still tiny — DISTSTYLE ALL is fine
+→ RISK: if customer attributes change daily (e.g., loyalty points)
+   → SCD2 grows to 500 × 365 × 5 = 912,500 rows
+   → Still manageable but consider: is daily SCD2 really needed?
+
+WIDE FACT TABLE GROWTH:
+→ Same rows as fact_orders BUT wider (more columns per row)
+→ 100K orders × 20 columns vs 100K × 8 columns
+→ ~2.5x more storage than normalized fact
+→ Trade-off: 2.5x storage cost vs eliminating JOINs in 90% of queries
+→ At 1 billion rows: storage difference is significant — consider carefully
+
+AGGREGATE TABLE REFRESH:
+→ Daily refresh: runs once, query benefit all day
+→ Hourly refresh: more current but 24x compute cost
+→ Real-time: use materialized views (Project 63) instead
+→ At QuickCart scale: daily refresh is fine
+
+STAGING TABLE SIZING:
+→ Stage only ONE batch at a time
+→ TRUNCATE before each load — never accumulates
+→ Size = one day's data (worst case)
+→ QuickCart: ~200K orders/day × ~150 bytes/row = ~30 MB staging
+→ Trivial at any scale because it's always ONE batch
+
+FACT TABLE AT SCALE:
+→ 1 million rows: any design works
+→ 100 million rows: distribution key critical, sort key critical
+→ 1 billion rows: encoding saves terabytes, VACUUM takes hours
+→ 10 billion rows: consider partitioning (date-range tables) or Spectrum</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VALIDATE THE DATA MODEL:
+</span>
+1. SCD2 Validation:
+   → Every customer_id must have exactly ONE row where is_current = TRUE
+   → SELECT customer_id, COUNT(*) FROM dim_customers_scd2 
+     WHERE is_current = TRUE GROUP BY customer_id HAVING COUNT(*) != 1;
+   → Should return ZERO rows
+
+2. Surrogate Key Validation:
+   → Every fact_orders.customer_sk must exist in dim_customers_scd2.sk
+   → SELECT COUNT(*) FROM fact_orders f
+     LEFT JOIN dim_customers_scd2 d ON f.customer_sk = d.surrogate_key
+     WHERE d.surrogate_key IS NULL;
+   → Should return ZERO
+
+3. Distribution Validation:
+   → SELECT "table", skew_rows FROM svv_table_info WHERE "schema" = 'analytics';
+   → skew_rows &lt; 1.5 = good, &gt; 2.0 = problem
+
+4. Sort Key Validation:
+   → SELECT "table", unsorted, vacuum_sort_benefit
+     FROM svv_table_info WHERE "schema" = 'analytics';
+   → unsorted &lt; 20% = healthy, &gt; 40% = VACUUM needed
+
+5. Encoding Validation:
+   → ANALYZE COMPRESSION analytics.fact_orders;
+   → Shows current encoding vs recommended encoding per column
+   → If different: consider deep copy to apply optimal encoding
+
+6. Aggregate Validation:
+   → Compare aggregate totals with fact table totals
+   → SELECT SUM(revenue) FROM agg_daily_revenue 
+     WHERE date_key BETWEEN X AND Y;
+   → Must match: SELECT SUM(total_amount) FROM fact_orders
+     WHERE order_date BETWEEN X AND Y AND status = 'completed';</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(11)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Migration 1: SCD Type 2 Customer Dimension</h3>
+
+<h3>Migration 2: Redesigned Fact Tables (COPY-Ready)</h3>
+
+<h3>Migration 3: Staging, Wide Fact, Aggregates, Audit</h3>
+
+<h3>Step 4: Populate Wide Fact &amp; Aggregates</h3>
+
+<h3>Step 5: SCD Type 2 Merge Process</h3>
+
+<h3>Step 6: Physical Design Validation</h3>
+
+<h3>Step 7: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER (builds on Project 10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Prerequisites:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Redshift cluster running (Project 10)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → Basic schema + sample data loaded (Project 10)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Apply SCD2 customer dimension migration</span><span>
+</span><span>psql -h </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span>endpoint</span><span class="token" style="color: rgb(57, 58, 52);">&gt;</span><span> -p </span><span class="token" style="color: rgb(54, 172, 170);">5439</span><span> -U admin_user -d quickcart_dw </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span>    -f migrations/R001_scd2_customers.sql
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Apply redesigned fact tables migration</span><span>
+</span><span>psql -h </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span>endpoint</span><span class="token" style="color: rgb(57, 58, 52);">&gt;</span><span> -p </span><span class="token" style="color: rgb(54, 172, 170);">5439</span><span> -U admin_user -d quickcart_dw </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span>    -f migrations/R002_redesign_facts.sql
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Apply staging, wide fact, aggregates, audit</span><span>
+</span><span>psql -h </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span>endpoint</span><span class="token" style="color: rgb(57, 58, 52);">&gt;</span><span> -p </span><span class="token" style="color: rgb(54, 172, 170);">5439</span><span> -U admin_user -d quickcart_dw </span><span class="token" style="color: rgb(57, 58, 52);">\</span><span>
+</span>    -f migrations/R003_staging_wide_agg.sql
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Populate derived tables (wide fact + aggregates)</span><span>
+</span>python3 04_populate_derived_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Demonstrate SCD Type 2 merge process</span><span>
+</span>python3 05_scd2_merge.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Validate physical design (distribution, sort, encoding)</span><span>
+</span>python3 06_validate_physical_design.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED SCD2 OUTPUT:
+</span>
+================================================================
+🔄 SCD TYPE 2 MERGE DEMONSTRATION
+================================================================
+
+📋 BEFORE STATE:
+
+📜 VERSION HISTORY: CUST-000001
+   SK=1     | silver     | 2024-01-15 to 9999-12-31 | batch=MIGRATION-001 ◄ CURRENT
+
+📦 Simulating customer changes in staging...
+   ✅ 5 records in staging
+
+🔍 Identifying changes...
+   Change Type  Customer ID     Detail
+   --------------------------------------------------------
+   NEW          CUST-NEW-001    New customer → tier=bronze
+   NEW          CUST-NEW-002    New customer → tier=bronze
+   CHANGED      CUST-000001     Tier: silver → gold
+   CHANGED      CUST-000002     Name: Customer 2 → Customer 2 UPDATED
+   UNCHANGED    CUST-000003     No changes detected — will skip
+
+🔄 Applying SCD2 merge...
+   Step 1: Expired 2 old versions
+   Step 2: Inserted 2 new versions for changed customers
+   Step 3: Inserted 2 brand new customers
+
+📋 AFTER STATE:
+
+📜 VERSION HISTORY: CUST-000001
+   SK=1     | silver     | 2024-01-15 to 2025-07-15 | batch=MIGRATION-001
+   SK=501   | gold       | 2025-07-15 to 9999-12-31 | batch=SCD2-DEMO-... ◄ CURRENT
+
+✅ SCD2 MERGE COMPLETE
+   Expired:   2 old versions
+   Changed:   2 new versions
+   New:       2 first versions
+   Skipped:   1 unchanged
+   Integrity: ✅ PASSED</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ SCD TYPE 2: version dimension rows to preserve point-in-time history
+   → surrogate_key uniquely identifies each VERSION
+   → effective_from/to defines validity window
+   → is_current flag simplifies "latest version" queries
+   → Fact table stores surrogate_key for accurate historical JOINs
+
+→ STAGING PATTERN: TRUNCATE → COPY → VALIDATE → MERGE → TRUNCATE
+   → Staging tables: no constraints, DISTSTYLE EVEN
+   → Always idempotent: re-running produces same result
+
+→ WIDE FACT TABLE: denormalize for dashboard performance
+   → Pre-join eliminates 3-way JOINs in 90% of queries
+   → Trade-off: more storage, simpler queries, must rebuild after loads
+
+→ AGGREGATE TABLES: pre-compute for sub-second dashboards
+   → Daily/monthly summaries avoid scanning millions of rows
+   → Cross-validate: aggregate totals must match fact totals
+
+→ AUDIT TABLES: track every ETL execution
+   → etl_job_log: what ran, when, how many rows, success/failure
+   → etl_row_counts: source vs target count validation
+
+→ PHYSICAL DESIGN VALIDATION: prove, don't assume
+   → Distribution skew: svv_table_info.skew_rows &lt; 1.5
+   → Sort effectiveness: svv_table_info.unsorted &lt; 20%
+   → Encoding: ANALYZE COMPRESSION shows optimal vs current
+   → EXPLAIN: shows redistribution strategy (DS_DIST_ALL_NONE = good)
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): staging data arrives via COPY from S3
+→ Projects 8-9 (MariaDB): source of truth, same entity model
+→ Project 10 (Redshift basics): cluster, basic schema we extended here
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 12 (SNS): alert team when ETL completes or fails
+→ Project 21 (COPY): bulk load from S3 into these staging tables
+→ Project 32 (Glue → Redshift): Glue writes to these staging tables
+→ Project 39 (Optimization): deep-dive on dist/sort key tuning
+→ Project 42 (CDC): incremental extraction using watermarks
+→ Project 63 (Materialized Views): replace aggregate tables with auto-refresh
+→ Project 65 (Full CDC): complete pipeline using staging → merge pattern</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a production-grade data warehouse:
+</span>→ SCD2 customer dimension preserving history
+→ COPY-ready staging tables for bulk loading
+→ Denormalized wide fact for dashboard performance
+→ Aggregate tables for sub-second responses
+→ Audit logging for every ETL operation
+→ Validated physical design (distribution, sort, encoding)
+
+BUT the data team says:
+"Our ETL pipeline will run every night. Sometimes it fails.
+ Sometimes it succeeds. Either way, we need to KNOW immediately.
+ If we wake up and discover the pipeline failed 8 hours ago,
+ the entire morning's reports are stale."
+
+CTO: "We need automated notifications. When pipeline finishes: 
+ send success email. When it fails: page the on-call engineer."
+
+→ Project 12: "Alert the Team When a Pipeline Finishes"
+→ Introduces: Amazon SNS → Topics → Subscriptions → 
+   Email/SMS notifications → Publishing messages
+→ These alerts will be connected to every pipeline built afterward
+→ Foundation for monitoring (Project 54) and SLA tracking (Project 78)</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="21" ========== -->
+<div class="chat-message" data-index="21"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-10.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 11 of 80</span>
+    <span class="nav-project-title">MODEL THE FIRST FACT &amp; DIMENSION TABLES IN REDSHIFT</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-12.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-12.html") window.location = "project-12.html";
+  if (e.key === 'ArrowLeft' && "project-10.html") window.location = "project-10.html";
+});
+</script>
+</body>
+</html>

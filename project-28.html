@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 28: FILE LANDS IN S3 → ALERT SENT → JOB QUEUED → WORKER PROCESSE — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:35%"></div></div>
+<div id="progress-label">35%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 28 of 80</div>
+  <div class="project-title">FILE LANDS IN S3 → ALERT SENT → JOB QUEUED → WORKER PROCESSES</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🔵 Phase 2: Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — individual pipeline pieces now working
+</span>Situation:
+→ Project 17: S3 → SNS (alert on file arrival) ✅
+→ Project 18: S3 → SQS (queue on file arrival) ✅
+→ Project 27: SQS → EC2 worker (processes queue) ✅
+
+→ BUT these are separate, disconnected scripts
+→ Nobody has wired them into ONE end-to-end flow
+
+→ Real-world scenario:
+   - Partner "ShipFast" drops shipping_updates_YYYYMMDD.csv into S3
+   - Within 60 seconds:
+     1. Data engineering team gets EMAIL notification
+     2. File is QUEUED for processing
+     3. EC2 worker PICKS UP the file
+     4. Worker VALIDATES the CSV (schema, row count, data types)
+     5. Worker LOADS data into MariaDB staging table
+     6. Worker sends COMPLETION notification
+     7. If ANYTHING fails → DLQ → alert → manual investigation
+
+→ Currently: all these steps require manual triggers
+→ Goal: ZERO human intervention from file drop to data loaded
+
+CTO: "When ShipFast drops a file, I want to see it in our database
+      within 15 minutes. No human should touch anything.
+      If it fails, wake someone up."
+
+YOU: "S3 event → SNS fan-out → SQS queue → EC2 worker → MariaDB.
+      All automatic. All monitored. All recoverable."</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the COMPLETE event chain
+</span>→ S3 PutObject event fires when file lands
+→ S3 sends notification to SNS topic
+→ SNS fans out to:
+   a) Email subscription (team notification)
+   b) SQS queue (processing buffer)
+→ EC2 worker polls SQS (long polling — Project 27)
+→ Worker receives message → downloads file → processes → deletes message
+→ Worker sends success/failure notification via SNS
+
+Step 2: Understand WHY SNS sits between S3 and SQS
+→ S3 can send directly to SQS (Project 18)
+→ BUT: S3 event notification allows only ONE destination per event type per prefix
+→ With SNS in the middle: ONE S3 event → SNS → MULTIPLE consumers
+   a) SQS queue (for processing)
+   b) Email (for team awareness)
+   c) Lambda (for future use — Project 41)
+   d) Another SQS queue (for audit logging)
+→ This is the SNS → SQS FAN-OUT pattern (Project 14)
+
+Step 3: Map the data flow with error handling
+→ Happy path: file → notify → queue → process → load → done
+→ Bad file: file → notify → queue → process → VALIDATION FAIL → retry → DLQ
+→ Worker crash: file → notify → queue → process (crash) → timeout → retry
+→ S3 delete before processing: file → queue → process → 404 → skip
+→ Every failure mode must be handled gracefully
+
+Step 4: Design for observability
+→ Every step must be VISIBLE:
+   - S3 event: CloudTrail logs
+   - SNS delivery: CloudWatch metrics
+   - SQS message: queue depth metrics
+   - Worker: application logs + custom metrics
+   - MariaDB load: row count validation
+   - End-to-end: latency from S3 event to DB load</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE ARCHITECTURE:
+</span>
+  ShipFast Partner
+       │
+       │ Drops CSV file via S3 API or AWS CLI
+       ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  S3 BUCKET: quickcart-raw-data-prod                      │
+  │  Prefix: incoming/shipfast/                              │
+  │  File: shipping_updates_20250130.csv                     │
+  │                                                          │
+  │  S3 Event Notification:                                  │
+  │  → Trigger: s3:ObjectCreated:*                           │
+  │  → Filter: prefix=incoming/shipfast/, suffix=.csv        │
+  │  → Destination: SNS Topic                                │
+  └──────────────────────────────────────────────────────────┘
+       │
+       │ S3 Event Notification (automatic)
+       ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  SNS TOPIC: quickcart-incoming-file-events               │
+  │                                                          │
+  │  Subscriptions (fan-out):                                │
+  │   ├── 📧 Email: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="8aeeebfeeba7feefebe7cafbffe3e9e1e9ebf8fea4e9e5e7">[email&#160;protected]</a>                  │
+  │   │   → "New file arrived: shipping_updates_20250130.csv"│
+  │   │                                                      │
+  │   └── 📬 SQS: quickcart-file-processing-queue            │
+  │       → Message queued for worker processing             │
+  └──────────────────────────────────────────────────────────┘
+       │                              │
+       │ Email sent                   │ Message delivered
+       ▼                              ▼
+  ┌──────────────┐    ┌──────────────────────────────────────┐
+  │ 📧 TEAM      │    │  SQS QUEUE                           │
+  │ INBOX        │    │  (from Project 27)                   │
+  │              │    │                                      │
+  │ "File        │    │  Message: {S3 event wrapped in SNS}  │
+  │  arrived!"   │    │  Visibility: 300s                    │
+  │              │    │  DLQ: after 3 failures               │
+  └──────────────┘    └──────────────────────────────────────┘
+                                      │
+                                      │ EC2 long polling (20s)
+                                      ▼
+                      ┌──────────────────────────────────────┐
+                      │  EC2 WORKER                           │
+                      │                                      │
+                      │  1. Receive message from SQS          │
+                      │  2. Parse S3 event (unwrap SNS)       │
+                      │  3. Download CSV from S3              │
+                      │  4. Validate: schema, types, rows     │
+                      │  5. Load into MariaDB staging table   │
+                      │  6. Delete SQS message                │
+                      │  7. Send success notification         │
+                      │                                      │
+                      │  On failure:                          │
+                      │  → Don't delete message               │
+                      │  → Retry via visibility timeout       │
+                      │  → After 3 failures → DLQ             │
+                      │  → DLQ alarm → SNS → pager           │
+                      └──────────────────────────────────────┘
+                                      │
+                                      │ pymysql INSERT
+                                      ▼
+                      ┌──────────────────────────────────────┐
+                      │  MARIADB (on EC2 — Project 8, 9)     │
+                      │                                      │
+                      │  Table: staging.shipfast_updates      │
+                      │  → tracking_id, order_id, status,     │
+                      │    shipped_date, carrier, updated_at  │
+                      └──────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: S3 → SQS → EC2 (direct, no SNS)
+</span>→ Simpler: one fewer service
+→ BUT: no email notification
+→ BUT: can't add more consumers later without reconfiguring S3
+→ REJECTED for production (not extensible)
+
+Option B: S3 → SNS → SQS → EC2 (recommended)
+→ SNS enables fan-out: email + SQS + future Lambda
+→ Adding consumers = adding SNS subscription (no S3 changes)
+→ S3 configured once → never touched again
+→ SELECTED ✅
+
+Option C: S3 → EventBridge → Step Functions → EC2
+→ More sophisticated orchestration
+→ Overkill for single-file processing
+→ Better for: multi-step workflows (Project 41, 55, 66)
+
+Option D: S3 → Lambda → MariaDB
+→ Serverless — no EC2 management
+→ BUT: Lambda 15-min timeout limits large file processing
+→ BUT: Lambda → MariaDB requires VPC configuration
+→ Good for small files — not for production flexibility
+
+DECISION: Option B — S3 → SNS → SQS → EC2
+→ Extensible fan-out pattern
+→ Reliable with DLQ
+→ EC2 handles large files and long processing
+→ Combines all pieces from Projects 17, 18, 27</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Configure S3 event notification to SNS (not directly to SQS)
+</span>   → SNS enables fan-out: multiple consumers from one event
+   → Adding email/Lambda/second queue = just add subscription
+   → No need to reconfigure S3 ever again
+
+2. Use prefix AND suffix filters on S3 notification
+   → Prefix: incoming/shipfast/ (only ShipFast files)
+   → Suffix: .csv (only CSV files, ignore .tmp or .metadata)
+   → Prevents: processing temp files, checkpoint files, folders
+
+3. Handle SNS-wrapped messages in worker
+   → S3 → SNS → SQS: message body is SNS envelope containing S3 event
+   → Different from S3 → SQS direct (plain S3 event)
+   → Worker must unwrap SNS layer first (coded in Project 27)
+
+4. Validate file BEFORE loading into database
+   → Check: file exists in S3 (may have been deleted)
+   → Check: file size &gt; 0 (empty file = source error)
+   → Check: CSV header matches expected schema
+   → Check: row count &gt; 0
+   → Check: data types valid (no strings in numeric columns)
+   → REJECT invalid files → send to DLQ → alert
+
+5. Use staging table in MariaDB (not production table directly)
+   → Load into staging.shipfast_updates first
+   → Validate data in staging
+   → Then merge into production table
+   → If staging load fails: production untouched
+
+6. Track processing state for idempotency
+   → Before processing: check "have I already processed this file?"
+   → Track in: MariaDB table (processed_files) or S3 marker
+   → If already processed: delete SQS message, skip
+
+7. Send completion notification with metrics
+   → "File processed: shipping_updates_20250130.csv"
+   → Rows loaded: 5,432
+   → Processing time: 8.3 seconds
+   → Latency from S3 arrival: 47 seconds</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT configure S3 events to SQS directly in this pattern
+</span>   → Loses fan-out capability
+   → Can't add email or Lambda without reconfiguring S3
+   → S3 → SNS → SQS gives same reliability + extensibility
+
+2. DO NOT process files without validation
+   → Partner sends corrupted file → loads garbage into MariaDB
+   → Always validate BEFORE loading
+   → Reject early, fail loud
+
+3. DO NOT load directly into production tables
+   → Bad data in production = broken dashboards, wrong reports
+   → ALWAYS: S3 → staging → validate → production
+   → Staging is your safety net
+
+4. DO NOT ignore the SNS wrapper in SQS messages
+   → S3 → SNS → SQS wraps the event in SNS envelope
+   → Parsing raw body as S3 event → JSON parse error
+   → Worker must detect and unwrap SNS layer (Project 27 handles this)
+
+5. DO NOT hardcode partner-specific logic in the worker
+   → Today: ShipFast
+   → Tomorrow: 3 more partners with different schemas
+   → Design worker to: read config per partner, apply correct schema
+   → Configuration-driven, not code-driven
+
+6. DO NOT skip the end-to-end test
+   → Unit testing individual pieces is not enough
+   → Must test: drop file in S3 → verify it appears in MariaDB
+   → Automated integration test catches: permission issues, 
+     format mismatches, network problems</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬───────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Pattern           │ Why                              │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ File arrival → process +         │ S3→SNS→SQS→EC2   │ Fan-out + reliable + extensible  │
+│ notify (this project)            │                   │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ File arrival → single consumer   │ S3→SQS→EC2       │ Simpler, no fan-out needed       │
+│ only                             │ (Project 18+27)   │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ File arrival → complex           │ S3→EventBridge→   │ Multi-step orchestration         │
+│ multi-step workflow              │ Step Functions     │ (Project 41, 55)                 │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ File arrival → lightweight       │ S3→SQS→Lambda     │ Serverless, auto-scale           │
+│ processing (&lt; 15 min)            │                   │                                  │
+├──────────────────────────────────┼───────────────────┼──────────────────────────────────┤
+│ File arrival → Redshift COPY     │ S3→SQS→EC2→COPY   │ Project 30 pattern               │
+│                                  │                   │                                  │
+└──────────────────────────────────┴───────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE THIS PATTERN</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When processing must happen in &lt; 1 second
+</span>   → S3 event → SNS → SQS → EC2 poll adds 1-25 seconds latency
+   → Use: S3 → Lambda (direct invocation, ~100ms)
+   → Or: API Gateway → Lambda for synchronous processing
+
+2. When file arrives via API (not S3 drop)
+   → S3 events only fire on S3 operations
+   → Use: API Gateway → SQS → EC2 for API-driven workflows
+
+3. When you need exactly-once processing guarantee
+   → SNS → SQS Standard may deliver duplicate messages
+   → Use: SQS FIFO + deduplication
+   → Or: implement idempotency in worker (recommended)
+
+4. When there are 50+ different file types with different schemas
+   → Single worker handling all types becomes complex
+   → Use: SNS → multiple SQS queues (filter by file type)
+   → Each queue has specialized worker (Project 51)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│           END-TO-END EVENT FLOW — INTERNAL TIMING                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  T=0.000s  ShipFast uploads file via: aws s3 cp file.csv s3://bucket/...   │
+│                                                                             │
+│  T=0.100s  S3 receives bytes, replicates across 3 AZs                      │
+│            S3 returns HTTP 200 to uploader                                  │
+│                                                                             │
+│  T=0.200s  S3 Event Notification system detects ObjectCreated event         │
+│            Checks notification configuration for matching rules             │
+│            Match: prefix=incoming/shipfast/, suffix=.csv ✅                 │
+│                                                                             │
+│  T=0.500s  S3 sends event to SNS topic via internal AWS networking          │
+│            Event payload: bucket, key, size, event type, timestamp          │
+│                                                                             │
+│  T=0.600s  SNS receives event, looks up subscriptions:                      │
+│            1. Email: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="3f5b5e4b5e124b5a5e527f4e4a565c545c5e4d4b115c5052">[email&#160;protected]</a>                                │
+│            2. SQS: quickcart-file-processing-queue                          │
+│                                                                             │
+│  T=0.700s  SNS delivers to SQS (internal, &lt; 100ms)                         │
+│            SNS wraps S3 event in SNS envelope:                              │
+│            {                                                                │
+│              "Type": "Notification",                                        │
+│              "MessageId": "sns-msg-id",                                     │
+│              "TopicArn": "arn:aws:sns:...",                                  │
+│              "Subject": "Amazon S3 Notification",                           │
+│              "Message": "{\"Records\":[{\"s3\":{...}}]}",  ← S3 event      │
+│              "Timestamp": "2025-01-30T10:00:00.700Z"                        │
+│            }                                                                │
+│                                                                             │
+│  T=0.800s  SNS delivers to SES (email) — async, may take 1-30 seconds      │
+│                                                                             │
+│  T=0.700s  SQS message now VISIBLE in queue                                │
+│            Waiting for consumer to pick it up                               │
+│                                                                             │
+│  T=1.000s  EC2 worker's long poll returns with the message                  │
+│  to         (If worker was mid-poll, message delivered instantly)            │
+│  T=20.00s  (If worker just started new poll, waits up to 20s)               │
+│                                                                             │
+│  TYPICAL: T=2-5 seconds from S3 upload to worker receiving message          │
+│                                                                             │
+│  T=5.000s  Worker parses message:                                           │
+│            1. Detect SNS wrapper → unwrap                                   │
+│            2. Extract S3 event → get bucket, key, size                      │
+│            3. URL-decode the key                                            │
+│                                                                             │
+│  T=5.100s  Worker validates file:                                           │
+│            1. head_object → confirm file exists                             │
+│            2. Check size &gt; 0                                                │
+│            3. Check idempotency → not already processed                     │
+│                                                                             │
+│  T=5.500s  Worker downloads file from S3                                    │
+│            500 KB file → ~0.3 seconds                                       │
+│                                                                             │
+│  T=6.000s  Worker validates CSV:                                            │
+│            1. Open file, read header                                        │
+│            2. Verify expected columns present                               │
+│            3. Sample first 100 rows for type validation                     │
+│            4. Count total rows                                              │
+│                                                                             │
+│  T=6.500s  Worker loads into MariaDB staging table:                         │
+│            1. TRUNCATE staging table                                        │
+│            2. Batch INSERT (1000 rows at a time)                            │
+│            3. 5,432 rows × batch → ~2 seconds                              │
+│                                                                             │
+│  T=8.500s  Worker validates load:                                           │
+│            1. SELECT COUNT(*) FROM staging → matches file row count?        │
+│            2. SELECT SUM(amount) → reasonable?                              │
+│                                                                             │
+│  T=9.000s  Worker deletes SQS message (acknowledgment)                     │
+│            Message permanently removed from queue                           │
+│                                                                             │
+│  T=9.100s  Worker records in processed_files table:                         │
+│            (file_key, rows_loaded, processing_time, timestamp)              │
+│                                                                             │
+│  T=9.200s  Worker sends completion SNS notification:                        │
+│            "✅ Processed: shipping_updates_20250130.csv                      │
+│             Rows: 5,432 | Time: 4.2s | Latency: 9.2s"                      │
+│                                                                             │
+│  TOTAL END-TO-END: ~9 seconds (file upload to data in MariaDB)              │
+│  Well within 15-minute SLA                                                  │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │  FAILURE SCENARIOS:                                             │        │
+│  │                                                                 │        │
+│  │  SCENARIO A: Bad CSV format                                     │        │
+│  │  T=6.0s: Worker detects wrong column count                      │        │
+│  │  T=6.1s: Worker logs error, does NOT delete message             │        │
+│  │  T=306s: Visibility timeout expires → message visible           │        │
+│  │  T=310s: Worker picks up SAME message → retries → fails again   │        │
+│  │  T=616s: Third attempt → fails → message moved to DLQ           │        │
+│  │  T=617s: CloudWatch alarm on DLQ → SNS → email alert            │        │
+│  │                                                                 │        │
+│  │  SCENARIO B: Worker crashes mid-processing                      │        │
+│  │  T=7.0s: Worker crashes (OOM, exception, EC2 terminated)        │        │
+│  │  T=307s: Visibility timeout expires → message visible           │        │
+│  │  T=310s: Worker (restarted) picks up message → retries          │        │
+│  │  T=319s: Processing succeeds → message deleted ✅               │        │
+│  │                                                                 │        │
+│  │  SCENARIO C: MariaDB down                                       │        │
+│  │  T=6.5s: pymysql.connect() fails → ConnectionRefusedError      │        │
+│  │  T=6.6s: Worker logs error, does NOT delete message             │        │
+│  │  T=306s: Retry → MariaDB still down → fail                     │        │
+│  │  T=616s: Third retry → still down → DLQ                        │        │
+│  │  T=617s: Alert: "MariaDB unreachable" → ops team investigates  │        │
+│  │  After fix: manually reprocess DLQ messages                     │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "S3 event notification not firing"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause A: notification not configured on the correct prefix
+→ Cause B: SNS topic policy doesn't allow S3 to publish
+→ Cause C: file uploaded to wrong prefix (incoming/ vs incoming/shipfast/)
+→ Debug: upload test file → check SNS delivery metrics in CloudWatch
+→ Fix: verify S3 notification config + SNS topic policy
+
+PITFALL 2: "SNS delivers to email but NOT to SQS"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: SQS queue policy doesn't allow SNS to send messages
+→ The SQS queue needs explicit policy: Allow SNS topic to SendMessage
+→ Debug: SNS delivery status logs (if enabled)
+→ Fix: update SQS queue policy (coded in this project)
+
+PITFALL 3: "Worker receives message but can't parse S3 event"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: S3 → SNS → SQS wraps event in TWO layers
+→ SQS message body = SNS envelope → inside = S3 event JSON
+→ Worker from Project 27 handles this (parse_s3_event function)
+→ ALWAYS log raw message body on parse failure for debugging
+
+PITFALL 4: "File processed twice after worker restart"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: worker processed file but crashed before delete_message
+→ Message reappears → processed again → duplicate data in MariaDB
+→ Fix: idempotency check before processing
+→ Check: SELECT COUNT(*) FROM processed_files WHERE file_key = ?
+→ If exists: skip processing, just delete the message
+
+PITFALL 5: "S3 event fires for .tmp files during multipart upload"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: some upload tools create temp files then rename
+→ S3 fires event for EVERY object creation
+→ Worker receives .tmp file → processing fails → clogs DLQ
+→ Fix: suffix filter in S3 notification (suffix=.csv)
+→ Also: worker validates file extension before processing
+
+PITFALL 6: "Email notifications arrive but processing doesn't start"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: SNS delivers to email (works) but SQS delivery fails (silently)
+→ Email subscription and SQS subscription are INDEPENDENT
+→ One can succeed while other fails
+→ Debug: check SQS queue depth — if 0 after file drop, SQS didn't receive
+→ Fix: verify SQS subscription is confirmed + queue policy allows SNS</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>THROUGHPUT:
+</span>━━━━━━━━━━
+→ 1 file/day:   single worker, trivial
+→ 10 files/day:  single worker, still trivial
+→ 100 files/day: single worker handles if processing &lt; 1 min each
+→ 1000 files/day: consider multiple workers or Lambda
+→ 10,000 files/day: auto-scaling EC2 fleet (Project 52)
+
+LATENCY:
+━━━━━━━━
+→ S3 → SNS: &lt; 1 second
+→ SNS → SQS: &lt; 100 ms
+→ SQS → EC2 (long poll): 0-20 seconds
+→ Processing: depends on file size and target
+→ End-to-end typical: 5-30 seconds
+
+MULTIPLE PARTNERS:
+━━━━━━━━━━━━━━━━━━
+→ Today: ShipFast only
+→ Tomorrow: 5 partners, each with different:
+   - S3 prefix (incoming/partner_a/, incoming/partner_b/)
+   - CSV schema
+   - Target table
+   - Validation rules
+→ Solution: config-driven worker that reads partner settings
+→ One queue for all partners OR separate queues per partner
+→ Separate queues: easier to monitor per-partner SLA
+→ Single queue: simpler infrastructure
+→ Start with single queue → split when SLA requirements diverge
+
+COST:
+━━━━━
+→ SNS: $0.50 per million notifications (free tier: 1M)
+→ SQS: $0.40 per million requests (free tier: 1M)
+→ EC2 t3.small: ~$15/month (always-on worker)
+→ S3 events: free (part of S3)
+→ Total pipeline cost: ~$15-20/month for moderate volume</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(28)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create SNS Topic with S3 Permission</h3>
+
+<h3>Step 2: Configure S3 Event Notification</h3>
+
+<h3>Step 3: Enhanced Worker with MariaDB Loading</h3>
+
+<h3>Step 4: MariaDB Setup (Staging Table + Tracking Table)</h3>
+
+<h3>Step 5: End-to-End Test Script</h3>
+
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED OUTPUT:
+</span>
+============================================================
+🧪 END-TO-END PIPELINE TEST
+   Time: 2025-01-30 10:15:23
+============================================================
+
+============================================================
+🏥 PIPELINE HEALTH CHECK
+============================================================
+   ✅ S3 Event Notification: configured
+   ✅ SNS Topic: exists (2 subscriptions)
+   ✅ SQS Queue: exists (visible: 0, in-flight: 0)
+   ✅ MariaDB: connected, staging table exists
+
+   🎉 All components healthy!
+
+────────────────────────────────────────────────────────────
+✅ Test CSV generated: /tmp/test_shipfast_update.csv (100 rows)
+✅ Uploaded to: s3://quickcart-raw-data-prod/incoming/shipfast/shipping_updates_20250130_101523.csv
+
+⏳ Waiting for pipeline to process file...
+   Checking every 5 seconds (timeout: 120s)
+   ⏳ 5.2s elapsed — staging has 0 rows...
+   ⏳ 10.4s elapsed — staging has 0 rows...
+
+✅ FILE PROCESSED!
+   Rows loaded:      100
+   Processing time:  3.42s
+   Processed at:     2025-01-30 10:15:37
+   End-to-end wait:  14.3s
+
+📊 STAGING TABLE VERIFICATION
+============================================================
+
+   Total rows: 100
+
+   📦 Status Distribution:
+      in_transit          24 (24.0%)
+      shipped             22 (22.0%)
+      delivered           21 (21.0%)
+      delayed             18 (18.0%)
+      returned            15 (15.0%)
+
+   🚚 Carrier Distribution:
+      FedEx               23 (23.0%)
+      UPS                 22 (22.0%)
+      USPS                20 (20.0%)
+      DHL                 19 (19.0%)
+      OnTrac              16 (16.0%)
+
+   📋 Sample Rows:
+      Tracking                     Order                     Status       Date         Carrier
+      ──────────────────────────── ───────────────────────── ──────────── ──────────── ──────────
+      TRK-20250130-000001          ORD-20250115-042871       shipped      2025-01-28   FedEx
+      TRK-20250130-000002          ORD-20250123-198432       in_transit   2025-01-29   UPS
+      TRK-20250130-000003          ORD-20250108-005219       delivered    2025-01-25   USPS
+      TRK-20250130-000004          ORD-20250127-341876       delayed      2025-01-30   DHL
+      TRK-20250130-000005          ORD-20250119-087654       shipped      2025-01-27   OnTrac
+
+============================================================
+🎉 END-TO-END TEST PASSED!
+   File dropped in S3 → processed → loaded into MariaDB
+   Pipeline is working correctly
+============================================================</code></pre></div>
+<h3>Step 6: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># --- COMPLETE EXECUTION ORDER ---</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># PREREQUISITES:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → S3 bucket exists (Project 1)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → EC2 with IAM role (Project 5, 6)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → MariaDB running (Project 8, 9)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS topic basics (Project 12)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SQS queue basics (Project 13)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SNS → SQS fan-out (Project 14)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → SQS queue + DLQ created (Project 27)</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Create SNS topic with S3 permission + SQS subscription</span><span>
+</span>python 01_create_sns_topic.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Confirm email subscription in inbox</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Configure S3 event notification → SNS</span><span>
+</span>python 02_configure_s3_events.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Set up MariaDB staging tables</span><span>
+</span><span>mysql -u root </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span> 04_mariadb_setup.sql
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Start the enhanced worker (runs continuously)</span><span>
+</span><span>python 03_enhanced_worker.py </span><span class="token" style="color: rgb(57, 58, 52);">&amp;</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Runs in background, polls SQS</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run end-to-end test</span><span>
+</span>python 05_end_to_end_test.py
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Uploads file → verifies it appears in MariaDB</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Monitor pipeline</span><span>
+</span><span>python </span><span class="token" style="color: rgb(57, 58, 52);">..</span><span>/project_27/04_monitor_queue.py
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;">#    → Check queue depth and DLQ</span></code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 → SNS → SQS → EC2 is the foundational event-driven pipeline
+→ SNS fan-out enables: email + SQS + Lambda from ONE S3 event
+→ S3 configured ONCE → add consumers by adding SNS subscriptions
+→ SNS wraps S3 event in envelope → worker must unwrap before parsing
+→ Staging table pattern: load → validate → merge (never direct to production)
+→ Idempotency table (processed_files) prevents duplicate processing
+→ CSV validation BEFORE database load catches bad data early
+→ End-to-end test proves ALL components work together (not just individually)
+→ Completion notification closes the loop (team knows it worked)
+→ Health check script diagnoses which component is broken
+
+THIS IS THE FIRST TRUE END-TO-END PIPELINE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Event-driven (not scheduled)
+→ Zero human intervention
+→ Self-healing (retry + DLQ)
+→ Observable (metrics + notifications)
+→ Testable (automated integration test)
+
+THE PIPELINE CHAIN:
+━━━━━━━━━━━━━━━━━━
+  S3 (file lands)
+   ↓ S3 Event Notification
+  SNS (fan-out)
+   ├→ Email (team notification)
+   └→ SQS (processing buffer)
+       ↓ EC2 Long Polling
+      Worker
+       ├→ Download from S3
+       ├→ Validate CSV
+       ├→ Load MariaDB staging
+       ├→ Delete SQS message
+       └→ Send completion notification
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1:  S3 bucket where files land
+→ Project 5:  EC2 instance where worker runs
+→ Project 8:  MariaDB where data loads
+→ Project 9:  MariaDB schema design (staging table)
+→ Project 12: SNS notification mechanism
+→ Project 13: SQS queue fundamentals
+→ Project 14: SNS → SQS fan-out pattern
+→ Project 17: S3 → SNS event notification
+→ Project 18: S3 → SQS event notification
+→ Project 27: EC2 worker polling SQS
+
+CONNECTION TO NEXT PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 29: Scheduled MariaDB → S3 export (cron-based, not event-driven)
+→ Project 30: Same pattern but worker triggers Redshift COPY instead of MariaDB
+→ Project 50: DLQ monitoring and reprocessing (deep dive)
+→ Project 51: Route different message types to different queues
+→ Project 52: Auto-scale EC2 workers based on queue depth</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has:
+</span>→ Event-driven pipeline: S3 → SNS → SQS → EC2 → MariaDB ✅
+→ Real-time processing of partner file drops ✅
+→ Self-healing with retry + DLQ ✅
+
+BUT: not everything should be event-driven
+
+The MariaDB database has accumulated valuable data:
+→ 18 months of orders, customers, products
+→ ShipFast shipping updates (just added)
+→ Internal analytics team wants NIGHTLY snapshots in S3
+
+Why S3 snapshots?
+→ Athena can query them (Project 24)
+→ Glue can transform them (Project 25)
+→ Redshift can COPY them (Project 21)
+→ S3 is the "hub" — MariaDB is just one "spoke"
+
+BUT: this is a SCHEDULED job, not event-driven
+→ Run every night at 2 AM
+→ Export tables to CSV
+→ Upload to S3 with date-stamped paths
+→ This is the OPPOSITE direction: database → S3 (not S3 → database)
+
+CTO: "We have Project 20 (MariaDB → S3 manual export).
+      But it's a one-off script. We need it to run automatically
+      every night without anyone touching it."
+
+YOU: "Cron job on EC2. Same Python script from Project 20,
+      wrapped in scheduling, logging, and error handling.
+      If it fails at 2 AM, we get an SNS alert."
+
+→ Project 29: "Scheduled MariaDB Export to S3 Every Night at 2 AM"
+→ Introduces: EC2 Cron → Python Script → Timestamped S3 Keys → Logging
+→ Builds on: Project 20 (manual export) + Project 12 (SNS alerts)</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="35" ========== -->
+<div class="chat-message" data-index="35"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-27.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 28 of 80</span>
+    <span class="nav-project-title">FILE LANDS IN S3 → ALERT SENT → JOB QUEUED → WORKER PROCESSES</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-29.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-29.html") window.location = "project-29.html";
+  if (e.key === 'ArrowLeft' && "project-27.html") window.location = "project-27.html";
+});
+</script>
+</body>
+</html>

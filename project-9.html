@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 9: BUILD THE FIRST SCHEMA FOR AN E-COMMERCE APP — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:11%"></div></div>
+<div id="progress-label">11%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 9 of 80</div>
+  <div class="project-title">BUILD THE FIRST SCHEMA FOR AN E-COMMERCE APP</div>
+  <div class="project-tags"><span class="project-tag phase">🟢 Phase 1: Very Easy</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — now handling real traffic
+</span>Situation:
+→ Project 8 gave us MariaDB with 4 tables + sample data
+→ Now the app team is ACTUALLY building features against this database
+→ Problems surfacing daily:
+
+PROBLEM 1 — APP DEVELOPER:
+"I'm inserting an order but sometimes it fails halfway —
+ the order header gets created but order_items don't.
+ Customer sees an empty order. How do I make it all-or-nothing?"
+
+PROBLEM 2 — CUSTOMER SUPPORT:
+"When I search orders by date range + status, it takes 8 seconds.
+ Same query on 'order_id' takes 1 ms. Why the difference?"
+
+PROBLEM 3 — DATA TEAM:
+"We need to bulk-load 500,000 historical orders from a CSV migration.
+ Inserting one row at a time takes 4 hours. Is there a faster way?"
+
+PROBLEM 4 — PRODUCT MANAGER:
+"We need new tables: order_status_history (track every status change),
+ customer_addresses (multiple addresses per customer),
+ and product_reviews. How do we design these correctly?"
+
+PROBLEM 5 — CTO:
+"Our database is the source of truth. If we design it wrong now,
+ every downstream system (S3 exports, Redshift, Glue) inherits 
+ the mess. Get the schema RIGHT."
+
+CORE CHALLENGE:
+→ Project 8 gave us a BASIC schema
+→ This project makes it PRODUCTION-GRADE
+→ Every decision here ripples into Projects 19, 20, 31, 42, 65, 79</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand the 5 pillars of production schema design
+</span>→ Normalization: eliminate redundancy (but know when to denormalize)
+→ Indexing: speed up reads without killing writes
+→ Constraints: enforce data integrity at database level
+→ Transactions: guarantee all-or-nothing operations
+→ Bulk operations: handle large data volumes efficiently
+
+Step 2: Map each problem to its pillar
+→ Problem 1 (half-written orders)    → Transactions
+→ Problem 2 (slow date+status query) → Indexing
+→ Problem 3 (slow bulk load)         → Bulk operations
+→ Problem 4 (new tables)             → Schema design + normalization
+→ Problem 5 (source of truth)        → Constraints + audit columns
+
+Step 3: Build incrementally
+→ Extend Project 8 schema (don't recreate)
+→ Add new tables that connect to existing ones
+→ Add indexes based on actual query patterns
+→ Demonstrate transactions with real failure scenarios
+→ Show bulk load techniques with timing comparisons
+
+Step 4: Think about downstream consumers
+→ Every table we design here will be:
+   → Exported to S3 as CSV (Project 20)
+   → Read by Glue via JDBC (Project 31)
+   → CDC-tracked for incremental loads (Project 42)
+   → Migrated to Redshift star schema (Project 65)
+→ Design choices NOW affect ALL those projects</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXTENDED SCHEMA ARCHITECTURE:
+</span>
+  quickcart_db (from Project 8)
+  │
+  ├── customers              ← EXISTS (Project 8)
+  │    └── customer_addresses ← NEW (1:many)
+  │
+  ├── products               ← EXISTS (Project 8)
+  │    └── product_reviews    ← NEW (1:many)
+  │
+  ├── orders                 ← EXISTS (Project 8) — add indexes
+  │    ├── order_items        ← EXISTS (Project 8)
+  │    └── order_status_history ← NEW (audit trail)
+  │
+  └── _etl_watermarks        ← NEW (CDC tracking — used in Project 42)
+
+  KEY ADDITIONS:
+  ─────────────
+  1. New tables with proper FK relationships
+  2. Composite indexes based on real query patterns
+  3. Covering indexes for high-frequency queries
+  4. Audit columns (created_at, updated_at) on EVERY table
+  5. ETL watermark table for change tracking
+  6. Transaction patterns for multi-table operations
+  7. Bulk load techniques with benchmarks</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Add everything in one giant migration script
+</span>→ Pros: one-shot, simple to run
+→ Cons: can't partially rollback, hard to debug
+
+Option B: Incremental migration scripts (numbered)
+→ Pros: each migration is atomic, reversible, auditable
+→ Cons: more files to manage
+→ THIS IS INDUSTRY STANDARD — used by Flyway, Liquibase, Alembic
+
+Option C: Use an ORM (SQLAlchemy) to define schema
+→ Pros: Python-native, version-controlled
+→ Cons: hides SQL mechanics, interview wants raw SQL knowledge
+
+DECISION: Option B — numbered migration scripts
+→ Each script does ONE thing
+→ Idempotent where possible (IF NOT EXISTS)
+→ Comments explain WHY, not just WHAT</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Add audit columns to EVERY table
+</span>   → created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   → updated_at TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+   → WHY: Project 42 (CDC) uses updated_at as watermark column
+   → Without these, you CANNOT do incremental extraction
+
+2. Design indexes based on QUERY PATTERNS, not table structure
+   → "I search orders by date + status" → INDEX (order_date, status)
+   → "I look up reviews by product" → INDEX (product_id, created_at)
+   → NEVER index every column — each index slows writes
+
+3. Use FOREIGN KEYS to enforce referential integrity
+   → Prevents orphan records (order_item without order)
+   → Database enforces rules even if application has bugs
+   → ON DELETE CASCADE vs RESTRICT — choose deliberately
+
+4. Use ENUM for finite value sets
+   → status ENUM('pending','shipped','completed','cancelled','refunded')
+   → Database rejects invalid values — no "compelted" typos
+   → Storage: 1-2 bytes vs VARCHAR's variable length
+
+5. Use DECIMAL for money — NEVER FLOAT
+   → FLOAT: 0.1 + 0.2 = 0.30000000000000004
+   → DECIMAL(10,2): 0.1 + 0.2 = 0.30 (exact)
+   → One rounding error × 1 million transactions = lawsuit
+
+6. Use GENERATED columns for derived values
+   → line_total GENERATED ALWAYS AS (quantity * unit_price) STORED
+   → Database guarantees correctness — application can't miscalculate
+   → Already done in Project 8's order_items table
+
+7. Plan for CDC from Day 1
+   → Add updated_at column to every table
+   → Add _etl_watermarks table to track last extraction time
+   → This enables incremental extraction in Projects 31, 42</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT create indexes on every column
+</span>   → Each index = separate B+Tree on disk
+   → Every INSERT/UPDATE must update ALL indexes
+   → 10 indexes on a table = 10x write amplification
+   → RULE: index only columns in WHERE, JOIN, ORDER BY
+
+2. DO NOT use VARCHAR(255) for everything
+   → customer_id is max 20 chars → use VARCHAR(20)
+   → state is max 2 chars → use CHAR(2)
+   → Smaller columns = more rows per page = faster scans
+
+3. DO NOT store addresses as part of customer table
+   → Customer has multiple addresses (billing, shipping, old)
+   → Separate table with FK to customer
+   → Violating this = nightmare when customer moves
+
+4. DO NOT use FLOAT/DOUBLE for monetary values
+   → Already explained in SHOULD DO — this is critical enough to repeat
+   → DECIMAL(10,2) for prices, DECIMAL(12,2) for totals
+
+5. DO NOT skip foreign keys "for performance"
+   → FK overhead on INSERT: microseconds
+   → Cost of orphan data in production: hours of debugging
+   → FK creates implicit index on child column — actually HELPS reads
+
+6. DO NOT create redundant indexes
+   → INDEX(order_date) is redundant if INDEX(order_date, status) exists
+   → Leftmost prefix rule: composite index serves single-column queries
+   → MariaDB can use (order_date, status) to search by order_date alone
+
+7. DO NOT use ON DELETE CASCADE without thinking
+   → CASCADE on orders → order_items: correct (items belong to order)
+   → CASCADE on customers → orders: DANGEROUS (deleting customer deletes orders)
+   → Use RESTRICT for critical relationships — force explicit deletion
+
+8. DO NOT add indexes before measuring
+   → Run EXPLAIN on slow queries FIRST
+   → Identify which queries actually need optimization
+   → Add the MINIMUM index that solves the problem</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────┬──────────────────────┬────────────────────────────────────────┐
+</span>│ Scenario                    │ Use                  │ Why                                    │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Lookup by exact value       │ PRIMARY KEY /        │ B+Tree O(log N) — milliseconds         │
+│ (order_id = 'X')            │ UNIQUE INDEX         │                                        │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Range scan + filter         │ COMPOSITE INDEX      │ (date, status) serves both conditions  │
+│ (date BETWEEN AND status=)  │                      │ in single B+Tree traversal             │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Query needs only indexed    │ COVERING INDEX       │ All columns in SELECT are in index     │
+│ columns (no table lookup)   │                      │ → no disk I/O to main table            │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Multi-table write must be   │ TRANSACTION          │ BEGIN → operations → COMMIT/ROLLBACK   │
+│ all-or-nothing              │ (BEGIN...COMMIT)     │ InnoDB undo log enables rollback        │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Load 100K+ rows fast        │ BULK INSERT          │ executemany + LOAD DATA INFILE          │
+│                             │                      │ 100x faster than row-by-row             │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Track every state change    │ HISTORY TABLE        │ Append-only log of status transitions  │
+│                             │                      │ Never UPDATE — always INSERT            │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Value must be one of N      │ ENUM                 │ DB rejects invalid values, 1-2 bytes   │
+│ predefined options          │                      │                                        │
+├─────────────────────────────┼──────────────────────┼────────────────────────────────────────┤
+│ Enforce parent-child        │ FOREIGN KEY          │ DB prevents orphan records             │
+│ relationship                │                      │ even if application has bugs           │
+└─────────────────────────────┴──────────────────────┴────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT use composite index when queries only filter on second column
+</span>   → INDEX(order_date, status): works for WHERE order_date = X
+   → INDEX(order_date, status): works for WHERE order_date = X AND status = Y
+   → INDEX(order_date, status): DOES NOT work for WHERE status = Y alone
+   → Leftmost prefix rule — column order in index MATTERS
+
+2. DO NOT use transactions for read-only queries
+   → SELECT queries don't need BEGIN/COMMIT
+   → InnoDB provides consistent reads via MVCC automatically
+   → Wrapping SELECTs in transactions wastes lock resources
+
+3. DO NOT use LOAD DATA INFILE for small batches (&lt; 1000 rows)
+   → Setup overhead exceeds benefit
+   → executemany() with 1000 rows is fast enough
+   → LOAD DATA INFILE shines at 100K+ rows
+
+4. DO NOT use ENUM if values change frequently
+   → Adding new ENUM value requires ALTER TABLE
+   → ALTER TABLE on 10M row table: locks table for minutes
+   → If values change monthly: use VARCHAR + application validation
+   → If values are truly fixed (status, tier): ENUM is perfect
+
+5. DO NOT use history tables for frequently queried current state
+   → History table grows forever — queries slow down
+   → Keep current state in main table (UPDATE)
+   → History table is append-only AUDIT LOG
+   → Query main table for current, history for timeline</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────┐
+</span>│              DEEP INTERNALS: INDEXES, TRANSACTIONS, BULK LOADS             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  1. COMPOSITE INDEX INTERNALS                                               │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  INDEX idx_date_status (order_date, status):                                │
+│                                                                             │
+│  B+Tree is sorted by (date, status) TOGETHER:                               │
+│                                                                             │
+│  ┌──────────────────────────────────────────────┐                           │
+│  │  Leaf nodes (sorted):                        │                           │
+│  │  (2025-01-01, cancelled)  → PK: ORD-001     │                           │
+│  │  (2025-01-01, completed)  → PK: ORD-002     │                           │
+│  │  (2025-01-01, completed)  → PK: ORD-005     │                           │
+│  │  (2025-01-01, pending)    → PK: ORD-003     │                           │
+│  │  (2025-01-01, shipped)    → PK: ORD-004     │                           │
+│  │  (2025-01-02, cancelled)  → PK: ORD-008     │                           │
+│  │  (2025-01-02, completed)  → PK: ORD-006     │                           │
+│  │  ...                                         │                           │
+│  └──────────────────────────────────────────────┘                           │
+│                                                                             │
+│  WHY (date, status) order matters:                                          │
+│                                                                             │
+│  Query: WHERE order_date = '2025-01-01' AND status = 'completed'            │
+│  → Seek to (2025-01-01, completed) in tree — O(log N)                       │
+│  → Scan consecutive entries — all matching rows are ADJACENT                │
+│  → Stop at first non-matching entry                                         │
+│  → Result: 2 rows examined, 2 rows returned                                │
+│                                                                             │
+│  Query: WHERE order_date BETWEEN '2025-01-01' AND '2025-01-31'              │
+│  → Seek to (2025-01-01, ...) — O(log N)                                    │
+│  → Scan forward until (2025-02-01, ...)                                     │
+│  → ALL January rows are in consecutive leaf pages                           │
+│  → Result: range scan — very efficient                                      │
+│                                                                             │
+│  Query: WHERE status = 'completed' (NO date filter)                         │
+│  → Index sorted by date FIRST, status SECOND                                │
+│  → 'completed' entries scattered across all dates                           │
+│  → Must scan ENTIRE index — no better than full table scan                  │
+│  → THIS is the leftmost prefix rule                                         │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  2. COVERING INDEX INTERNALS                                                │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  Normal query with index:                                                   │
+│  SELECT * FROM orders WHERE order_date = '2025-01-01'                       │
+│  Step 1: Search idx_date_status → find PK values                            │
+│  Step 2: Use PK to look up FULL ROW from main table ← EXTRA I/O            │
+│  This "Step 2" is called a BOOKMARK LOOKUP                                  │
+│                                                                             │
+│  Covering index query:                                                      │
+│  SELECT order_date, status, COUNT(*)                                        │
+│  FROM orders                                                                │
+│  WHERE order_date = '2025-01-01'                                            │
+│  GROUP BY order_date, status                                                │
+│  → All columns (order_date, status) ARE IN the index                        │
+│  → No bookmark lookup needed — answer entirely from index                   │
+│  → EXPLAIN shows: "Using index" in Extra column                             │
+│  → 2-3x faster than bookmark lookup                                        │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  3. TRANSACTION INTERNALS (InnoDB)                                          │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  BEGIN;                                                                     │
+│    INSERT INTO orders (...) VALUES (...);                                    │
+│    INSERT INTO order_items (...) VALUES (...);                               │
+│    INSERT INTO order_items (...) VALUES (...);                               │
+│  COMMIT;                                                                    │
+│                                                                             │
+│  WHAT HAPPENS INTERNALLY:                                                   │
+│                                                                             │
+│  1. BEGIN:                                                                  │
+│     → InnoDB assigns transaction ID (incrementing counter)                  │
+│     → Creates read view (snapshot of database at this moment)               │
+│     → No locks acquired yet                                                 │
+│                                                                             │
+│  2. First INSERT:                                                           │
+│     → New row written to Buffer Pool (RAM)                                  │
+│     → Row marked with this transaction's ID                                 │
+│     → UNDO LOG entry created (how to reverse this insert)                   │
+│     → REDO LOG entry created (how to replay this insert)                    │
+│     → Exclusive lock (X-lock) acquired on the row                           │
+│     → Other transactions CAN'T see this row yet (isolation)                 │
+│                                                                             │
+│  3. Second INSERT, Third INSERT:                                            │
+│     → Same process — undo log grows, redo log grows                         │
+│     → All rows locked, all invisible to other transactions                  │
+│                                                                             │
+│  4. COMMIT:                                                                 │
+│     → Redo log flushed to DISK (durability guarantee)                       │
+│     → Transaction marked as committed                                       │
+│     → Locks released                                                        │
+│     → Rows become visible to other transactions                             │
+│     → Dirty pages in Buffer Pool will flush to disk LATER (async)           │
+│                                                                             │
+│  5. If ROLLBACK instead of COMMIT:                                          │
+│     → InnoDB reads UNDO LOG                                                 │
+│     → Reverses each operation (delete inserted rows)                        │
+│     → Locks released                                                        │
+│     → As if nothing happened                                                │
+│                                                                             │
+│  6. If SERVER CRASHES between INSERT and COMMIT:                            │
+│     → On restart: InnoDB reads redo log                                     │
+│     → Replays committed transactions                                        │
+│     → Rolls back uncommitted transactions (using undo log)                  │
+│     → Database is consistent — no half-written orders                       │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  4. BULK INSERT INTERNALS                                                   │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  ROW-BY-ROW INSERT (slow):                                                  │
+│  for row in 100000_rows:                                                    │
+│      cursor.execute("INSERT ... VALUES (%s)", row)                          │
+│      connection.commit()                                                    │
+│  → 100,000 network round trips                                              │
+│  → 100,000 transaction commits                                              │
+│  → 100,000 redo log flushes to disk                                         │
+│  → ~400 seconds (4 hours for 500K rows)                                     │
+│                                                                             │
+│  BATCH INSERT (fast):                                                       │
+│  cursor.executemany("INSERT ... VALUES (%s)", all_100000_rows)              │
+│  connection.commit()                                                        │
+│  → 1 network round trip (batched)                                           │
+│  → 1 transaction commit                                                     │
+│  → 1 redo log flush                                                         │
+│  → ~4 seconds (100x faster)                                                 │
+│                                                                             │
+│  LOAD DATA INFILE (fastest):                                                │
+│  LOAD DATA LOCAL INFILE '/path/file.csv' INTO TABLE orders ...              │
+│  → MariaDB's native bulk loader                                             │
+│  → Bypasses SQL parser for each row                                         │
+│  → Direct page writes to InnoDB                                             │
+│  → ~1.5 seconds for 100K rows                                               │
+│  → BUT: requires local_infile=1 (security risk — disabled in Project 8)     │
+│                                                                             │
+│  OPTIMIZATION TRICKS FOR BULK INSERT:                                       │
+│  → Disable indexes: ALTER TABLE t DISABLE KEYS; (MyISAM only)              │
+│  → For InnoDB: insert in PRIMARY KEY order                                  │
+│  → Increase bulk_insert_buffer_size                                         │
+│  → Set innodb_autoinc_lock_mode = 2 (interleaved)                           │
+│  → Commit every 10,000 rows (not every row, not all 1M at once)            │
+│                                                                             │
+│  ═══════════════════════════════════════════════════════                     │
+│  5. FOREIGN KEY ENFORCEMENT INTERNALS                                       │
+│  ═══════════════════════════════════════════════════════                     │
+│                                                                             │
+│  INSERT INTO order_items (order_id, product_id, ...) VALUES ('ORD-999',...) │
+│                                                                             │
+│  InnoDB does:                                                               │
+│  1. Acquire shared lock (S-lock) on parent row in orders table              │
+│  2. Check: does order_id='ORD-999' exist in orders?                         │
+│  3. If YES: allow insert, release lock                                      │
+│  4. If NO: reject with ERROR 1452 (foreign key constraint fails)            │
+│                                                                             │
+│  ON DELETE CASCADE:                                                         │
+│  DELETE FROM orders WHERE order_id = 'ORD-001'                              │
+│  1. InnoDB finds all order_items with order_id = 'ORD-001'                  │
+│  2. Deletes those child rows FIRST                                          │
+│  3. Then deletes parent order row                                           │
+│  4. All within same transaction — atomic                                    │
+│                                                                             │
+│  ON DELETE RESTRICT:                                                        │
+│  DELETE FROM customers WHERE customer_id = 'CUST-001'                       │
+│  1. InnoDB checks: any orders reference CUST-001?                           │
+│  2. If YES: reject with ERROR 1451 (cannot delete parent row)               │
+│  3. Must delete/reassign orders FIRST, then delete customer                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Query uses index for 1000 rows but full scan for 100K"
+</span>→ Cause: MariaDB optimizer decides full scan is cheaper when 
+   index would return &gt; 20-30% of table
+→ This is CORRECT behavior — random I/O from index is slower 
+   than sequential full scan above a threshold
+→ Fix: accept it OR force with FORCE INDEX (rarely needed)
+
+PITFALL 2: "Transaction deadlock — both transactions killed"
+→ Cause: Transaction A locks row 1, waits for row 2
+         Transaction B locks row 2, waits for row 1
+→ InnoDB detects deadlock, kills one transaction (victim)
+→ Fix: always access tables/rows in SAME ORDER across all code
+→ Fix: keep transactions SHORT — don't hold locks during API calls
+
+PITFALL 3: "ALTER TABLE adding index locks table for 20 minutes"
+→ Cause: InnoDB must build entire B+Tree for new index
+→ On 10M rows: can take 10-30 minutes, table is locked
+→ Fix: use pt-online-schema-change (Percona toolkit)
+→ Fix: schedule during maintenance window
+→ In RDS: ALTER TABLE is online for most operations
+
+PITFALL 4: "executemany() is not actually faster"
+→ Cause: pymysql's executemany still sends individual INSERTs
+→ It just loops cursor.execute() internally
+→ Fix: use multi-row INSERT VALUES syntax manually:
+   INSERT INTO t VALUES (1,'a'), (2,'b'), (3,'c')
+→ OR: set rewriteBatchedStatements=true in connection string
+
+PITFALL 5: "Inserted duplicate order — UNIQUE constraint missing"
+→ Cause: application generates order_id, no DB uniqueness check
+→ Two concurrent requests create same order_id
+→ Fix: PRIMARY KEY or UNIQUE constraint catches this at DB level
+→ Application gets error, retries with new ID
+
+PITFALL 6: "History table has 50M rows — queries crawling"
+→ Cause: no partition strategy, no archiving
+→ Fix: partition by month (PARTITION BY RANGE)
+→ Fix: archive old partitions to S3 (Project 20)
+→ Fix: only query recent data, use Athena for historical (Project 24)
+
+PITFALL 7: "updated_at not changing on UPDATE"
+→ Cause: ON UPDATE CURRENT_TIMESTAMP only fires when 
+   row VALUES actually change
+→ UPDATE customers SET name='John' WHERE name='John' → no change
+→ This is CORRECT behavior — but surprises CDC systems
+→ Fix: for CDC, also check row content hash (Project 42)</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>TABLE SIZE GUIDELINES (MariaDB on t3.medium):
+</span>→ &lt; 1M rows per table: no tuning needed, everything fast
+→ 1M-10M rows: proper indexing critical, buffer pool must be sized
+→ 10M-100M rows: partitioning needed, consider read replicas
+→ &gt; 100M rows: MariaDB struggling — extract to Redshift for analytics
+
+INDEX SCALING:
+→ Each index adds ~30-50% overhead on INSERT operations
+→ 2-3 indexes per table: healthy
+→ 5+ indexes per table: writes slow down noticeably
+→ 10+ indexes: something is wrong with your query patterns
+
+TRANSACTION SCALING:
+→ Short transactions (&lt; 100ms): handle 500+ TPS on t3.medium
+→ Long transactions (&gt; 5 seconds): block other operations
+→ RULE: transaction should touch &lt; 1000 rows
+→ Bulk operations: commit every 10,000 rows
+
+HISTORY TABLE SCALING:
+→ 1 year of order history: ~730K rows (2000 orders/day)
+→ 3 years: ~2.2M rows — still manageable
+→ 5 years: ~3.6M rows — partition by year
+→ Archival: old partitions → S3 CSV → query with Athena
+
+WHEN TO MIGRATE OFF EC2 MariaDB:
+→ Database &gt; 50 GB: migrate to RDS (managed)
+→ Need read replicas: RDS one-click setup
+→ Need Multi-AZ failover: RDS only
+→ Analytics queries slow down OLTP: extract to Redshift (Project 32)
+→ &gt; 500 concurrent connections: Aurora MySQL</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO ANALYZE QUERY PERFORMANCE:
+</span>
+1. EXPLAIN — shows execution plan
+   → EXPLAIN SELECT * FROM orders WHERE order_date = '2025-01-15';
+   → Look for:
+     type: const (best) → eq_ref → ref → range → index → ALL (worst)
+     key: which index is used (NULL = no index)
+     rows: estimated rows examined
+     Extra: "Using index" = covering index (excellent)
+            "Using filesort" = sorting in temp space (slow)
+            "Using temporary" = temp table created (slow)
+
+2. EXPLAIN ANALYZE (MariaDB 10.1+) — shows ACTUAL execution
+   → EXPLAIN ANALYZE SELECT ...
+   → Shows real row counts, not estimates
+   → Shows actual time per step
+
+3. SHOW INDEX FROM table — list all indexes
+   → Cardinality: number of unique values (higher = more selective)
+   → Low cardinality index (e.g., status with 5 values) = less useful
+   → High cardinality index (e.g., order_id) = very useful
+
+4. slow_query_log — catches problems in production
+   → Enabled in Project 8 configuration
+   → Any query &gt; 2 seconds logged with full SQL
+   → Review weekly — fix top offenders
+
+5. SHOW TABLE STATUS — storage metrics
+   → Row count, data size, index size, average row length
+   → Useful for capacity planning</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(9)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Migration 1: Extend Schema with New Tables</h3>
+
+<h3>Migration 2: Add Strategic Indexes to Existing Tables</h3>
+
+<h3>Step 3: Transaction Patterns — Solving Problem 1</h3>
+
+<h3>Step 4: Bulk Load Benchmark — Solving Problem 3</h3>
+
+<h3>Step 5: Index Analysis &amp; EXPLAIN Deep Dive — Solving Problem 2</h3>
+
+<h3>Step 6: Seed Extended Tables (Addresses, Reviews, History)</h3>
+
+<h3>Step 7: Advanced Query Patterns — Real Business Scenarios</h3>
+
+<h3>Step 8: Execution Flow</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># COMPLETE EXECUTION ORDER (builds on Project 8)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ============================================================</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Project 8 must be completed first:</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → MariaDB installed, secured, quickcart_db created</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># → customers, products, orders, order_items tables exist with data</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 1. Run schema migration — add new tables</span><span>
+</span><span>mysql -u root -p</span><span class="token" style="color: rgb(163, 21, 21);">'QuickCart_R00t_2025!'</span><span> quickcart_db </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span> migrations/V001_extend_schema.sql
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 2. Run index migration — optimize existing tables</span><span>
+</span><span>mysql -u root -p</span><span class="token" style="color: rgb(163, 21, 21);">'QuickCart_R00t_2025!'</span><span> quickcart_db </span><span class="token" style="color: rgb(57, 58, 52);">&lt;</span><span> migrations/V002_add_indexes.sql
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 3. Seed extended tables</span><span>
+</span>python3 06_seed_extended_tables.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 4. Run transaction demonstrations</span><span>
+</span>python3 03_transaction_patterns.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 5. Run bulk load benchmark</span><span>
+</span>python3 04_bulk_load_benchmark.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 6. Run index analysis</span><span>
+</span>python3 05_index_analysis.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># 7. Run advanced queries</span><span>
+</span>python3 07_advanced_queries.py</code></pre></div>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>EXPECTED BENCHMARK OUTPUT:
+</span>
+============================================================
+🏎️  BULK INSERT BENCHMARK — 10,000 rows
+============================================================
+
+⏱️  Running benchmarks:
+
+   Method 1 (row-by-row + commit each): 45.23s (221 rows/sec)
+   Method 2 (row-by-row + single commit): 4.12s (2427 rows/sec)
+   Method 3 (executemany + single commit): 2.87s (3484 rows/sec)
+   Method 4 (multi-row INSERT, batch=1000): 0.43s (23256 rows/sec)
+   Method 5 (executemany + commit every 5000): 1.15s (8696 rows/sec)
+
+📊 RESULTS SUMMARY (10,000 rows)
+Method                                          Time  Speedup
+------------------------------------------------------------
+1. Row-by-row + commit each (WORST)           45.23s     1.0x
+2. Row-by-row + single commit                  4.12s    11.0x
+3. executemany + single commit                  2.87s    15.8x
+4. Multi-row INSERT (batch=1000)                0.43s   105.2x
+5. executemany + periodic commit (PRACTICAL)    1.15s    39.3x
+
+💡 For 500K rows: Method 1 = ~6.3 hours, Method 4 = ~21 seconds</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ TRANSACTIONS: BEGIN/COMMIT/ROLLBACK = all-or-nothing operations
+   → InnoDB uses redo log (durability) + undo log (rollback)
+   → Never commit between related INSERT operations
+   → FOR UPDATE locks rows during read-modify-write cycles
+
+→ INDEXES: B+Tree structures that turn O(N) into O(log N)
+   → Composite index: column ORDER matters (leftmost prefix rule)
+   → Covering index: all SELECT columns in index = no table access
+   → EXPLAIN shows: type, key, rows, Extra — learn to read these
+   → Never put functions on indexed columns in WHERE
+
+→ BULK OPERATIONS: multi-row INSERT = 100x faster than row-by-row
+   → Commit per row = redo log flush per row = catastrophically slow
+   → Batch + periodic commit = practical for production loads
+
+→ SCHEMA DESIGN: audit columns + history tables + ETL watermarks
+   → updated_at enables CDC (incremental extraction)
+   → History tables enable timeline queries
+   → Separate tables for 1:many relationships (addresses, reviews)
+   → ENUM for finite values, DECIMAL for money, GENERATED for derived
+
+CONNECTION TO PREVIOUS PROJECTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 1 (S3): CSV files are what we're REPLACING with proper queries
+→ Project 8 (MariaDB install): base schema we EXTENDED here
+
+WHAT THIS ENABLES NEXT:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 10 (Redshift): same star schema, but columnar + MPP
+   → Fact/dimension pattern transfers directly
+→ Project 19 (S3 load to MariaDB): uses bulk insert techniques from here
+→ Project 20 (MariaDB to S3): extracts using etl_user + watermarks
+→ Project 31 (Glue JDBC): Glue reads this schema via JDBC connector
+→ Project 42 (CDC): uses _etl_watermarks + updated_at for incremental loads
+→ Project 65 (Full CDC pipeline): merge pattern uses this as source</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a production-grade MariaDB:
+</span>→ Normalized schema with proper constraints
+→ Strategic indexes based on real query patterns
+→ Transaction patterns for data integrity
+→ Bulk load capability for historical data
+→ Audit columns ready for CDC extraction
+
+BUT: The analytics team says:
+"We need to run aggregation queries across 6 months of data.
+ MariaDB returns results in 8-12 seconds.
+ We need sub-second response for dashboards.
+ MariaDB is ROW-ORIENTED — it reads entire rows even when 
+ we only need 2 columns. For analytics, we need COLUMNAR storage."
+
+CTO: "We need a data warehouse. Not for transactions — for analytics."
+
+→ Project 10: "Analytics Team Needs a Columnar Warehouse for Aggregations"
+→ Introduces: Amazon Redshift → Cluster provisioning → 
+   Columnar storage → MPP architecture → Node types → VPC placement
+→ The SAME star schema from this project gets redesigned for OLAP
+→ MariaDB stays as OLTP source, Redshift becomes OLAP destination</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="13" ========== -->
+<div class="chat-message" data-index="13"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-8.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 9 of 80</span>
+    <span class="nav-project-title">BUILD THE FIRST SCHEMA FOR AN E-COMMERCE APP</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-10.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-10.html") window.location = "project-10.html";
+  if (e.key === 'ArrowLeft' && "project-8.html") window.location = "project-8.html";
+});
+</script>
+</body>
+</html>

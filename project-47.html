@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 47: REPLICATE S3 DATA TO ANOTHER REGION FOR DR — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:59%"></div></div>
+<div id="progress-label">59%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 47 of 80</div>
+  <div class="project-title">REPLICATE S3 DATA TO ANOTHER REGION FOR DR</div>
+  <div class="project-tags"><span class="project-tag">S3</span><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Series B funded, $2M ARR, mission-critical data platform
+</span>Team: 5-person data team, platform serves 50+ internal users daily
+
+CURRENT STATE (built through Projects 1–46):
+→ Medallion data lake in us-east-2: Bronze → Silver → Gold (Project 44)
+→ CDC pipeline: MariaDB → S3 → Glue → Redshift (Projects 42, 44)
+→ Reverse ETL: Redshift → S3 → MariaDB (Project 43)
+→ Athena Federated Queries (Project 46)
+→ Event-driven orchestration (Project 41)
+→ All data in SINGLE region: us-east-2 (Ohio)
+
+THE INCIDENT:
+
+  February 15, 2025 — 09:14 AM EST
+  → AWS Health Dashboard: "Elevated error rates for S3 API calls in us-east-2"
+  → S3 GET/PUT requests intermittently failing (5xx errors)
+  
+  09:15 AM — Athena queries start failing
+  → "HIVE_CANNOT_OPEN_SPLIT: Error opening Hive split"
+  → Gold zone Parquet files unreadable intermittently
+  → 12 BI analysts can't refresh dashboards
+  
+  09:18 AM — Glue ETL jobs fail
+  → Bronze→Silver job: "S3 service returned error"
+  → Silver→Gold job: never started (upstream failed)
+  → CDC extraction can't upload to S3
+  
+  09:20 AM — Redshift COPY fails
+  → "S3ServiceException: Service Unavailable"
+  → Morning data load aborted
+  
+  09:22 AM — Step Functions alerts fire
+  → SNS: "❌ Pipeline FAILED — S3 unavailable"
+  → 5 simultaneous failure notifications
+  
+  09:30 AM — CTO Slack: "ALL dashboards are down. What's happening?"
+  → You: "AWS S3 regional issue in us-east-2. We're waiting for AWS to resolve."
+  → CTO: "WAITING? We can't just WAIT. Revenue decisions depend on this data."
+  
+  11:45 AM — AWS resolves the issue (2.5 hours of downtime)
+  
+  12:00 PM — Pipelines recover, dashboards refresh
+  
+  POST-MORTEM:
+  → 2.5 hours of complete data platform outage
+  → 50+ users couldn't access any data
+  → Morning executive meeting used YESTERDAY's numbers
+  → Marketing couldn't validate flash sale performance
+  → Finance delayed monthly close by 1 day
+  
+  CTO MANDATE:
+  "This was a SINGLE point of failure. Our entire data platform
+   depends on ONE S3 bucket in ONE region. I want:
+   
+   1. All critical data replicated to a second region
+   2. If us-east-2 fails, we can serve data from the backup region
+   3. Recovery time: &lt; 15 minutes (RTO)
+   4. Data loss: &lt; 1 hour of data (RPO)
+   5. Budget: &lt; $200/month for DR"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand DR terminology
+</span>
+  RTO (Recovery Time Objective):
+  → How long until service is RESTORED after failure
+  → CTO wants: &lt; 15 minutes
+  → Meaning: within 15 minutes of us-east-2 failure,
+    analysts can query data from the backup region
+
+  RPO (Recovery Point Objective):
+  → How much DATA can we afford to LOSE
+  → CTO wants: &lt; 1 hour
+  → Meaning: if us-east-2 fails at 09:00,
+    backup region has data up to at least 08:00
+
+  RTO + RPO together define the DR requirements:
+  ┌──────────────────────────────────────────────────────────┐
+  │  Timeline:                                                │
+  │                                                          │
+  │  08:00  08:30  09:00  09:15  09:30                       │
+  │    │      │      │      │      │                         │
+  │    │      │      │      │      └─ Service restored (RTO) │
+  │    │      │      │      └─ Failure detected               │
+  │    │      │      └─ us-east-2 fails                      │
+  │    │      └─ Last replicated data (RPO = 1 hour)         │
+  │    └─ Data available in backup (at minimum)               │
+  └──────────────────────────────────────────────────────────┘
+
+Step 2: Evaluate S3 replication options
+
+  ┌───────────────────────────┬──────────────────────────────────────────┐
+  │ Option                    │ Description                              │
+  ├───────────────────────────┼──────────────────────────────────────────┤
+  │ S3 Cross-Region           │ Automatic replication to bucket in       │
+  │ Replication (CRR)         │ different region. Async, eventual.       │
+  │                           │ Typical lag: seconds to minutes.         │
+  ├───────────────────────────┼──────────────────────────────────────────┤
+  │ S3 Same-Region            │ Replication within same region           │
+  │ Replication (SRR)         │ (different bucket/account).              │
+  │                           │ NOT useful for regional DR.              │
+  ├───────────────────────────┼──────────────────────────────────────────┤
+  │ S3 Replication Time       │ CRR + SLA: 99.99% of objects            │
+  │ Control (RTC)             │ replicated within 15 minutes.            │
+  │                           │ Adds cost but guarantees RPO.            │
+  ├───────────────────────────┼──────────────────────────────────────────┤
+  │ S3 Batch Replication      │ One-time replication of existing objects │
+  │                           │ (CRR only replicates NEW objects).       │
+  │                           │ Needed for initial backfill.             │
+  ├───────────────────────────┼──────────────────────────────────────────┤
+  │ AWS Backup for S3         │ Point-in-time recovery for S3 buckets.  │
+  │                           │ Backup, not real-time replication.       │
+  │                           │ Higher RPO (hours).                      │
+  └───────────────────────────┴──────────────────────────────────────────┘
+
+Step 3: Choose the right option
+
+  CTO requirements:
+  → RPO &lt; 1 hour → CRR alone (minutes lag) satisfies this ✅
+  → RPO guaranteed → RTC adds 15-minute SLA guarantee ✅
+  → RTO &lt; 15 minutes → need pre-configured Athena in DR region ✅
+  → Budget &lt; $200/month → CRR cost is manageable for our data volume ✅
+
+  DECISION:
+  → S3 CRR with RTC (Replication Time Control)
+  → Replicate: Gold zone (critical for dashboards)
+  → Replicate: Silver zone (needed for recovery/rebuild)
+  → Skip: Bronze zone (can be regenerated, saves cost)
+  → Skip: _system zone (operational files, not critical)
+
+Step 4: Design the DR architecture
+
+  PRIMARY REGION: us-east-2 (Ohio) — normal operations
+  DR REGION: us-west-2 (Oregon) — standby, activated on failure
+
+  ┌─────────────────────────┐         ┌─────────────────────────┐
+  │ us-east-2 (PRIMARY)     │         │ us-west-2 (DR)          │
+  │                         │         │                         │
+  │ quickcart-datalake-prod │ ──CRR──→│ quickcart-datalake-dr   │
+  │ ├── bronze/ (not repl.) │         │ ├── silver/ (replica)   │
+  │ ├── silver/ ────────────│────────→│ └── gold/ (replica)     │
+  │ ├── gold/ ──────────────│────────→│                         │
+  │ └── _system/ (not repl.)│         │ Glue Catalog (DR)       │
+  │                         │         │ Athena (DR, standby)    │
+  │ Glue Catalog (primary)  │         │                         │
+  │ Athena (primary)        │         │ Activated on failure:   │
+  │ Redshift (primary)      │         │ → Analysts switch to    │
+  │                         │         │   us-west-2 Athena      │
+  └─────────────────────────┘         └─────────────────────────┘
+
+Step 5: Pre-configure DR region (warm standby)
+→ Glue Catalog tables pointing to DR bucket
+→ Athena workgroups configured and tested
+→ IAM roles and policies ready
+→ Runbook: step-by-step failover procedure
+→ Monthly DR drill: test the failover</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION: CRR with RTC + Pre-configured DR Region
+</span>
+COMPONENTS:
+1. S3 CRR with Replication Time Control (Silver + Gold zones)
+2. S3 Batch Replication (initial backfill of existing data)
+3. DR bucket in us-west-2 with matching structure
+4. Glue Catalog in us-west-2 (pointing to DR bucket)
+5. Athena workgroups in us-west-2 (pre-configured, standby)
+6. CloudWatch metrics for replication monitoring
+7. Automated failover detection + notification
+8. Runbook for manual failover procedure
+
+REPLICATION FLOW:
+  
+  Pipeline writes to primary (normal operation):
+  Glue ETL → s3://quickcart-datalake-prod/silver/orders/year=2025/...
+       │
+       │ S3 CRR (automatic, async)
+       │ Typical lag: 30 seconds – 5 minutes
+       │ RTC guarantee: 99.99% within 15 minutes
+       ▼
+  s3://quickcart-datalake-dr/silver/orders/year=2025/...
+       │
+       │ DR Glue Catalog already points here
+       │ DR Athena already configured
+       ▼
+  On failure: analysts switch Athena to us-west-2 → query DR bucket</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Manual S3 sync via aws s3 sync (cron job)
+</span>→ Scheduled copy from primary to DR bucket
+→ Problem: not real-time (RPO = sync interval, e.g., 1 hour)
+→ Problem: must manage sync script, handle failures
+→ Problem: doesn't sync deletes by default
+→ VERDICT: Simple but insufficient for &lt; 1 hour RPO guarantee
+
+Option B: S3 CRR without RTC
+→ Automatic async replication for new objects
+→ No SLA on replication time (usually minutes, but no guarantee)
+→ Problem: during high load, replication can lag hours
+→ Problem: no CloudWatch metric for replication lag
+→ VERDICT: Works 99% of time, but can't guarantee RPO
+
+Option C: S3 CRR with RTC (Replication Time Control)
+→ Same as CRR + 15-minute SLA (99.99% of objects)
+→ CloudWatch metrics: ReplicationLatency, OperationsFailedReplication
+→ S3 Replication Metrics: track replication status per object
+→ Additional cost: $0.015 per GB replicated
+→ VERDICT: ✅ Best — guaranteed RPO with monitoring
+
+Option D: Multi-region active-active (write to both regions)
+→ Every pipeline writes to BOTH us-east-2 AND us-west-2
+→ Zero replication lag (data in both regions simultaneously)
+→ Problem: double compute cost (Glue runs in both regions)
+→ Problem: double storage cost
+→ Problem: consistency issues (which region is source of truth?)
+→ VERDICT: Overkill for DR — needed only for active-active serving
+
+DECISION: Option C — S3 CRR with RTC</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Enable VERSIONING on BOTH source and destination buckets
+</span>   → CRR REQUIRES versioning on both buckets
+   → Without versioning: CRR configuration fails
+   → Primary bucket already has versioning (Project 44)
+   → DR bucket must also have versioning enabled
+
+2. Use PREFIX-BASED replication rules (not entire bucket)
+   → Replicate: silver/ and gold/ (critical for analytics)
+   → Skip: bronze/ (regenerable from source, saves 60%+ cost)
+   → Skip: _system/ (operational files, not needed for DR)
+   → Each prefix gets its own replication rule
+
+3. Enable Replication Time Control (RTC) for Gold zone
+   → Gold is most critical (dashboards depend on it)
+   → RTC guarantees 99.99% of objects replicated within 15 minutes
+   → Silver can use standard CRR (slightly relaxed SLA)
+   → Saves cost: RTC costs more per GB
+
+4. Enable S3 Replication Metrics
+   → Track: bytes pending replication, replication latency
+   → CloudWatch alarm: if ReplicationLatency &gt; 10 minutes → alert
+   → CloudWatch alarm: if OperationsFailed &gt; 0 → alert
+
+5. Run S3 Batch Replication for existing objects
+   → CRR only replicates NEW objects (written after CRR enabled)
+   → Existing Silver + Gold data: must be batch-replicated
+   → One-time operation, can take hours for large datasets
+
+6. Pre-configure Glue Catalog in DR region
+   → Create same databases: quickcart_silver, quickcart_gold
+   → Tables point to DR bucket: s3://quickcart-datalake-dr/silver/...
+   → Run Glue Crawlers in DR region to discover replicated data
+
+7. Pre-configure Athena in DR region
+   → Create workgroups matching primary region
+   → Test queries BEFORE disaster (monthly DR drill)
+   → Document: which Athena endpoint to use during failover
+
+8. Create a RUNBOOK for failover
+   → Step 1: Confirm us-east-2 is actually down (not false alarm)
+   → Step 2: Announce failover to team (Slack, email)
+   → Step 3: Analysts switch to us-west-2 Athena console
+   → Step 4: Verify data freshness in DR (check latest partition)
+   → Step 5: Monitor DR region for issues
+   → Step 6: When primary recovers → fail BACK</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT replicate Bronze zone (waste of money)
+</span>   → Bronze = raw CSV from sources (62% of total storage)
+   → Can be regenerated from MariaDB / source systems
+   → Replicating Bronze: ~$35/month additional cost
+   → Savings: skip Bronze, keep Silver + Gold only
+
+2. DO NOT enable CRR without versioning
+   → CRR fails silently without versioning on BOTH buckets
+   → Common mistake: enable versioning on source, forget destination
+   → Result: replication rule "active" but nothing replicates
+
+3. DO NOT assume CRR replicates existing objects
+   → CRR ONLY replicates objects written AFTER rule creation
+   → Existing Silver/Gold data: NOT replicated automatically
+   → Must run S3 Batch Replication for backfill
+   → Without backfill: DR bucket has only recent data
+
+4. DO NOT use the same bucket name for DR
+   → S3 bucket names are globally unique
+   → Can't have: quickcart-datalake-prod in both regions
+   → Use: quickcart-datalake-dr in us-west-2
+
+5. DO NOT skip monthly DR drills
+   → DR configuration that's never tested = false confidence
+   → Drill: query DR Athena, verify data, measure RTO
+   → Common discovery during drills: Glue Catalog tables out of date
+   → Drill frequency: monthly (minimum), quarterly (acceptable)
+
+6. DO NOT auto-failover without human confirmation
+   → False positive: CloudWatch alarm fires but S3 is actually fine
+   → Auto-failover: analysts suddenly on DR data → confusion
+   → Better: alert → human confirms → manual failover
+   → Exception: if RTO &lt; 5 minutes required → then auto-failover
+
+7. DO NOT replicate delete markers by default
+   → If someone deletes Gold data (accidentally or maliciously)
+   → CRR can replicate the DELETE to DR → DR data also gone
+   → Configure: replicate object creation ONLY, not deletes
+   → DR becomes your "safety net" against accidental deletion
+
+8. DO NOT forget to replicate KMS keys if using SSE-KMS
+   → If source bucket uses AWS KMS encryption
+   → DR bucket needs access to decrypt/re-encrypt
+   → Use separate KMS key in DR region + grant CRR role access
+   → For SSE-S3 (AES256): no key management needed ✅</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────┬─────────────────────────────┬─────────────────────────────┐
+</span>│ Replication Strategy            │ Use When                    │ Don't Use When              │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ S3 CRR (standard)              │ DR with relaxed RPO         │ Need guaranteed RPO         │
+│                                 │ Cost-sensitive               │ Regulatory compliance       │
+│                                 │ RPO: minutes (usually)      │ requiring SLA               │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ S3 CRR + RTC                   │ DR with guaranteed RPO      │ Budget extremely tight      │
+│ (THIS PROJECT)                  │ RPO: 15 minutes (SLA)       │ Relaxed RPO acceptable      │
+│                                 │ Need monitoring metrics      │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ S3 SRR (Same-Region)           │ Cross-account replication   │ Regional DR                 │
+│                                 │ Log aggregation             │ (same region = same failure)│
+│                                 │ Compliance copies            │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ S3 Batch Replication            │ Backfill existing objects   │ Ongoing replication         │
+│                                 │ One-time migration          │ (use CRR for ongoing)       │
+│                                 │ CRR didn't replicate old data│                            │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ AWS Backup for S3               │ Point-in-time recovery      │ Real-time DR                │
+│                                 │ Compliance / audit           │ RPO &lt; 1 hour               │
+│                                 │ Accidental deletion recovery │                             │
+├─────────────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+│ Multi-region active-active      │ Zero RPO required           │ Budget-conscious            │
+│ (dual-write)                    │ Zero RTO required           │ Simple DR sufficient        │
+│                                 │ Global user base             │                             │
+└─────────────────────────────────┴─────────────────────────────┴─────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE S3 CRR</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. When data is easily regenerable from source
+</span>   → Bronze zone: can re-extract from MariaDB
+   → Glue temp files: recreated every run
+   → Don't pay replication cost for regenerable data
+
+2. When RPO of hours is acceptable
+   → Weekly reports: data is already days old
+   → Historical archives: rarely accessed
+   → Use: AWS Backup (daily snapshots) instead of CRR
+
+3. When data volume makes replication prohibitively expensive
+   → 100 TB data lake: CRR + RTC = $1,500/month
+   → If DR is "nice to have" not "must have" → skip
+   → Or: replicate only Gold zone (smallest, most critical)
+
+4. When both regions share the same failure domain
+   → Two buckets in us-east-1 → both fail if us-east-1 fails
+   → CRR to same region = SRR → doesn't help for regional DR
+   → Always replicate to a DIFFERENT region
+
+5. When data has residency requirements
+   → EU data must stay in EU (GDPR)
+   → Replicating to us-west-2 violates data residency
+   → Use: eu-west-1 → eu-central-1 (within EU)</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌─────────────────────────────────────────────────────────────────────────────────┐
+</span>│                    INTERNAL MECHANICS: S3 CROSS-REGION REPLICATION              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ❶ How CRR Works Internally                                                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━                                                  │
+│                                                                                 │
+│  When an object is PUT to the source bucket:                                    │
+│                                                                                 │
+│  1. S3 receives PUT request → stores object in us-east-2                       │
+│  2. S3 returns 200 OK to client (object stored in primary)                     │
+│  3. ASYNC: S3 evaluates replication rules for this object                      │
+│     → Matches prefix filter? (e.g., "silver/")                                 │
+│     → Matches tag filter? (if configured)                                      │
+│     → Object is new version? (CRR requires versioning)                         │
+│  4. If rules match: S3 queues the object for replication                       │
+│  5. S3 replication subsystem:                                                   │
+│     a. Reads object from source bucket                                          │
+│     b. Assumes the CRR IAM role                                                │
+│     c. PUTs object to destination bucket in us-west-2                          │
+│     d. Preserves: key, metadata, tags, ACLs, encryption                        │
+│     e. Adds header: x-amz-replication-status = "COMPLETED"                     │
+│  6. Source object metadata updated:                                             │
+│     x-amz-replication-status = "COMPLETED" (or "PENDING" or "FAILED")          │
+│                                                                                 │
+│  Replication status values:                                                     │
+│  → PENDING: queued for replication, not yet started                            │
+│  → COMPLETED: successfully replicated to destination                           │
+│  → FAILED: replication failed (permissions, bucket doesn't exist, etc.)        │
+│  → REPLICA: this object IS a replica (on destination bucket)                   │
+│                                                                                 │
+│                                                                                 │
+│  ❷ Replication Time Control (RTC) Mechanics                                    │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                  │
+│                                                                                 │
+│  Standard CRR:                                                                  │
+│  → Best-effort replication timing                                               │
+│  → Most objects: replicated within seconds to minutes                          │
+│  → Under load: can take hours (no SLA)                                         │
+│  → No CloudWatch metrics for replication latency                               │
+│                                                                                 │
+│  CRR + RTC:                                                                     │
+│  → SLA: 99.99% of objects replicated within 15 minutes                         │
+│  → S3 prioritizes RTC-enabled objects in replication queue                     │
+│  → CloudWatch metrics enabled:                                                  │
+│    - ReplicationLatency: seconds since object creation                         │
+│    - OperationsPendingReplication: count of objects not yet replicated          │
+│    - BytesPendingReplication: bytes not yet replicated                          │
+│    - OperationsFailedReplication: count of failed replications                 │
+│  → S3 Replication Metrics: per-rule, per-prefix tracking                       │
+│                                                                                 │
+│  RTC pricing (additional to CRR):                                               │
+│  → $0.015 per GB replicated (on top of standard transfer)                      │
+│  → Standard CRR data transfer: $0.02 per GB (cross-region)                    │
+│  → Total with RTC: $0.035 per GB replicated                                   │
+│                                                                                 │
+│                                                                                 │
+│  ❸ What Gets Replicated (and What Doesn't)                                    │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                  │
+│                                                                                 │
+│  REPLICATED:                                                                    │
+│  ✅ New objects (written after CRR enabled)                                    │
+│  ✅ Object metadata (user-defined + system)                                    │
+│  ✅ Object tags                                                                │
+│  ✅ Object ACLs (if configured)                                                │
+│  ✅ S3 Object Lock settings (if configured)                                    │
+│                                                                                 │
+│  NOT REPLICATED (by default):                                                   │
+│  ❌ Objects that existed BEFORE CRR was enabled                                │
+│     → Use S3 Batch Replication for backfill                                    │
+│  ❌ Objects encrypted with SSE-C (customer-provided keys)                      │
+│  ❌ Objects in Glacier or Deep Archive storage class                            │
+│  ❌ Lifecycle transition actions (must set lifecycle on DR bucket too)          │
+│  ❌ Delete markers (configurable — can enable)                                  │
+│  ❌ Objects replicated FROM another source (no chaining by default)             │
+│                                                                                 │
+│                                                                                 │
+│  ❹ IAM Role for CRR                                                           │
+│  ━━━━━━━━━━━━━━━━━━━                                                          │
+│                                                                                 │
+│  S3 assumes an IAM role to perform replication:                                 │
+│                                                                                 │
+│  Trust policy:                                                                  │
+│  {                                                                              │
+│    "Principal": {"Service": "s3.amazonaws.com"},                               │
+│    "Action": "sts:AssumeRole"                                                  │
+│  }                                                                              │
+│                                                                                 │
+│  Permissions needed:                                                            │
+│  → s3:GetReplicationConfiguration (source bucket)                              │
+│  → s3:ListBucket (source bucket)                                               │
+│  → s3:GetObjectVersionForReplication (source bucket)                           │
+│  → s3:GetObjectVersionAcl (source bucket)                                      │
+│  → s3:GetObjectVersionTagging (source bucket)                                  │
+│  → s3:ReplicateObject (destination bucket)                                     │
+│  → s3:ReplicateDelete (destination bucket — if delete replication enabled)     │
+│  → s3:ReplicateTags (destination bucket)                                       │
+│                                                                                 │
+│                                                                                 │
+│  ❺ Cost Model for QuickCart                                                    │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━                                                  │
+│                                                                                 │
+│  Current data volumes:                                                          │
+│  → Silver zone: ~900 MB (existing) + ~5 GB/month (new)                         │
+│  → Gold zone: ~150 MB (existing) + ~1 GB/month (new)                           │
+│                                                                                 │
+│  One-time cost (Batch Replication backfill):                                    │
+│  → Silver: 900 MB × $0.035/GB = $0.03                                         │
+│  → Gold: 150 MB × $0.035/GB = $0.005                                          │
+│  → Total one-time: ~$0.04                                                      │
+│                                                                                 │
+│  Monthly ongoing cost:                                                          │
+│  → Data transfer: 6 GB/month × $0.02/GB = $0.12                              │
+│  → RTC fee (Gold only): 1 GB/month × $0.015/GB = $0.015                      │
+│  → DR bucket storage: 7 GB × $0.023/GB = $0.16                               │
+│  → Total monthly: ~$0.30                                                       │
+│                                                                                 │
+│  At scale (100 GB Silver + 20 GB Gold):                                         │
+│  → Data transfer: 120 GB/month × $0.02 = $2.40                               │
+│  → RTC fee: 20 GB × $0.015 = $0.30                                            │
+│  → DR storage: 120 GB × $0.023 = $2.76                                        │
+│  → Total monthly: ~$5.46                                                       │
+│                                                                                 │
+│  WELL within $200/month budget at any foreseeable scale ✅                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "CRR enabled but nothing replicates"
+</span>→ Cause #1: Versioning not enabled on destination bucket
+→ Cause #2: IAM role lacks s3:ReplicateObject on destination
+→ Cause #3: Objects existed before CRR → not eligible for CRR
+→ Debug: check x-amz-replication-status on source objects
+→ Fix: enable versioning, fix IAM, run batch replication for existing
+
+PITFALL 2: "Replication works for small files but fails for large ones"
+→ Cause: large files use multipart upload
+→ CRR handles multipart correctly, but IAM role needs:
+  s3:GetObjectVersionForReplication (includes multipart parts)
+→ Fix: ensure IAM policy includes all required actions
+
+PITFALL 3: "DR bucket has data but Glue Catalog tables point to old paths"
+→ Cause: Glue Catalog in DR region wasn't updated after new partitions
+→ Source: silver/orders/year=2025/month=01/day=16/ (new partition)
+→ DR bucket: data replicated ✅
+→ DR Glue Catalog: doesn't know about day=16 partition ❌
+→ Fix: run Glue Crawler in DR region periodically (daily)
+→ Or: use partition projection (no crawler needed — Project 26)
+
+PITFALL 4: "Failover works but data is 3 days old"
+→ Cause: CRR was failing silently for 3 days
+→ No monitoring → no one noticed
+→ Fix: CloudWatch alarm on OperationsFailedReplication &gt; 0
+→ Fix: CloudWatch alarm on BytesPendingReplication &gt; threshold
+
+PITFALL 5: "Deleted data from primary also deleted from DR"
+→ Cause: delete marker replication enabled
+→ Someone accidentally deleted Gold data → CRR replicated the delete
+→ DR bucket now also empty → no recovery possible
+→ Fix: DISABLE delete marker replication
+→ DR becomes a safety net against accidental deletion
+
+PITFALL 6: "Failback after primary recovery creates duplicates"
+→ Cause: during failover, analysts wrote queries/results to DR region
+→ When failing back: primary has old data, DR has newer data
+→ Fix: failback procedure must sync DR → primary BEFORE switching
+→ Or: re-run ETL pipeline from Bronze to rebuild Silver/Gold
+
+PITFALL 7: "DR Athena query costs double because scanning full table"
+→ Cause: DR Glue Catalog not partitioned (Crawler didn't detect partitions)
+→ Athena scans ALL data instead of just latest partition
+→ Fix: use partition projection in DR Catalog tables (no Crawler dependency)
+→ Partition projection works identically regardless of Crawler state</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>CURRENT LOAD:
+</span>→ Silver + Gold: ~1 GB existing, ~6 GB/month new
+→ CRR cost: ~$0.30/month
+→ Well within budget
+
+SCALING TO 100 GB:
+→ CRR data transfer: 100 GB × $0.02 = $2.00/month
+→ RTC (Gold 20 GB): 20 GB × $0.015 = $0.30/month
+→ DR storage: 100 GB × $0.023 = $2.30/month
+→ Total: ~$4.60/month
+
+SCALING TO 1 TB:
+→ CRR transfer: 1 TB × $0.02 = $20/month
+→ RTC (Gold 200 GB): 200 GB × $0.015 = $3.00/month
+→ DR storage: 1 TB × $0.023 = $23/month
+→ Total: ~$46/month (still well under $200)
+
+SCALING TO 10 TB:
+→ CRR transfer: 10 TB × $0.02 = $200/month
+→ DR storage: 10 TB × $0.023 = $230/month
+→ Total: ~$430/month → EXCEEDS $200 budget
+→ Optimize: replicate ONLY Gold zone (smallest)
+→ Or: replicate Silver with lifecycle → IA after 30 days
+
+REPLICATION BANDWIDTH:
+→ S3 CRR: no bandwidth limit (S3-internal transfer)
+→ Large bursts (10 GB in 1 minute): handled fine
+→ S3 internally manages replication queue
+→ RTC: prioritizes objects to meet 15-minute SLA
+
+MULTI-REGION (3+ regions):
+→ CRR supports replication to multiple destinations
+→ One source → two destinations (e.g., us-west-2 + eu-west-1)
+→ Each destination = separate rule
+→ Each destination = separate cost
+→ Use for: global DR or multi-region serving</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO MONITOR REPLICATION HEALTH:
+</span>
+1. CloudWatch Replication Metrics (enabled with RTC)
+   → ReplicationLatency: avg seconds for replication
+     - Normal: &lt; 60 seconds
+     - Warning: &gt; 300 seconds (5 minutes)
+     - Critical: &gt; 900 seconds (15 minutes — RTC SLA breach)
+   → BytesPendingReplication: bytes waiting to replicate
+     - Normal: &lt; 10 MB
+     - Warning: &gt; 100 MB (backlog building)
+     - Critical: &gt; 1 GB (significant lag)
+   → OperationsFailedReplication: count of failures
+     - Normal: 0
+     - Any non-zero: investigate immediately
+
+2. S3 Replication Metrics (per-rule dashboard)
+   → Enable in replication configuration
+   → Shows: objects replicated, bytes replicated, failed count
+   → Available in S3 console under Management → Replication
+
+3. DR Bucket Verification (weekly script)
+   → Compare object count: source vs destination per prefix
+   → Compare latest object timestamp: source vs destination
+   → Flag: if DR is &gt; 1 hour behind → alert
+
+4. Monthly DR Drill Report
+   → Drill performed: yes/no
+   → RTO measured: X minutes (target: &lt; 15)
+   → RPO measured: X minutes (target: &lt; 60)
+   → Issues found: list
+   → Remediation: actions taken
+
+5. Cost Tracking
+   → CloudWatch billing: filter by CRR data transfer
+   → Compare: CRR cost vs total S3 cost
+   → Expected: CRR &lt; 5% of total S3 cost</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(47)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Step 1: Create DR Bucket and IAM Role</h3>
+
+<h3>Step 2: Configure CRR Replication Rules</h3>
+
+<h3>Step 3: Test Replication and Monitor</h3>
+
+<h3>Step 4: Setup DR Glue Catalog and Athena</h3>
+
+<h3>Step 5: Failover Runbook (Automated)</h3>
+
+<h3>Step 6: Failback Procedure</h3>
+
+<h3>Execution Order</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># SETUP (one-time)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 1: Create DR bucket + IAM role</span><span>
+</span>python 47_01_create_dr_infrastructure.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 2: Configure CRR replication rules</span><span>
+</span>python 47_02_configure_crr.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 3: Test replication + monitor</span><span>
+</span>python 47_03_test_and_monitor_replication.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Step 4: Setup DR Glue Catalog + Athena</span><span>
+</span>python 47_04_setup_dr_region.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONITORING (weekly)</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+python 47_03_test_and_monitor_replication.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># MONTHLY DR DRILL</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Simulate failover (without actually failing primary)</span><span>
+</span><span>python 47_04_setup_dr_region.py  </span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Test DR queries</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># DURING ACTUAL OUTAGE</span><span>
+</span><span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span><span>
+</span>
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># Failover to DR</span><span>
+</span>python 47_05_failover_runbook.py
+
+<span></span><span class="token" style="color: rgb(0, 128, 0); font-style: italic;"># After primary recovers — failback</span><span>
+</span>python 47_06_failback.py</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ S3 CRR: automatic async replication to another region
+→ CRR REQUIRES versioning on BOTH source and destination buckets
+→ CRR only replicates NEW objects — use Batch Replication for existing data
+→ Replication Time Control (RTC): 99.99% within 15 minutes (SLA)
+→ RTC enables CloudWatch metrics: ReplicationLatency, BytesPending, OperationsFailed
+→ Delete markers NOT replicated by default — DR is safety net against accidental deletion
+→ Prefix-based rules: replicate Gold (RTC) + Silver (standard), skip Bronze + _system
+→ Partition projection in DR eliminates need for Crawlers — zero operational overhead
+→ Failover runbook: confirm → announce → verify → test → activate → instruct
+→ Failback: verify primary → check replication caught up → re-run ETL → switch back
+→ Monthly DR drills: test the failover BEFORE you need it
+
+COST ANALYSIS:
+━━━━━━━━━━━━━
+  Current scale (~1 GB Silver + Gold):
+  → CRR data transfer: ~$0.12/month
+  → RTC fee (Gold): ~$0.015/month
+  → DR storage: ~$0.16/month
+  → Total: ~$0.30/month (well under $200 budget)
+
+  At 100 GB scale:
+  → Total: ~$5.50/month
+
+  At 1 TB scale:
+  → Total: ~$46/month (still under budget)
+
+DR ARCHITECTURE:
+━━━━━━━━━━━━━━
+  ┌──────────────────────┐    CRR    ┌──────────────────────┐
+  │ us-east-2 (PRIMARY)  │ ────────→ │ us-west-2 (DR)       │
+  │ quickcart-datalake   │           │ quickcart-datalake-dr │
+  │ ├── silver/ ─────────│──RTC Off─→│ ├── silver/           │
+  │ ├── gold/ ───────────│──RTC On──→│ ├── gold/             │
+  │ ├── bronze/ (skip)   │           │ │                     │
+  │ └── _system/ (skip)  │           │ Glue Catalog (DR)     │
+  │                      │           │ Athena (standby)      │
+  │ RTO target: &lt;15 min  │           │ RPO target: &lt;1 hour   │
+  └──────────────────────┘           └──────────────────────┘
+
+CONNECTS TO PREVIOUS:
+━━━━━━━━━━━━━━━━━━━━
+→ Project 2: S3 versioning (required for CRR)
+→ Project 4: S3 storage classes + lifecycle (applied to DR bucket)
+→ Project 26: Partition projection (used in DR Glue Catalog)
+→ Project 44: Medallion architecture (zone-based replication strategy)
+
+CONNECTS TO NEXT:
+━━━━━━━━━━━━━━━━━
+→ Project 48: Query a Specific Column from a Huge CSV Without Full Scan
+   (S3 Select — read specific columns/rows from CSV without downloading
+    the entire file. Useful for Bronze zone ad-hoc inspection where
+    downloading 500 MB CSVs is impractical.)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>DR is configured and tested:
+</span>→ Silver + Gold replicated to us-west-2 with 15-minute SLA
+→ Failover runbook tested, RTO measured at ~3 minutes
+→ Monthly drills scheduled
+
+Meanwhile, a junior data engineer encounters a practical problem:
+
+"I need to check one specific column in a Bronze CSV file.
+ The file is 500 MB (orders_20250115.csv in Bronze zone).
+ Downloading 500 MB just to grep one column seems wasteful.
+ 
+ Is there a way to read JUST the columns I need from S3
+ WITHOUT downloading the entire file?"
+
+→ Project 48: "Query a Specific Column from a Huge CSV Without Full Scan"
+→ Introduces: S3 Select, SQL Expressions on S3 objects,
+  Scan Range for partial reads, Glacier Select</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="33" ========== -->
+<div class="chat-message" data-index="33"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-46.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 47 of 80</span>
+    <span class="nav-project-title">REPLICATE S3 DATA TO ANOTHER REGION FOR DR</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-48.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-48.html") window.location = "project-48.html";
+  if (e.key === 'ArrowLeft' && "project-46.html") window.location = "project-46.html";
+});
+</script>
+</body>
+</html>

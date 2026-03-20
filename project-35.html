@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project 35: CHAIN CRAWLER → ETL → CRAWLER AS ONE ORCHESTRATED WORKFLOW — DE Interview Guide</title>
+<link rel="icon" type="image/png" href="images/favicon.png">
+<link rel="stylesheet" href="styles.css">
+
+</head>
+<body>
+<div id="progress-bar-container"><div id="progress-bar" style="width:44%"></div></div>
+<div id="progress-label">44%</div>
+<div class="page-wrapper">
+<div class="project-header">
+  <div class="project-num">⚙️ PROJECT 35 of 80</div>
+  <div class="project-title">CHAIN CRAWLER → ETL → CRAWLER AS ONE ORCHESTRATED WORKFLOW</div>
+  <div class="project-tags"><span class="project-tag phase">🟡 Phase 3: Medium</span></div>
+</div>
+<div class="content-card"><hr>
+<h2>🔴 HYPOTHETICAL PROBLEM</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Company: "QuickCart" — Pipeline maturity growing
+</span>Current State (after Projects 31, 32, 33, 34):
+→ 3 Glue ETL Jobs running nightly:
+   Job 1: MariaDB → S3 Bronze (Project 31)
+   Job 2: Bronze → Silver transforms (Project 34)
+   Job 3: Silver → Redshift load (Project 32)
+→ 2 Glue Crawlers needed:
+   Crawler A: Crawl bronze/ after Job 1 (discover new partitions)
+   Crawler B: Crawl silver/ after Job 2 (register new tables/partitions)
+→ Currently orchestrated by Python script (Project 34 Part 3)
+
+THE PROBLEMS:
+━━━━━━━━━━━━━
+
+Problem 1 — FRAGILE ORCHESTRATION:
+→ Python script runs on EC2 via cron
+→ If EC2 reboots at 2 AM → pipeline doesn't run
+→ If script crashes mid-way → partial state, no cleanup
+→ No automatic retry on transient failures
+
+Problem 2 — NO DEPENDENCY MANAGEMENT:
+→ Job 2 should ONLY run if Job 1 SUCCEEDED
+→ Crawler B should ONLY run if Job 2 SUCCEEDED
+→ Python script checks sequentially — but what if Job 1 takes 2 hours?
+→ Script timeout → Job 2 never starts
+
+Problem 3 — MISSING CRAWLERS IN PIPELINE:
+→ Job 1 writes new Parquet partitions to bronze/
+→ Athena can't query new partitions until Crawler A runs
+→ Currently: engineer manually runs Crawler A each morning
+→ Sometimes forgets → analysts see stale data
+
+Problem 4 — NO VISUAL MONITORING:
+→ Python script logs to CloudWatch but no visual graph
+→ "Which step failed?" requires reading 500 lines of logs
+→ No at-a-glance pipeline status
+
+Problem 5 — ADDING NEW STEPS IS PAINFUL:
+→ Want to add: data quality check between Job 2 and Job 3
+→ Requires modifying Python script, testing, redeploying
+→ No plug-and-play step insertion
+
+→ Data engineer: "We need a MANAGED workflow that chains
+   Crawlers + ETL Jobs with dependencies, retries, and monitoring."
+
+→ CTO: "Isn't that what Glue Workflows do?"</code></pre></div>
+<hr>
+<h2>🟡 HOW TO APPROACH IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Step 1: Understand Glue Workflow components
+</span>→ WORKFLOW: Container that groups Crawlers + Jobs + Triggers
+→ TRIGGER: Defines WHEN something runs (on-demand, scheduled, conditional)
+→ CRAWLER: Auto-discovers schema from S3 data (Project 23)
+→ JOB: ETL transformation (Projects 31, 32, 34)
+→ ACTION: What a trigger starts (one or more Crawlers/Jobs)
+
+Step 2: Design the execution graph
+→ Start trigger (scheduled at 2:00 AM)
+  → Job 1: MariaDB → Bronze
+    → Conditional trigger (on Job 1 SUCCESS)
+      → Crawler A: Crawl bronze/
+        → Conditional trigger (on Crawler A SUCCESS)
+          → Job 2: Bronze → Silver
+            → Conditional trigger (on Job 2 SUCCESS)
+              → Crawler B: Crawl silver/
+                → Conditional trigger (on Crawler B SUCCESS)
+                  → Job 3: Silver → Redshift
+
+Step 3: Understand trigger types
+→ SCHEDULED: Cron expression (e.g., "cron(0 2 * * ? *)")
+→ ON_DEMAND: Manual start via API/Console
+→ CONDITIONAL: Fires when predecessor(s) reach a state
+→ EVENT: Fires on EventBridge event (Project 41 pattern)
+
+Step 4: Dependencies from previous projects
+→ Project 23: Glue Crawlers (auto-discover schema)
+→ Project 31: MariaDB → Bronze job
+→ Project 32: Silver → Redshift job
+→ Project 34: Bronze → Silver job
+→ Project 33: Incremental processing (bookmarks still apply)</code></pre></div>
+<hr>
+<h2>🟢 HOW CAN WE SOLVE IT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>SOLUTION ARCHITECTURE:
+</span>
+┌────────────────────────────────────────────────────────────────────────┐
+│                                                                        │
+│  GLUE WORKFLOW: "quickcart-nightly-pipeline"                           │
+│  ════════════════════════════════════════════                           │
+│                                                                        │
+│  ┌─────────────────┐                                                   │
+│  │ SCHEDULE TRIGGER │ cron(0 2 * * ? *)  ← Every day at 2:00 AM UTC  │
+│  │ "trigger-start"  │                                                  │
+│  └────────┬────────┘                                                   │
+│           │                                                            │
+│           ▼                                                            │
+│  ┌─────────────────────────────────────────┐                           │
+│  │ JOB 1: quickcart-mariadb-to-s3-parquet  │ (Project 31)             │
+│  │ Extract MariaDB → S3 Bronze             │                           │
+│  └────────┬────────────────────────────────┘                           │
+│           │ ON SUCCESS                                                 │
+│           ▼                                                            │
+│  ┌─────────────────────────────────────────┐                           │
+│  │ CRAWLER A: crawl-bronze-mariadb         │ (Project 23)             │
+│  │ Discover new partitions in bronze/      │                           │
+│  └────────┬────────────────────────────────┘                           │
+│           │ ON SUCCESS                                                 │
+│           ▼                                                            │
+│  ┌─────────────────────────────────────────┐                           │
+│  │ JOB 2: quickcart-silver-layer-transforms│ (Project 34)             │
+│  │ Clean, Dedup, Join, Aggregate           │                           │
+│  └────────┬────────────────────────────────┘                           │
+│           │ ON SUCCESS                                                 │
+│           ▼                                                            │
+│  ┌─────────────────────────────────────────┐                           │
+│  │ CRAWLER B: crawl-silver-quickcart       │                           │
+│  │ Register silver tables + partitions     │                           │
+│  └────────┬────────────────────────────────┘                           │
+│           │ ON SUCCESS                                                 │
+│           ▼                                                            │
+│  ┌─────────────────────────────────────────┐                           │
+│  │ JOB 3: quickcart-s3-to-redshift         │ (Project 32)             │
+│  │ Load Silver → Redshift                  │                           │
+│  └─────────────────────────────────────────┘                           │
+│                                                                        │
+│  IF ANY STEP FAILS → Workflow stops → Status = FAILED                  │
+│  → CloudWatch Alarm detects failure (Project 54)                       │
+│  → SNS sends notification (Project 12)                                 │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🔵 WHAT COULD BE DONE</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>Option A: Glue Workflow (this project)
+</span>→ Native Glue orchestration
+→ Visual graph in Console
+→ Conditional triggers between steps
+→ Pros: tight Glue integration, simple for Glue-only pipelines
+→ Cons: limited to Glue Crawlers + Jobs, no Lambda/non-Glue steps
+
+Option B: Step Functions (Project 55)
+→ AWS-native orchestration for ANY service
+→ Can chain: Glue + Lambda + ECS + SNS + SQS + any AWS API
+→ Pros: most flexible, visual designer, complex branching
+→ Cons: more setup, separate service to manage
+
+Option C: MWAA (Managed Apache Airflow)
+→ Full Airflow on AWS
+→ DAG-based orchestration with Python
+→ Pros: industry standard, huge community, complex DAGs
+→ Cons: expensive ($400+/month minimum), overkill for 5-step pipeline
+
+Option D: EventBridge + Lambda
+→ Event-driven: each step completion triggers next step
+→ Pros: serverless, event-driven, decoupled
+→ Cons: no visual graph, hard to track pipeline state
+
+DECISION: Option A — Glue Workflow
+→ Perfect for Glue-only pipelines (our exact case)
+→ Zero additional infrastructure cost
+→ Visual monitoring in Glue Console
+→ Will migrate to Step Functions (Project 55) when we add non-Glue steps</code></pre></div>
+<hr>
+<h2>✅ WHAT SHOULD DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Name workflows and triggers descriptively
+</span>   → Workflow: "quickcart-nightly-pipeline"
+   → Triggers: "trigger-start", "trigger-after-extract", "trigger-after-silver"
+   → Makes Console navigation and debugging clear
+
+2. Use CONDITIONAL triggers with SUCCEEDED condition
+   → "Start Job 2 ONLY when Job 1 state = SUCCEEDED"
+   → If Job 1 FAILS: trigger does NOT fire → pipeline stops
+   → This is the dependency enforcement mechanism
+
+3. Pass workflow run properties to all jobs
+   → Workflow can pass key-value properties to child jobs
+   → Use for: extraction_date, run_id, pipeline_name
+   → All jobs share same date parameter → consistency
+
+4. Set appropriate timeouts on each step
+   → Job 1 (Extract): 60 min timeout
+   → Crawler A: 30 min timeout
+   → Job 2 (Silver): 90 min timeout
+   → Crawler B: 30 min timeout
+   → Job 3 (Redshift): 60 min timeout
+   → Total pipeline budget: ~4.5 hours max
+
+5. Create a dedicated Crawler for each layer
+   → Crawler A: targets bronze/mariadb/ only
+   → Crawler B: targets silver/ only
+   → Don't mix — one crawler per data layer
+
+6. Monitor workflow via CloudWatch
+   → Glue publishes workflow run metrics
+   → Set alarm on: workflow FAILED state
+   → Route alarm to SNS (Project 54)
+
+7. Test with ON_DEMAND trigger first
+   → Create workflow with on-demand start trigger
+   → Manually trigger → watch execution → verify all steps
+   → Switch to SCHEDULED trigger after successful test</code></pre></div>
+<hr>
+<h2>❌ WHAT SHOULD NOT DO</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. DO NOT create circular trigger dependencies
+</span>   → Trigger A starts Job 1 → Trigger B starts Job 2 → Trigger C starts Job 1
+   → Creates infinite loop → burns DPUs forever
+   → Workflow graph must be a DAG (Directed Acyclic Graph)
+
+2. DO NOT put ALL crawlers and jobs in one mega-workflow
+   → Workflow for pipeline A, separate workflow for pipeline B
+   → One failure in shared workflow blocks unrelated pipelines
+   → Keep workflows focused on one logical pipeline
+
+3. DO NOT skip crawlers between ETL jobs
+   → Job 2 reads from Glue Catalog tables populated by Crawler A
+   → If Crawler A hasn't run → Job 2 reads stale/missing partitions
+   → Crawler ensures catalog is fresh before next job reads it
+
+4. DO NOT use SCHEDULED triggers on INTERMEDIATE steps
+   → Only the FIRST trigger should be scheduled
+   → All subsequent triggers should be CONDITIONAL (on predecessor success)
+   → Scheduled intermediate trigger = step runs even if predecessor failed
+
+5. DO NOT hardcode dates in workflow properties
+   → Use dynamic expressions or let each job derive its own date
+   → Or pass date via workflow run properties at start time
+
+6. DO NOT forget to handle the "no new data" scenario
+   → Job 1 extracts 0 rows (no changes in MariaDB)
+   → Job 1 still SUCCEEDS (0 rows is valid)
+   → Job 2 runs on empty bronze partition → produces empty silver
+   → Job 3 loads empty data to Redshift → no-op
+   → All steps should handle 0-row gracefully without failing
+
+7. DO NOT mix Glue versions across jobs in same workflow
+   → Job 1: Glue 4.0, Job 2: Glue 2.0 → different Spark versions
+   → Parquet files written by Spark 3.3 may have compatibility issues with Spark 2.4
+   → Use Glue 4.0 for ALL jobs in the pipeline</code></pre></div>
+<hr>
+<h2>🔶 WHEN TO USE WHAT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────┬──────────────────┬──────────────────────────────────┐
+</span>│ Scenario                         │ Use              │ Why                              │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Chain Glue Crawlers + Jobs only  │ Glue Workflow    │ Native, zero extra cost, visual  │
+│ (no Lambda, no non-Glue steps)   │ (this project)   │ graph, conditional triggers      │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Chain Glue + Lambda + SNS + SQS  │ Step Functions   │ Most flexible, any AWS service   │
+│ + any AWS service                │ (Project 55)     │ Complex branching, error handling │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Complex DAGs with 50+ steps,     │ MWAA (Airflow)   │ Industry standard, Python DAGs   │
+│ external systems, custom sensors │                  │ Large community, rich plugins     │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Event-driven, loosely coupled    │ EventBridge +    │ Decoupled, each step independent  │
+│ pipeline (fire and forget)       │ Lambda/StepFn    │ (Project 41, 66)                 │
+├──────────────────────────────────┼──────────────────┼──────────────────────────────────┤
+│ Simple 2-step: trigger Job on    │ Glue Trigger     │ Don't need full workflow          │
+│ schedule                         │ (standalone)     │ Single trigger suffices           │
+└──────────────────────────────────┴──────────────────┴──────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🚫 WHEN NOT TO USE GLUE WORKFLOWS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>1. Pipeline includes non-Glue steps
+</span>   → Lambda function for data quality validation
+   → ECS task for ML model inference
+   → SNS notification between steps
+   → Glue Workflow can ONLY orchestrate Glue Crawlers and Jobs
+   → Use: Step Functions (Project 55)
+
+2. Need complex branching logic
+   → "If revenue &gt; $1M → run Job A, else → run Job B"
+   → Glue Workflow triggers are simple: SUCCESS/FAIL/ANY
+   → No data-dependent branching
+   → Use: Step Functions with Choice state
+
+3. Need human approval gates
+   → "Pause pipeline until manager approves data quality report"
+   → Glue Workflows have no wait/approval mechanism
+   → Use: Step Functions with Task token + callback
+
+4. Need to orchestrate cross-account resources
+   → Glue Workflow can only manage resources in same account
+   → Cross-account jobs need external orchestration
+   → Use: Step Functions with cross-account IAM roles (Project 60)
+
+5. Need parallel execution with fan-out/fan-in
+   → "Run 10 table extractions in parallel, wait for all, then merge"
+   → Glue Workflow supports parallel actions BUT limited fan-in
+   → Use: Step Functions with Parallel + Map states
+
+6. Need sub-minute scheduling
+   → Glue Workflow minimum schedule: 5 minutes
+   → For real-time processing: use EventBridge + Lambda</code></pre></div>
+<hr>
+<h2>⚙️ HOW IT ONLY WORKS — INTERNAL MECHANICS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>┌──────────────────────────────────────────────────────────────────────────────────┐
+</span>│              GLUE WORKFLOW — INTERNAL MECHANICS                                   │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  WORKFLOW OBJECT MODEL:                                                          │
+│  ═════════════════════                                                           │
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐                     │
+│  │ WORKFLOW                                                │                     │
+│  │ ├── Name: "quickcart-nightly-pipeline"                  │                     │
+│  │ ├── Description: "Full nightly ETL pipeline"            │                     │
+│  │ ├── DefaultRunProperties:                               │                     │
+│  │ │   ├── extraction_date: "2025-01-15"                   │                     │
+│  │ │   └── pipeline_version: "v3.2"                        │                     │
+│  │ │                                                       │                     │
+│  │ ├── TRIGGER 1 (Start):                                  │                     │
+│  │ │   ├── Type: SCHEDULED                                 │                     │
+│  │ │   ├── Schedule: "cron(0 2 * * ? *)"                   │                     │
+│  │ │   └── Actions: [Job 1]                                │                     │
+│  │ │                                                       │                     │
+│  │ ├── TRIGGER 2 (After Extract):                          │                     │
+│  │ │   ├── Type: CONDITIONAL                               │                     │
+│  │ │   ├── Predicate: Job 1 = SUCCEEDED                    │                     │
+│  │ │   └── Actions: [Crawler A]                            │                     │
+│  │ │                                                       │                     │
+│  │ ├── TRIGGER 3 (After Bronze Crawl):                     │                     │
+│  │ │   ├── Type: CONDITIONAL                               │                     │
+│  │ │   ├── Predicate: Crawler A = SUCCEEDED                │                     │
+│  │ │   └── Actions: [Job 2]                                │                     │
+│  │ │                                                       │                     │
+│  │ ├── TRIGGER 4 (After Silver Transform):                 │                     │
+│  │ │   ├── Type: CONDITIONAL                               │                     │
+│  │ │   ├── Predicate: Job 2 = SUCCEEDED                    │                     │
+│  │ │   └── Actions: [Crawler B]                            │                     │
+│  │ │                                                       │                     │
+│  │ └── TRIGGER 5 (After Silver Crawl):                     │                     │
+│  │     ├── Type: CONDITIONAL                               │                     │
+│  │     ├── Predicate: Crawler B = SUCCEEDED                │                     │
+│  │     └── Actions: [Job 3]                                │                     │
+│  │                                                         │                     │
+│  └─────────────────────────────────────────────────────────┘                     │
+│                                                                                  │
+│  EXECUTION FLOW (What happens at 2:00 AM):                                       │
+│  ═════════════════════════════════════════                                        │
+│                                                                                  │
+│  02:00:00 → Glue checks SCHEDULED triggers                                      │
+│  02:00:00 → trigger-start fires → starts workflow run                            │
+│  02:00:00 → Workflow Run ID generated: wr-abc123                                 │
+│  02:00:00 → DefaultRunProperties injected                                        │
+│  02:00:01 → Job 1 started (start_job_run called internally)                      │
+│  02:00:30 → Job 1 RUNNING (DPUs allocated, ENIs provisioned)                     │
+│  02:10:00 → Job 1 SUCCEEDED                                                     │
+│  02:10:01 → Glue evaluates CONDITIONAL triggers                                 │
+│  02:10:01 → trigger-after-extract: predicate = Job 1 SUCCEEDED ✅                │
+│  02:10:02 → Crawler A started                                                    │
+│  02:12:00 → Crawler A SUCCEEDED (discovered 3 new partitions)                    │
+│  02:12:01 → trigger-after-bronze-crawl: predicate = Crawler A SUCCEEDED ✅       │
+│  02:12:02 → Job 2 started                                                        │
+│  02:37:00 → Job 2 SUCCEEDED                                                     │
+│  02:37:01 → trigger-after-silver: predicate = Job 2 SUCCEEDED ✅                 │
+│  02:37:02 → Crawler B started                                                    │
+│  02:39:00 → Crawler B SUCCEEDED (registered 7 silver tables)                     │
+│  02:39:01 → trigger-after-silver-crawl: predicate = Crawler B SUCCEEDED ✅       │
+│  02:39:02 → Job 3 started                                                        │
+│  02:46:00 → Job 3 SUCCEEDED                                                     │
+│  02:46:01 → No more triggers → Workflow Run COMPLETED                            │
+│  02:46:01 → Status: COMPLETED, Duration: 46 minutes                              │
+│                                                                                  │
+│  FAILURE SCENARIO:                                                               │
+│  ═════════════════                                                               │
+│                                                                                  │
+│  02:00:00 → trigger-start fires → Job 1 started                                 │
+│  02:08:00 → Job 1 FAILED (MariaDB connection timeout)                            │
+│  02:08:01 → Glue evaluates CONDITIONAL triggers                                 │
+│  02:08:01 → trigger-after-extract: predicate = Job 1 SUCCEEDED ❌                │
+│  02:08:01 → Predicate NOT met → trigger does NOT fire                            │
+│  02:08:01 → No more triggers can fire → Workflow Run STOPPED                     │
+│  02:08:01 → Status: STOPPED (not all steps completed)                            │
+│  → Crawler A, Job 2, Crawler B, Job 3 never started                             │
+│  → CloudWatch detects: workflow run != COMPLETED → alarm → SNS                   │
+│                                                                                  │
+│  TRIGGER EVALUATION LOGIC:                                                       │
+│  ═════════════════════════                                                       │
+│                                                                                  │
+│  CONDITIONAL trigger with multiple predecessors:                                 │
+│  ┌─────────────────────────────────────────────────────┐                         │
+│  │ Predicate:                                          │                         │
+│  │   Logical: "AND"                                    │                         │
+│  │   Conditions:                                       │                         │
+│  │     - Job A = SUCCEEDED                             │                         │
+│  │     - Job B = SUCCEEDED                             │                         │
+│  │                                                     │                         │
+│  │ → Trigger fires ONLY when BOTH A and B succeeded    │                         │
+│  │ → If A succeeds but B fails → trigger never fires   │                         │
+│  │ → If A fails → trigger never fires (short-circuit)  │                         │
+│  └─────────────────────────────────────────────────────┘                         │
+│                                                                                  │
+│  Logical can also be "ANY":                                                      │
+│  → Trigger fires when ANY predecessor succeeds                                   │
+│  → Use case: "run cleanup job if extract OR transform fails"                     │
+│                                                                                  │
+│  WORKFLOW RUN PROPERTIES:                                                        │
+│  ════════════════════════                                                        │
+│                                                                                  │
+│  → Set at workflow level → inherited by ALL child jobs                           │
+│  → Jobs access via: args["--extraction_date"]                                    │
+│  → Override per-run: start_workflow_run(RunProperties={...})                     │
+│  → Ensures ALL steps in pipeline use SAME date                                   │
+│  → No date mismatch between extract and load                                     │
+│                                                                                  │
+│  HOW TRIGGERS ATTACH TO WORKFLOWS:                                               │
+│  ═════════════════════════════════                                                │
+│                                                                                  │
+│  → Trigger created with WorkflowName parameter                                   │
+│  → Trigger BELONGS to exactly one workflow                                       │
+│  → When workflow starts: activates its start trigger                             │
+│  → Subsequent triggers evaluated as predecessors complete                        │
+│  → Trigger outside workflow: standalone, not part of any pipeline                │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘</code></pre></div>
+<hr>
+<h2>🕳️ COMMON PITFALLS AND FAILURE MODES</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>PITFALL 1: "Workflow runs but triggers never fire"
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Triggers not ACTIVATED
+→ After creating trigger: state is CREATED (not ACTIVATED)
+→ Must call: activate_trigger() for each trigger
+→ OR: set State="ACTIVATED" during creation
+→ Without activation: trigger exists but never evaluates
+
+PITFALL 2: "Workflow starts but first job never runs"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Start trigger is CONDITIONAL instead of SCHEDULED
+→ Conditional trigger waits for predecessor — but there IS no predecessor
+→ Fix: First trigger must be SCHEDULED or ON_DEMAND
+
+PITFALL 3: "Jobs run but don't receive workflow properties"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Jobs must explicitly read workflow run properties
+→ Workflow properties passed as additional job arguments
+→ Job must use getResolvedOptions to read them
+→ Properties prefixed with "--" automatically
+
+PITFALL 4: "Crawler succeeds but Catalog still shows old schema"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Crawler configured to ADD new partitions only, not UPDATE
+→ SchemaChangePolicy: "UPDATE_IN_DATABASE" vs "ADD_NEW_COLUMNS"
+→ Fix: Set UpdateBehavior to "UPDATE_IN_DATABASE"
+→ And: RecrawlPolicy to "CRAWL_NEW_FOLDERS_ONLY" for efficiency
+
+PITFALL 5: "Workflow completes but one step was skipped silently"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Trigger predicate uses "ANY" instead of "AND"
+→ If predecessor A fails but predecessor B succeeds → trigger fires
+→ Downstream job runs without data from A
+→ Fix: Always use logical="AND" unless explicitly needed
+
+PITFALL 6: "Scheduled trigger fires but workflow is already running"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Previous run took longer than 24 hours
+→ New scheduled run starts while old one still running
+→ Two workflows running simultaneously → data conflicts
+→ Fix: Check MaxConcurrentRuns on each job (should be 1)
+→ Fix: Set workflow timeout shorter than schedule interval
+
+PITFALL 7: "Workflow shows COMPLETED but Job 3 actually failed"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+→ Cause: Workflow status is COMPLETED when all triggers are evaluated
+→ "COMPLETED" means "workflow finished executing" NOT "all jobs succeeded"
+→ A job can FAIL and workflow still shows COMPLETED
+→ Fix: Check individual node statuses, not just workflow status
+→ Use get_workflow_run() → check each node in Graph.Nodes</code></pre></div>
+<hr>
+<h2>📈 SCALABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WORKFLOW LIMITS:
+</span>━━━━━━━━━━━━━━━
+→ Max triggers per workflow: 10 (soft limit, can request increase)
+→ Max concurrent workflow runs: 1 (by default)
+→ Max crawlers/jobs per trigger action: 10
+→ Max workflow runs retained: 1000 (oldest auto-deleted)
+
+SCALING STRATEGIES:
+→ 5-step pipeline: single workflow (our case) ✅
+→ 10-step pipeline: single workflow, optimize with parallel triggers
+→ 20+ step pipeline: consider Step Functions (more flexible)
+→ 50+ step pipeline: MWAA (Airflow) — designed for complex DAGs
+
+PARALLEL EXECUTION WITHIN WORKFLOW:
+→ One trigger can start MULTIPLE jobs/crawlers simultaneously
+→ Example: trigger-start → [Job 1A, Job 1B, Job 1C] in parallel
+→ Next trigger: CONDITIONAL on ALL three succeeding (AND logic)
+→ Useful for extracting multiple independent sources in parallel
+
+COST:
+→ Glue Workflow itself: FREE (no additional charge)
+→ You only pay for the Crawlers and Jobs that run within it
+→ Crawler: $0.44/DPU-hour (same as jobs)
+→ Typical crawler run: 2-5 minutes = ~$0.07-$0.15 per run
+→ Adding 2 crawlers to pipeline: ~$0.30/day extra</code></pre></div>
+<hr>
+<h2>🔍 INTERPRETABILITY CONSIDERATIONS</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>HOW TO VERIFY WORKFLOW IS WORKING:
+</span>
+1. CONSOLE VISUALIZATION
+   → Glue → Workflows → Select workflow → Graph tab
+   → Shows visual DAG with status of each node
+   → Green = succeeded, Red = failed, Gray = not yet run
+   → BEST way to debug pipeline issues
+
+2. WORKFLOW RUN HISTORY
+   → Glue → Workflows → Select → History tab
+   → Shows all runs with start time, end time, status
+   → Click run → see detailed node-by-node execution
+
+3. API MONITORING
+   → get_workflow_run() returns full execution graph
+   → Each node has: Type, Name, State, StartedOn, CompletedOn
+   → Programmatic monitoring for alerting
+
+4. CLOUDWATCH METRICS
+   → Glue publishes: glue.workflow.run.status
+   → Set alarm on: status != COMPLETED for &gt; 0 runs
+   → Covered in Project 54
+
+5. NODE-LEVEL DEBUGGING
+   → Click any node in workflow graph
+   → Links to: Job Run details, Crawler Run details
+   → From there: CloudWatch Logs for full debugging</code></pre></div>
+<hr>
+
+<h2><div class="toc-phase">
+  <div class="toc-phase-title">
+    <ul class="toc-list">
+      <li class="toc-item">
+        <a href="https://github.com/Shakti4640/data-engineer-masterclass-guide/tree/main/Codes/project-%20(35)" target="_blank" rel="noopener noreferrer">
+          <span class="toc-title"><h2>💻 COMPLETE WORKING CODE</h2></span>
+        </a>
+      </li>
+    </ul>
+  </div>
+</div></h2>
+
+
+<h3>Part 1: Create Crawlers</h3>
+
+<h3>Part 2: Create Workflow with Triggers</h3>
+
+<h3>Part 3: Manual Trigger and Monitoring</h3>
+
+<h3>Part 4: Workflow Teardown and Cleanup Utility</h3>
+
+<h3>Execution Flow Summary</h3>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>COMPLETE SETUP AND EXECUTION FLOW:
+</span>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ONE-TIME SETUP                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. Create crawlers:                                                     │
+│    $ python 35_01_create_crawlers.py                                    │
+│    → Creates: crawl-bronze-mariadb, crawl-silver-quickcart              │
+│                                                                         │
+│ 2. Create workflow with triggers:                                       │
+│    $ python 35_02_create_workflow.py                                    │
+│    → Creates: workflow + 5 triggers (1 scheduled + 4 conditional)       │
+│    → Activates all triggers                                             │
+│                                                                         │
+│ 3. Verify configuration:                                                │
+│    $ python 35_04_workflow_management.py status                         │
+│    → Shows: workflow, triggers, jobs, crawlers status                   │
+│                                                                         │
+│ 4. Test with manual run:                                                │
+│    $ python 35_03_run_and_monitor_workflow.py run                       │
+│    → Triggers full pipeline → monitors each step                        │
+│    → Verify all 5 steps succeed before enabling schedule                │
+│                                                                         │
+│ 5. Enable scheduled run:                                                │
+│    → Schedule already set: cron(0 2 * * ? *)                            │
+│    → Pipeline auto-runs at 2:00 AM UTC daily                            │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ DAILY AUTOMATIC EXECUTION (2:00 AM UTC)                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  02:00  ┌──────────────────────────────────────┐                        │
+│    │    │ trigger-start (SCHEDULED)             │                        │
+│    │    └──────────────────┬───────────────────┘                        │
+│    │                       ▼                                            │
+│  02:01  ┌──────────────────────────────────────┐                        │
+│    │    │ JOB 1: MariaDB → Bronze (Proj 31)    │ ~10 min               │
+│    │    └──────────────────┬───────────────────┘                        │
+│    │                       ▼ ON SUCCESS                                 │
+│  02:11  ┌──────────────────────────────────────┐                        │
+│    │    │ CRAWLER A: crawl-bronze-mariadb       │ ~2 min                │
+│    │    └──────────────────┬───────────────────┘                        │
+│    │                       ▼ ON SUCCESS                                 │
+│  02:13  ┌──────────────────────────────────────┐                        │
+│    │    │ JOB 2: Bronze → Silver (Proj 34)     │ ~25 min               │
+│    │    └──────────────────┬───────────────────┘                        │
+│    │                       ▼ ON SUCCESS                                 │
+│  02:38  ┌──────────────────────────────────────┐                        │
+│    │    │ CRAWLER B: crawl-silver-quickcart     │ ~2 min                │
+│    │    └──────────────────┬───────────────────┘                        │
+│    │                       ▼ ON SUCCESS                                 │
+│  02:40  ┌──────────────────────────────────────┐                        │
+│    │    │ JOB 3: Silver → Redshift (Proj 32)   │ ~7 min                │
+│    │    └──────────────────────────────────────┘                        │
+│  02:47  ✅ WORKFLOW COMPLETED                                           │
+│                                                                         │
+│  Total: ~47 minutes                                                     │
+│  Cost breakdown:                                                        │
+│    Job 1 (10 DPUs × 10 min):   $0.73                                   │
+│    Crawler A (1 DPU × 2 min):  $0.07                                   │
+│    Job 2 (15 G.2X × 25 min):   $5.50                                   │
+│    Crawler B (1 DPU × 2 min):  $0.07                                   │
+│    Job 3 (10 DPUs × 7 min):    $0.73                                   │
+│    ─────────────────────────────────                                    │
+│    Total per run:               $7.10                                   │
+│    Monthly (30 days):           $213                                    │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ OPERATIONS                                                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ View status:    $ python 35_04_... status                               │
+│ Pause schedule: $ python 35_04_... pause                                │
+│ Resume:         $ python 35_04_... resume                               │
+│ View history:   $ python 35_03_... history                              │
+│ Reprocess date: $ python 35_03_... rerun 2025-01-10                     │
+│ Emergency stop: $ python 35_03_... stop &lt;run_id&gt;                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+
+VISUAL WORKFLOW GRAPH (as seen in Glue Console):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ⏰ trigger-start (SCHEDULED: cron 0 2 * * ? *)
+    │
+    ▼
+    🟢 JOB: quickcart-mariadb-to-s3-parquet
+    │
+    ▼
+    🔗 trigger-after-extract (CONDITIONAL: Job1=SUCCEEDED)
+    │
+    ▼
+    🕷️ CRAWLER: crawl-bronze-mariadb
+    │
+    ▼
+    🔗 trigger-after-bronze-crawl (CONDITIONAL: CrawlerA=SUCCEEDED)
+    │
+    ▼
+    🟢 JOB: quickcart-silver-layer-transforms
+    │
+    ▼
+    🔗 trigger-after-silver (CONDITIONAL: Job2=SUCCEEDED)
+    │
+    ▼
+    🕷️ CRAWLER: crawl-silver-quickcart
+    │
+    ▼
+    🔗 trigger-after-silver-crawl (CONDITIONAL: CrawlerB=SUCCEEDED)
+    │
+    ▼
+    🟢 JOB: quickcart-s3-to-redshift
+
+    LEGEND:
+    ⏰ = Scheduled trigger    🔗 = Conditional trigger
+    🟢 = ETL Job              🕷️ = Crawler</code></pre></div>
+<hr>
+<h2>🔑 KEY TAKEAWAY</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>WHAT WE LEARNED:
+</span>━━━━━━━━━━━━━━━━
+→ Glue Workflows chain Crawlers + Jobs with dependency management
+→ SCHEDULED trigger starts the pipeline, CONDITIONAL triggers chain steps
+→ Triggers MUST be ACTIVATED after creation (default state is CREATED)
+→ CONDITIONAL triggers evaluate: predecessor state == SUCCEEDED
+→ If ANY step fails → downstream triggers never fire → pipeline stops safely
+→ Workflow Run Properties pass shared parameters to ALL child jobs
+→ COMPLETED workflow status does NOT mean all jobs succeeded — check nodes
+→ Crawlers between jobs ensure Catalog is fresh for downstream consumers
+→ CRAWL_NEW_FOLDERS_ONLY makes crawlers fast for incremental pipelines
+→ Pause/Resume via trigger activation — no need to delete and recreate
+→ Re-run historical dates by starting workflow with custom RunProperties
+→ Glue Workflows are FREE — you only pay for the Crawlers and Jobs
+
+WHAT CONNECTS BACKWARD:
+━━━━━━━━━━━━━━━━━━━━━━━
+→ Project 23: Glue Crawlers (now integrated into workflow)
+→ Project 31: Job 1 — MariaDB extraction (first step)
+→ Project 32: Job 3 — Redshift loading (last step)
+→ Project 33: Incremental processing (bookmarks still active within jobs)
+→ Project 34: Job 2 — Silver transforms (middle step)
+
+WHAT CONNECTS FORWARD:
+━━━━━━━━━━━━━━━━━━━━━━
+→ Project 36: Athena CTAS — materialize heavy queries from silver tables
+   (now that silver tables are auto-refreshed by workflow)
+→ Project 41: Event-driven triggers — replace schedule with S3 events
+   (file arrives → pipeline starts immediately, not at 2 AM)
+→ Project 54: CloudWatch Alarms — get paged when workflow fails
+   (monitor workflow status → alarm → SNS notification)
+→ Project 55: Step Functions — replace Glue Workflow when we add
+   Lambda, SNS, or non-Glue steps to the pipeline
+→ Project 66: EventBridge + Step Functions — full event-driven architecture
+   (replace both cron schedule and Glue Workflow)</code></pre></div>
+<hr>
+<h2>🌉 BRIDGE TO NEXT PROJECT</h2>
+<div class="relative"><pre style="color: rgb(57, 58, 52); font-family: Consolas, &quot;Bitstream Vera Sans Mono&quot;, &quot;Courier New&quot;, Courier, monospace; direction: ltr; text-align: left; white-space: pre; word-spacing: normal; word-break: normal; font-size: 0.9em; line-height: 1.2em; tab-size: 4; hyphens: none; padding: 1em; margin: 0.5em 0px; overflow: auto; border: 1px solid rgb(221, 221, 221); background-color: white;"><code style="white-space: pre-wrap; word-break: break-all;"><span>QuickCart now has a fully orchestrated nightly pipeline:
+</span>→ 5 steps chained with conditional triggers
+→ Auto-runs at 2:00 AM UTC
+→ Visual monitoring in Glue Console
+→ Stops safely on any failure
+
+The silver layer tables are now reliably refreshed every night.
+Analysts can query them via Athena (Project 24).
+
+THEN: A senior analyst says:
+"I run this complex query every morning:
+ 
+ SELECT category, month, SUM(revenue), COUNT(DISTINCT customer_id)
+ FROM silver_quickcart.order_details
+ WHERE year = '2025'
+ GROUP BY category, month
+ ORDER BY SUM(revenue) DESC
+ 
+ It scans 15 GB of Parquet and takes 12 seconds.
+ I pay $0.075 per query (Athena: $5/TB scanned).
+ I run it 20 times a day → $1.50/day → $45/month just for ONE query.
+ 
+ Can we PRE-COMPUTE this result into a small table
+ so it's instant and free to query?"
+
+CTO: "That's what Athena CTAS does — CREATE TABLE AS SELECT.
+      Materialize the query result into its own Parquet table."
+
+→ Project 36: "Materialize Heavy Athena Queries into Optimized Tables"
+→ Introduces: Athena CTAS, Format Conversion, Bucketing,
+              Partition Specification, Cost Optimization</code></pre></div>
+<hr>
+</div>
+</div>
+
+<!-- ========== data-index="25" ========== -->
+<div class="chat-message" data-index="25"></div>
+</div>
+<div class="bottom-nav">
+  <a href="project-34.html" class="nav-btn prev">← Prev</a>
+  <div class="nav-center">
+    <span class="nav-project-num">PROJECT 35 of 80</span>
+    <span class="nav-project-title">CHAIN CRAWLER → ETL → CRAWLER AS ONE ORCHESTRATED WORKFLOW</span>
+    <span class="kbd-hint">← → keys to navigate</span>
+  </div>
+  <a href="project-36.html" class="nav-btn next">Next →</a>
+  <a href="index.html" class="nav-btn home">🏠 TOC</a>
+</div>
+
+<div id="progress-track"><div id="progress-fill"></div></div>
+<div id="progress-pct">0%</div>
+<script src="script.js"></script>
+
+<script>
+document.addEventListener('keydown', function(e) {
+  if (['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+  if (e.key === 'ArrowRight' && "project-36.html") window.location = "project-36.html";
+  if (e.key === 'ArrowLeft' && "project-34.html") window.location = "project-34.html";
+});
+</script>
+</body>
+</html>
