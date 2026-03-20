@@ -1,0 +1,91 @@
+# file: 60_04_cleanup.py (CONTINUED)
+
+import boto3
+import json
+import os
+
+REGION = "us-east-2"
+JOB_NAME = "cross-account-analytics-etl"
+
+
+def cleanup_all():
+    """Remove cross-account Glue job and related resources in Account B"""
+    glue_client = boto3.client("glue", region_name=REGION)
+
+    print("=" * 70)
+    print("🧹 CLEANING UP PROJECT 60 — CROSS-ACCOUNT GLUE ETL")
+    print("=" * 70)
+
+    # --- Step 1: Stop running job executions ---
+    print("\n📌 Step 1: Stopping running Glue job executions...")
+    try:
+        response = glue_client.get_job_runs(JobName=JOB_NAME, MaxResults=5)
+        for run in response.get("JobRuns", []):
+            if run["JobRunState"] in ["STARTING", "RUNNING", "STOPPING"]:
+                glue_client.batch_stop_job_run(
+                    JobName=JOB_NAME,
+                    JobRunIds=[run["Id"]]
+                )
+                print(f"  ⏹️  Stopped run: {run['Id']}")
+    except glue_client.exceptions.EntityNotFoundException:
+        print(f"  ℹ️  No job found: {JOB_NAME}")
+    except Exception as e:
+        print(f"  ⚠️  {e}")
+
+    # --- Step 2: Delete Glue job ---
+    print("\n📌 Step 2: Deleting Glue job...")
+    try:
+        glue_client.delete_job(JobName=JOB_NAME)
+        print(f"  ✅ Glue job deleted: {JOB_NAME}")
+    except glue_client.exceptions.EntityNotFoundException:
+        print(f"  ℹ️  Job not found: {JOB_NAME}")
+    except Exception as e:
+        print(f"  ⚠️  {e}")
+
+    # --- Step 3: Clean staging S3 ---
+    print("\n📌 Step 3: Cleaning staging S3 (if exists)...")
+    s3_client = boto3.client("s3", region_name=REGION)
+    staging_bucket = f"quickcart-analytics-staging-222222222222"
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=staging_bucket,
+            Prefix="redshift-temp/",
+            MaxKeys=100
+        )
+        if "Contents" in response:
+            objects = [{"Key": obj["Key"]} for obj in response["Contents"]]
+            s3_client.delete_objects(
+                Bucket=staging_bucket,
+                Delete={"Objects": objects}
+            )
+            print(f"  ✅ Cleaned {len(objects)} staging objects")
+        else:
+            print(f"  ℹ️  No staging objects found")
+    except Exception as e:
+        print(f"  ⚠️  Staging cleanup: {e}")
+
+    # --- Step 4: Clean config files ---
+    print("\n📌 Step 4: Cleaning config files...")
+    config_files = [
+        "/tmp/cross_account_glue_config.json",
+        "/tmp/acct_b_analytics_pipeline.json"
+    ]
+    for f_path in config_files:
+        try:
+            os.remove(f_path)
+            print(f"  ✅ Removed: {f_path}")
+        except FileNotFoundError:
+            pass
+
+    print("\n" + "=" * 70)
+    print("🎉 ALL PROJECT 60 RESOURCES CLEANED UP")
+    print("=" * 70)
+    print(f"\n  ⚠️  NOTE: Cross-account IAM roles NOT deleted")
+    print(f"  → Account A's cross-account role: cleanup via Project 56")
+    print(f"  → Account B's Glue role: cleanup via Project 56")
+    print(f"  → SNS/SQS cross-account: cleanup via Project 59")
+    print(f"  → These are shared across multiple projects")
+
+
+if __name__ == "__main__":
+    cleanup_all()
